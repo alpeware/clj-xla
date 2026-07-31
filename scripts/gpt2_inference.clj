@@ -15,6 +15,13 @@
    :temperature 0.7
    :top-k 10})
 
+(defn- clamp-float ^double [^double d]
+  (cond
+    (Double/isNaN d) 0.0
+    (> d 3.4028234663852886E38) 3.4028234663852886E38
+    (< d -3.4028234663852886E38) -3.4028234663852886E38
+    :else d))
+
 (defn parse-cli-args
   "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k)."
   [args]
@@ -113,8 +120,8 @@
                                   pos-offset (* (min last-pos 1023) emb-dim)
                                   ^floats h (float-array emb-dim)]
                               (dotimes [i emb-dim]
-                                (aset-float h i (float (+ (aget wte-floats (+ tok-offset i))
-                                                          (aget wpe-floats (+ pos-offset i))))))
+                                (aset-float h i (float (clamp-float (+ (aget wte-floats (+ tok-offset i))
+                                                                       (aget wpe-floats (+ pos-offset i)))))))
                               (let [^floats logits (float-array vocab-size)]
                                 (dotimes [v vocab-size]
                                   (let [v-offset (* v emb-dim)]
@@ -122,7 +129,7 @@
                                       (if (< i emb-dim)
                                         (recur (inc i) (+ sum (* (double (aget h i))
                                                                  (double (aget wte-floats (+ v-offset i))))))
-                                        (aset-float logits v (float sum))))))
+                                        (aset-float logits v (float (clamp-float sum)))))))
                                 (vec logits))))
                   gen-ids (ar/generate-tokens step-fn prompt-ids {:max-new-tokens max-new-tokens
                                                                   :temperature temperature
