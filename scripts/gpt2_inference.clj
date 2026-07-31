@@ -10,8 +10,8 @@
   (:import [java.lang.foreign Arena]))
 
 (def DEFAULT_CLI_OPTS
-  {:prompt "In a hole in the ground there lived a"
-   :max-new-tokens 16
+  {:prompt "The quick brown fox"
+   :max-new-tokens 8
    :temperature 0.7
    :top-k 10})
 
@@ -69,15 +69,32 @@
                          max-new-tokens temperature top-k))
         (println (format "Encoded Subword Token IDs (%d tokens): %s" (count prompt-ids) prompt-ids))
 
-        ;; 3. Load Safetensors weights header
+        ;; 3. Load Safetensors weights header & memory-map 12 layers
         (println (str "Loading Safetensors metadata from [" weights-path "]..."))
         (let [arena (Arena/ofConfined)
               weights-mmap (st/map-safetensors-weights weights-path arena)
               metadata (:header weights-mmap)
               ^floats wte-floats (st/get-tensor-floats weights-mmap "wte.weight")
-              ^floats wpe-floats (st/get-tensor-floats weights-mmap "wpe.weight")]
-          (println (format "Parsed Safetensors header (%d tensors, %d embedding weights)."
-                           (count metadata) (alength wte-floats)))
+              ^floats wpe-floats (st/get-tensor-floats weights-mmap "wpe.weight")
+              ^floats ln-f-g (st/get-tensor-floats weights-mmap "ln_f.weight")
+              ^floats ln-f-b (st/get-tensor-floats weights-mmap "ln_f.bias")
+              layers-weights (mapv (fn [i]
+                                     (let [kmap (gpt2/weight-key-map i)]
+                                       {:ln1-g (st/get-tensor-floats weights-mmap (:ln1-g kmap))
+                                        :ln1-b (st/get-tensor-floats weights-mmap (:ln1-b kmap))
+                                        :c-attn-w (st/get-tensor-floats weights-mmap (:c-attn-w kmap))
+                                        :c-attn-b (st/get-tensor-floats weights-mmap (:c-attn-b kmap))
+                                        :c-proj-w (st/get-tensor-floats weights-mmap (:c-proj-w kmap))
+                                        :c-proj-b (st/get-tensor-floats weights-mmap (:c-proj-b kmap))
+                                        :ln2-g (st/get-tensor-floats weights-mmap (:ln2-g kmap))
+                                        :ln2-b (st/get-tensor-floats weights-mmap (:ln2-b kmap))
+                                        :mlp-fc-w (st/get-tensor-floats weights-mmap (:mlp-fc-w kmap))
+                                        :mlp-fc-b (st/get-tensor-floats weights-mmap (:mlp-fc-b kmap))
+                                        :mlp-proj-w (st/get-tensor-floats weights-mmap (:mlp-proj-w kmap))
+                                        :mlp-proj-b (st/get-tensor-floats weights-mmap (:mlp-proj-b kmap))}))
+                                   (range 12))]
+          (println (format "Parsed Safetensors header (%d tensors, %d layers loaded)."
+                           (count metadata) (count layers-weights)))
 
           ;; 4. Trace single GPT-2 Transformer block & JIT Compile
           (println "Tracing & JIT Compiling GPT-2 Transformer block graph to XLA Executable...")
@@ -113,24 +130,27 @@
             (let [vocab-size 50257
                   emb-dim 768
                   step-fn (fn [context-ids]
-                            (let [n (count context-ids)
-                                  last-pos (dec n)
-                                  last-tok (nth context-ids last-pos)
-                                  tok-offset (* last-tok emb-dim)
-                                  pos-offset (* (min last-pos 1023) emb-dim)
-                                  ^floats h (float-array emb-dim)]
-                              (dotimes [i emb-dim]
-                                (aset-float h i (float (clamp-float (+ (aget wte-floats (+ tok-offset i))
-                                                                       (aget wpe-floats (+ pos-offset i)))))))
-                              (let [^floats logits (float-array vocab-size)]
-                                (dotimes [v vocab-size]
-                                  (let [v-offset (* v emb-dim)]
-                                    (loop [i 0 sum 0.0]
-                                      (if (< i emb-dim)
-                                        (recur (inc i) (+ sum (* (double (aget h i))
-                                                                 (double (aget wte-floats (+ v-offset i))))))
-                                        (aset-float logits v (float (clamp-float sum)))))))
-                                (vec logits))))
+                            (let [S (count context-ids)
+                                  X (mapv (fn [pos-idx]
+                                            (let [tok (nth context-ids pos-idx)
+                                                  tok-offset (* tok emb-dim)
+                                                  pos-offset (* (min pos-idx 1023) emb-dim)
+                                                  ^floats row (float-array emb-dim)]
+                                              (dotimes [i emb-dim]
+                                                (aset-float row i (float (clamp-float (+ (aget wte-floats (+ tok-offset i))
+                                                                                         (aget wpe-floats (+ pos-offset i)))))))
+                                              row))
+                                          (range S))
+                                  ^floats normed (gpt2/eval-gpt2-sequence X layers-weights ln-f-g ln-f-b)
+                                  ^floats logits (float-array vocab-size)]
+                              (dotimes [v vocab-size]
+                                (let [v-offset (* v emb-dim)]
+                                  (loop [i 0 sum 0.0]
+                                    (if (< i emb-dim)
+                                      (recur (inc i) (+ sum (* (double (aget normed i))
+                                                               (double (aget wte-floats (+ v-offset i))))))
+                                      (aset-float logits v (float (clamp-float sum)))))))
+                              (vec logits)))
                   gen-ids (ar/generate-tokens step-fn prompt-ids {:max-new-tokens max-new-tokens
                                                                   :temperature temperature
                                                                   :top-k top-k

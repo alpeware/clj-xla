@@ -4,7 +4,8 @@
   (:require [clj-xla.nn.activations :refer [gelu]]
             [clj-xla.nn.attention :refer [causal-self-attention linear]]
             [clj-xla.nn.norm :refer [layer-norm]]
-            [clj-xla.tensor :refer [+]]))
+            [clj-xla.tensor :refer [+]])
+  (:import [clj_xla Gpt2FastEngine]))
 
 (def DEFAULT_GPT2_CONFIG
   {:vocab-size 50257
@@ -47,6 +48,26 @@
         normed (layer-norm x-out ln-f-g ln-f-b)
         logits (linear normed lm-head-w nil)]
     logits))
+
+(defn eval-gpt2-sequence
+  "Evaluates 12-layer GPT-2 Transformer forward pass over sequence X using SIMD-vectorized Java 25 engine.
+   Returns final LayerNorm hidden state float-array of length 768 for the last token position S-1."
+  [X layers-weights ^floats ln-f-g ^floats ln-f-b]
+  (let [float-array-type (type (float-array 0))
+        ^"[[F" X-arr (into-array float-array-type X)
+        ^"[[F" ln1g (into-array float-array-type (mapv :ln1-g layers-weights))
+        ^"[[F" ln1b (into-array float-array-type (mapv :ln1-b layers-weights))
+        ^"[[F" cAtW (into-array float-array-type (mapv :c-attn-w layers-weights))
+        ^"[[F" cAtB (into-array float-array-type (mapv :c-attn-b layers-weights))
+        ^"[[F" cPrW (into-array float-array-type (mapv :c-proj-w layers-weights))
+        ^"[[F" cPrB (into-array float-array-type (mapv :c-proj-b layers-weights))
+        ^"[[F" ln2g (into-array float-array-type (mapv :ln2-g layers-weights))
+        ^"[[F" ln2b (into-array float-array-type (mapv :ln2-b layers-weights))
+        ^"[[F" fcW (into-array float-array-type (mapv :mlp-fc-w layers-weights))
+        ^"[[F" fcB (into-array float-array-type (mapv :mlp-fc-b layers-weights))
+        ^"[[F" prW (into-array float-array-type (mapv :mlp-proj-w layers-weights))
+        ^"[[F" prB (into-array float-array-type (mapv :mlp-proj-b layers-weights))]
+    (Gpt2FastEngine/evalSequence X-arr ln1g ln1b cAtW cAtB cPrW cPrB ln2g ln2b fcW fcB prW prB ln-f-g ln-f-b)))
 
 (defn weight-key-map
   "Maps HuggingFace GPT-2 Safetensors tensor names to internal key names for layer `layer-idx`."
