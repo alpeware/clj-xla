@@ -8,6 +8,9 @@
   :gpt2
   {:main-opts ["-m" "scripts.gpt2-inference"]
    :jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
+  :smollm
+  {:main-opts ["-m" "scripts.smollm-inference"]
+   :jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
   :repl
   {:jvm-opts ["-Dclojure.server.repl={:port 5555 :accept clojure.core.server/repl}"
               "--enable-native-access=ALL-UNNAMED"]}

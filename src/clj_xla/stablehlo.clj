@@ -1,79 +1,66 @@
 (ns clj-xla.stablehlo
-  "EDN SSA graph Malli schemas and StableHLO MLIR text formatter."
+  "EDN SSA Graph Schema Definition, Validation, and MLIR Serialization."
   (:require [clojure.string :as str]
             [malli.core :as m]))
 
-;; -----------------------------------------------------------------------------
-;; Malli Schemas for Jaxpr-Style EDN SSA Intermediate Representation
-;; -----------------------------------------------------------------------------
+(def TensorType
+  [:cat [:enum :tensor] [:vector :int] [:enum :f32 :f64 :i32 :i64 :f16 :bf16 :i8 :i16 :u8 :u16 :u32 :u64]])
 
-(def ElementTypeSchema
-  "Schema for supported tensor element data types."
-  [:enum :f16 :f32 :f64 :bf16 :i8 :i16 :i32 :i64 :pred])
+(def VariableDecl
+  [:tuple :keyword TensorType])
 
-(def TensorTypeSchema
-  "Schema for a tensor type specifier tuple [:tensor dims dtype]."
-  [:tuple [:= :tensor] [:vector :int] ElementTypeSchema])
-
-(def VarBindingSchema
-  "Schema for a named input variable binding [var-name tensor-type]."
-  [:tuple keyword? TensorTypeSchema])
-
-(def EquationSchema
-  "Schema for a single SSA graph equation."
+(def Equation
   [:map
    [:op keyword?]
    [:invars {:optional true} [:vector keyword?]]
    [:outvars [:vector keyword?]]
-   [:value {:optional true} [:or number? boolean? vector?]]
+   [:value {:optional true} any?]
    [:attrs {:optional true} map?]])
 
 (def GraphSchema
-  "Schema for an EDN SSA computation graph map."
   [:map
    [:name string?]
-   [:invars [:vector VarBindingSchema]]
+   [:invars [:vector VariableDecl]]
    [:outvars [:vector keyword?]]
-   [:eqns [:vector EquationSchema]]])
+   [:eqns [:vector Equation]]])
 
 (defn validate-graph
-  "Validates `graph` against `GraphSchema`. Throws an exception if invalid."
+  "Validates graph structure against Malli GraphSchema."
   [graph]
   (if (m/validate GraphSchema graph)
     graph
-    (throw (ex-info "Invalid EDN SSA Graph schema"
-                    {:explanation (m/explain GraphSchema graph)}))))
-
-;; -----------------------------------------------------------------------------
-;; MLIR Text Serialization
-;; -----------------------------------------------------------------------------
+    (throw (ex-info "Invalid SSA Graph EDN schema"
+                    {:errors (m/explain GraphSchema graph)}))))
 
 (defn type->mlir-string
-  "Converts `[:tensor [1 128 768] :f32]` to `tensor<1x128x768xf32>`."
-  [tensor-type]
-  (if (vector? tensor-type)
-    (let [[_ dims dtype] tensor-type
-          dim-str (str/join "x" dims)
-          dtype-str (name dtype)]
-      (if (seq dims)
-        (str "tensor<" dim-str "x" dtype-str ">")
-        (str "tensor<" dtype-str ">")))
-    "tensor<f32>"))
+  "Converts EDN SSA tensor type tuple to MLIR type string."
+  [[_dims shape dtype]]
+  (let [dtype-str (name dtype)
+        dims-str (str/join "x" shape)]
+    (if (seq shape)
+      (str "tensor<" dims-str "x" dtype-str ">")
+      (str "tensor<" dtype-str ">"))))
 
-(defn- format-op-name [op]
-  (let [op-str (name op)]
-    (str "stablehlo." op-str)))
+(defn- format-op-name [op-kw]
+  (let [n (name op-kw)]
+    (if (str/includes? n "/")
+      n
+      (str "stablehlo." n))))
+
+(defn- find-tensor-type [invars var-types]
+  (some (fn [inv]
+          (when-let [t (get var-types inv)]
+            (when (re-find #"^tensor<\d+x" t)
+              t)))
+        invars))
 
 (defn- infer-var-types [invars eqns]
   (let [initial-types (into {} (map (fn [[v t]] [v (type->mlir-string t)]) invars))]
     (reduce (fn [acc {:keys [op invars outvars]}]
               (let [in-vars (or invars [])
-                    in-types (keep acc in-vars)
-                    out-types (keep acc outvars)
-                    fallback-type (or (first (filter #(str/includes? % "1x128x") (concat in-types out-types)))
-                                      (first in-types)
-                                      (first out-types)
-                                      "tensor<f32>")]
+                    non-scalar-t (find-tensor-type in-vars acc)
+                    first-in (first in-vars)
+                    in-type (or non-scalar-t (when first-in (get acc first-in)))]
                 (cond
                   (= op :stablehlo/constant)
                   (assoc acc (first outvars) "tensor<f32>")
@@ -84,21 +71,22 @@
                   (= op :stablehlo/dot_general)
                   (let [lhs-v (first in-vars)
                         rhs-v (second in-vars)
-                        lhs-t (get acc lhs-v "tensor<1x128x768xf32>")
-                        rhs-t (get acc rhs-v "tensor<768x768xf32>")
-                        lhs-k (or (second (re-find #"tensor<\d+x\d+x(\d+)xf32>" lhs-t)) "768")
-                        [rhs-d0 rhs-d1] (or (rest (re-find #"tensor<(\d+)x(\d+)xf32>" rhs-t)) ["768" "768"])
+                        lhs-t (get acc lhs-v "tensor<1x128x576xf32>")
+                        rhs-t (get acc rhs-v "tensor<576x576xf32>")
+                        lhs-k (or (second (re-find #"tensor<\d+x\d+x(\d+)xf32>" lhs-t)) "576")
+                        [rhs-d0 rhs-d1] (or (rest (re-find #"tensor<(\d+)x(\d+)xf32>" rhs-t)) ["576" "576"])
                         out-dim (if (= rhs-d0 lhs-k) rhs-d1 rhs-d0)
                         out-t (str "tensor<1x128x" out-dim "xf32>")]
                     (assoc acc (first outvars) out-t))
 
                   :else
-                  (reduce (fn [a v]
-                            (if (contains? initial-types v)
-                              a
-                              (assoc a v fallback-type)))
-                          acc
-                          outvars))))
+                  (let [target-type (or in-type "tensor<1x128x576xf32>")]
+                    (reduce (fn [a v]
+                              (if (contains? initial-types v)
+                                a
+                                (assoc a v target-type)))
+                            acc
+                            outvars)))))
             initial-types
             eqns)))
 
@@ -128,10 +116,17 @@
              "    }) {dimensions = array<i64: " axes-str ">} : (" in-type ", tensor<f32>) -> tensor<1x128xf32>\n"
              "    %" (name out-var) " = stablehlo.reshape %" (name out-var) "_red : (tensor<1x128xf32>) -> " out-type))
 
+      (= op :stablehlo/custom_call)
+      (let [target-name (or (get attrs :call_target_name) "rope")
+            in-var (first invars)
+            in-type (get var-types in-var "tensor<1x128x576xf32>")
+            out-type (get var-types out-var "tensor<1x128x576xf32>")]
+        (str "    %" (name out-var) " = \"stablehlo.custom_call\"(%" (name in-var) ") {call_target_name = \"" target-name "\"} : (" in-type ") -> " out-type))
+
       (= op :stablehlo/dot_general)
       (let [[lhs rhs] invars
-            lhs-type (get var-types lhs "tensor<1x128x768xf32>")
-            rhs-type (get var-types rhs "tensor<768x768xf32>")
+            lhs-type (get var-types lhs "tensor<1x128x576xf32>")
+            rhs-type (get var-types rhs "tensor<576x576xf32>")
             out-type (get var-types out-var "tensor<f32>")
             contracting (get attrs :contracting_dims [[2] [0]])
             rhs-c (str (first (second contracting)))]
@@ -140,8 +135,8 @@
              "(" lhs-type ", " rhs-type ") -> " out-type))
 
       :else
-      (let [in-types (map #(get var-types % "tensor<f32>") invars)
-            out-type (get var-types out-var "tensor<f32>")
+      (let [in-types (map #(get var-types % "tensor<1x128x576xf32>") invars)
+            out-type (get var-types out-var (or (find-tensor-type invars var-types) (get var-types (first invars)) "tensor<1x128x576xf32>"))
             [in-vars-str prep-lines]
             (reduce (fn [[v-strs p-lines] [inv in-t]]
                       (cond

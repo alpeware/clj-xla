@@ -1,5 +1,5 @@
 (ns clj-xla.nn.attention-test
-  "Unit and generative tests for self-attention mechanisms."
+  "Unit and generative tests for self-attention mechanisms and RoPE positioning."
   (:require [clj-xla.nn.attention :as attn]
             [clj-xla.tensor :as t :refer [tracer?]]
             [clj-xla.trace :refer [trace-graph]]
@@ -16,9 +16,14 @@
                                            [:c_attn_b [:tensor [2304] :f32]]
                                            [:c_proj_w [:tensor [768 768] :f32]]
                                            [:c_proj_b [:tensor [768] :f32]]]
-                                          (fn [x w b pw pb] (attn/causal-self-attention x w b pw pb 12)))]
+                                          (fn [x w b pw pb] (attn/causal-self-attention x w b pw pb 12)))
+                      g-rope (trace-graph "rope_test"
+                                          [[:q [:tensor [1 16 96] :f32]]]
+                                          (fn [q] (attn/apply-rope q [0])))]
                   (and (= "causal_attn" (:name g-attn))
-                       (seq (:eqns g-attn))))))
+                       (= "rope_test" (:name g-rope))
+                       (seq (:eqns g-attn))
+                       (seq (:eqns g-rope))))))
 
 (deftest attention-tracer-test
   (testing "Causal self-attention returns Tracer on Tracer input"
@@ -27,4 +32,5 @@
           b (t/->Tracer :b [:tensor [2304] :f32])
           pw (t/->Tracer :pw [:tensor [768 768] :f32])
           pb (t/->Tracer :pb [:tensor [768] :f32])]
-      (is (tracer? (attn/causal-self-attention x w b pw pb 12))))))
+      (is (tracer? (attn/causal-self-attention x w b pw pb 12)))
+      (is (tracer? (attn/apply-rope x [0]))))))

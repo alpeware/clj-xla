@@ -26,14 +26,26 @@
   "Loads HuggingFace `tokenizer.json` file keeping raw string tokens intact."
   [json-path]
   (let [data (json/read-str (slurp json-path))
-        vocab-map (get-in data ["model" "vocab"])
-        merges (get-in data ["model" "merges"])
+        vocab-map (or (get-in data ["model" "vocab"]) {})
+        merges (or (get-in data ["model" "merges"]) [])
         encoder (into {} (map (fn [[k v]] [k (int v)]) vocab-map))
-        vocab (into {} (map (fn [[k v]] [v k]) encoder))
+        vocab (into {} (map (fn [[k v]] [(int v) k]) vocab-map))
         merge-pairs (for [item merges
-                          :let [parts (str/split item #" ")]
+                          :let [parts (cond
+                                        (string? item) (str/split item #" ")
+                                        (sequential? item) item
+                                        :else [])]
                           :when (= 2 (count parts))]
                       [(first parts) (second parts)])
         bpe-ranks (into {} (map-indexed (fn [i pair] [pair i]) merge-pairs))
-        eos-id (get encoder "<|endoftext|>" 50256)]
-    (->HFJsonTokenizer vocab encoder bpe-ranks eos-id eos-id)))
+        eos-id (or (get encoder "<|endoftext|>")
+                   (get encoder "</s>")
+                   (get encoder "<eos>")
+                   (get encoder "<|im_end|>")
+                   0)
+        bos-id (or (get encoder "<|endoftext|>")
+                   (get encoder "<s>")
+                   (get encoder "<bos>")
+                   (get encoder "<|im_start|>")
+                   0)]
+    (->HFJsonTokenizer vocab encoder bpe-ranks bos-id eos-id)))
