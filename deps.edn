@@ -4,21 +4,21 @@
         metosin/malli {:mvn/version "0.16.4"}}
  :aliases
  {:run
-  {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
+  {:jvm-opts ["--enable-native-access=ALL-UNNAMED" "-Xmx4g"]}
   :gpt2
   {:main-opts ["-m" "scripts.gpt2-inference"]
-   :jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
+   :jvm-opts ["--enable-native-access=ALL-UNNAMED" "-Xmx4g"]}
   :smollm
   {:main-opts ["-m" "scripts.smollm-inference"]
-   :jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
+   :jvm-opts ["--enable-native-access=ALL-UNNAMED" "-Xmx4g"]}
   :repl
   {:jvm-opts ["-Dclojure.server.repl={:port 5555 :accept clojure.core.server/repl}"
-              "--enable-native-access=ALL-UNNAMED"]}
+              "--enable-native-access=ALL-UNNAMED" "-Xmx4g"]}
   :test
   {:extra-paths ["test"]
    :extra-deps {org.clojure/test.check {:mvn/version "1.1.1"}}
    :jvm-opts ["-Dclojure.server.repl={:port 5555 :accept clojure.core.server/repl}"
-              "--enable-native-access=ALL-UNNAMED"]}
+              "--enable-native-access=ALL-UNNAMED" "-Xmx4g"]}
   :lint
   {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2026.01.19"}
                   org.clojure/data.json {:mvn/version "2.5.0"}

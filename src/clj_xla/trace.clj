@@ -17,5 +17,6 @@
         raw-graph {:name graph-name
                    :invars invars
                    :outvars outvars
-                   :eqns @eqns-atom}]
+                   :eqns @eqns-atom
+                   :f f}]
     (shlo/validate-graph raw-graph)))

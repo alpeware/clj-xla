@@ -2,10 +2,9 @@
   "SmolLM Architecture Assembler and Safetensors Parameter Key Mapping."
   (:refer-clojure :exclude [+])
   (:require [clj-xla.nn.activations :refer [swiglu]]
-            [clj-xla.nn.attention :refer [apply-rope linear]]
+            [clj-xla.nn.attention :refer [apply-rope gqa-causal-attention linear]]
             [clj-xla.nn.norm :refer [rms-norm]]
-            [clj-xla.tensor :refer [+]])
-  (:import [clj_xla SmolLMFastEngine]))
+            [clj-xla.tensor :refer [+]]))
 
 (def DEFAULT_SMOLLM_CONFIG
   {:vocab-size 49152
@@ -28,15 +27,13 @@
   (swiglu x gate-w up-w down-w))
 
 (defn smollm-attention
-  "SmolLM Multi-Head Causal Self-Attention with RoPE."
-  [x q-w k-w v-w o-w _num-heads _num-kv-heads pos-ids]
+  "SmolLM Multi-Head Causal Self-Attention with RoPE and Grouped-Query Attention."
+  [x q-w k-w v-w o-w num-heads num-kv-heads pos-ids]
   (let [q (linear x q-w nil)
         k (linear x k-w nil)
         v (linear x v-w nil)
-        [q-rope k-rope] (apply-rope q k pos-ids)
-        _qkv [q-rope k-rope v]
-        attn-out (linear x o-w nil)]
-    attn-out))
+        [q-rope k-rope] (apply-rope q k pos-ids)]
+    (gqa-causal-attention q-rope k-rope v o-w num-heads num-kv-heads)))
 
 (defn smollm-block
   "Single SmolLM Llama-style Transformer layer block."
@@ -60,23 +57,6 @@
         normed (rms-norm x-out final-norm-w 1e-5)
         logits (linear normed lm-head-w nil)]
     logits))
-
-(defn eval-smollm-sequence
-  "Evaluates 30-layer SmolLM-135M Transformer forward pass over sequence X using SIMD-vectorized Java 25 engine.
-   Returns final RMSNorm hidden state float-array of length 576 for the last token position S-1."
-  [X layers-weights ^floats final-norm-w]
-  (let [float-array-type (type (float-array 0))
-        ^"[[F" X-arr (into-array float-array-type X)
-        ^"[[F" inLn (into-array float-array-type (mapv :input-ln-w layers-weights))
-        ^"[[F" qW (into-array float-array-type (mapv :q-w layers-weights))
-        ^"[[F" kW (into-array float-array-type (mapv :k-w layers-weights))
-        ^"[[F" vW (into-array float-array-type (mapv :v-w layers-weights))
-        ^"[[F" oW (into-array float-array-type (mapv :o-w layers-weights))
-        ^"[[F" postLn (into-array float-array-type (mapv :post-attn-ln-w layers-weights))
-        ^"[[F" gateW (into-array float-array-type (mapv :gate-w layers-weights))
-        ^"[[F" upW (into-array float-array-type (mapv :up-w layers-weights))
-        ^"[[F" downW (into-array float-array-type (mapv :down-w layers-weights))]
-    (SmolLMFastEngine/evalSequence X-arr inLn qW kW vW oW postLn gateW upW downW final-norm-w)))
 
 (defn weight-key-map
   "Maps HuggingFace SmolLM Safetensors tensor names to internal key names for layer `layer-idx`."

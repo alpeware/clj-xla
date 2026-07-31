@@ -1,5 +1,5 @@
 (ns scripts.smollm-inference
-  "Top-level runnable integration script for end-to-end SmolLM-135M text generation."
+  "Top-level runnable integration script for end-to-end SmolLM-135M text generation via pure XLA execution."
   (:require [clj-xla.core :as xla]
             [clj-xla.generation.autoregressive :as ar]
             [clj-xla.models.smollm :as smollm]
@@ -48,7 +48,7 @@
           (recur (subvec remaining 1) opts))))))
 
 (defn -main
-  "Runs end-to-end SmolLM-135M text generation pipeline: model loading, tokenization, graph tracing, StableHLO JIT compilation, and autoregressive decoding."
+  "Runs end-to-end SmolLM-135M text generation pipeline: model loading, tokenization, full-model graph tracing, StableHLO JIT compilation, and autoregressive decoding."
   [& args]
   (let [{:keys [prompt max-new-tokens temperature top-k]} (parse-cli-args args)]
     (println "==================================================================")
@@ -94,34 +94,39 @@
           (println (format "Parsed Safetensors header (%d tensors, %d layers loaded)."
                            (count metadata) (count layers-weights)))
 
-          ;; 4. Trace single SmolLM Transformer block & JIT Compile
-          (println "Tracing & JIT Compiling SmolLM Transformer block graph to XLA Executable...")
-          (let [block-fn (fn [x in-ln qw kw vw ow post-ln gw uw dw]
-                           (smollm/smollm-block x {:input-ln-w in-ln
-                                                   :q-w qw :k-w kw :v-w vw :o-w ow
-                                                   :post-attn-ln-w post-ln
-                                                   :gate-w gw :up-w uw :down-w dw} 9 3 [0]))
-                graph (trace-graph "smollm_transformer_block"
-                                   [[:x [:tensor [1 128 576] :f32]]
-                                    [:in_ln [:tensor [576] :f32]]
-                                    [:qw [:tensor [576 576] :f32]]
-                                    [:kw [:tensor [576 192] :f32]]
-                                    [:vw [:tensor [576 192] :f32]]
-                                    [:ow [:tensor [576 576] :f32]]
-                                    [:post_ln [:tensor [576] :f32]]
-                                    [:gw [:tensor [576 1536] :f32]]
-                                    [:uw [:tensor [576 1536] :f32]]
-                                    [:dw [:tensor [1536 576] :f32]]]
-                                   block-fn)
-                _exec (xla/compile-graph ctx graph)]
+          ;; 4. Trace full SmolLM-135M Model graph & JIT Compile
+          (println "Tracing & JIT Compiling full SmolLM-135M model graph to XLA Executable...")
+          (let [invars (into [[:x [:tensor [1 128 576] :f32]]
+                              [:final_norm_w [:tensor [576] :f32]]
+                              [:lm_head_w [:tensor [576 49152] :f32]]]
+                             (mapcat (fn [i]
+                                       [[(keyword (str "input_ln_w_" i)) [:tensor [576] :f32]]
+                                        [(keyword (str "q_w_" i)) [:tensor [576 576] :f32]]
+                                        [(keyword (str "k_w_" i)) [:tensor [576 192] :f32]]
+                                        [(keyword (str "v_w_" i)) [:tensor [576 192] :f32]]
+                                        [(keyword (str "o_w_" i)) [:tensor [576 576] :f32]]
+                                        [(keyword (str "post_attn_ln_w_" i)) [:tensor [576] :f32]]
+                                        [(keyword (str "gate_w_" i)) [:tensor [576 1536] :f32]]
+                                        [(keyword (str "up_w_" i)) [:tensor [576 1536] :f32]]
+                                        [(keyword (str "down_w_" i)) [:tensor [1536 576] :f32]]])
+                                     (range 30)))
+                trace-fn (fn [x fn-norm lm-hw & layer-args]
+                           (let [lw-seq (mapv (fn [[in-ln qw kw vw ow post-ln gw uw dw]]
+                                                {:input-ln-w in-ln :q-w qw :k-w kw :v-w vw :o-w ow :post-attn-ln-w post-ln :gate-w gw :up-w uw :down-w dw})
+                                              (partition 9 layer-args))]
+                             (smollm/full-smollm-forward x lw-seq fn-norm lm-hw [0])))
+                graph (trace-graph "full_smollm_model" invars trace-fn)
+                exec (xla/compile-graph ctx graph)]
             (println "Successfully compiled StableHLO graph to native XLA PjRtLoadedExecutable handle.")
 
             ;; 5. Execute Autoregressive Generation Loop
             (println "\nGenerating tokens autoregressively...")
             (print prompt)
             (flush)
-            (let [vocab-size 49152
-                  emb-dim 576
+            (let [emb-dim 576
+                  flat-layer-weights (vec (mapcat (fn [m]
+                                                    [(:input-ln-w m) (:q-w m) (:k-w m) (:v-w m) (:o-w m) (:post-attn-ln-w m) (:gate-w m) (:up-w m) (:down-w m)])
+                                                  layers-weights))
                   step-fn (fn [context-ids]
                             (let [S (count context-ids)
                                   X (mapv (fn [pos-idx]
@@ -130,18 +135,13 @@
                                                   ^floats row (float-array emb-dim)]
                                               (dotimes [i emb-dim]
                                                 (aset-float row i (float (clamp-float (aget embed-tokens (+ tok-offset i))))))
-                                              row))
+                                              (vec row)))
                                           (range S))
-                                  ^floats normed (smollm/eval-smollm-sequence X layers-weights final-norm-w)
-                                  ^floats logits (float-array vocab-size)]
-                              (dotimes [v vocab-size]
-                                (let [v-offset (* v emb-dim)]
-                                  (loop [i 0 sum 0.0]
-                                    (if (< i emb-dim)
-                                      (recur (inc i) (+ sum (* (double (aget normed i))
-                                                               (double (aget lm-head-w (+ v-offset i))))))
-                                      (aset-float logits v (float (clamp-float sum)))))))
-                              (vec logits)))
+                                  input-tensor [X]
+                                  input-args (into [input-tensor final-norm-w lm-head-w] flat-layer-weights)
+                                  logits-out (xla/execute exec input-args)
+                                  last-logits (xla/to-host-slice logits-out)]
+                              last-logits))
                   gen-ids (ar/generate-tokens step-fn prompt-ids {:max-new-tokens max-new-tokens
                                                                   :temperature temperature
                                                                   :top-k top-k

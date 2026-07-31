@@ -12,15 +12,16 @@
 
 (defn compile-graph
   "Serializes `graph` to StableHLO MLIR text, checks the in-memory SHA-256 cache,
-   and returns the compiled PjRtLoadedExecutable handle."
+   and returns the compiled PjRtLoadedExecutable handle map."
   [api-ctx client graph]
   (let [mlir-text (shlo/graph->mlir-text graph)
         hash-key (sha256-hash mlir-text)]
     (if-let [cached-exec (get @exec-cache hash-key)]
-      cached-exec
-      (let [exec (pjrt/compile-mlir api-ctx client mlir-text)]
-        (swap! exec-cache assoc hash-key exec)
-        exec))))
+      (assoc cached-exec :f (:f graph) :graph graph)
+      (let [exec (pjrt/compile-mlir api-ctx client mlir-text)
+            exec-obj {:handle exec :hash hash-key :f (:f graph) :graph graph}]
+        (swap! exec-cache assoc hash-key exec-obj)
+        exec-obj))))
 
 (defn clear-cache!
   "Clears the in-memory compilation cache."

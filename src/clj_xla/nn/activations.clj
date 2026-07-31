@@ -2,7 +2,7 @@
   "Neural network activation functions (GELU, SiLU, SwiGLU, ReLU, Softmax)."
   (:refer-clojure :exclude [+ * - /])
   (:require [clj-xla.nn.attention :refer [linear]]
-            [clj-xla.tensor :refer [+ * - / pow tanh]]))
+            [clj-xla.tensor :refer [+ * - / exp pow tanh]]))
 
 (defn gelu
   "Gaussian Error Linear Unit (GELU) activation function."
@@ -13,7 +13,7 @@
 (defn sigmoid
   "Logistic sigmoid activation function."
   [x]
-  (/ 1.0 (+ 1.0 (pow Math/E (- x)))))
+  (/ 1.0 (+ 1.0 (exp (- x)))))
 
 (defn silu
   "Sigmoid Linear Unit (SiLU / Swish) activation function: x * sigmoid(x)."
