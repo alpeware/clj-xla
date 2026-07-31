@@ -28,18 +28,10 @@ public class SmolLMFastEngine {
             System.arraycopy(X[s], 0, CurrM[s], 0, embDim);
         }
 
-        double[] qAcc = new double[embDim];
-        double[] kAcc = new double[192];
-        double[] vAcc = new double[192];
-        double[] oAcc = new double[embDim];
-        double[] gateAcc = new double[intermediateSize];
-        double[] upAcc = new double[intermediateSize];
-        double[] downAcc = new double[embDim];
-
         double[] scoresBuf = new double[2048];
         double[] expsBuf = new double[2048];
 
-        // Precompute RoPE cos/sin frequencies for max seq len
+        // Precompute RoPE cos/sin frequencies
         double[][] cosTable = new double[S][32];
         double[][] sinTable = new double[S][32];
         for (int pos = 0; pos < S; pos++) {
@@ -69,7 +61,7 @@ public class SmolLMFastEngine {
                 }
             }
 
-            // 2. Q, K, V Projections
+            // 2. Q, K, V Projections (Safetensors weight layout: [out_features, in_features])
             float[][] Q = new float[S][embDim];
             float[][] K = new float[S][192];
             float[][] V = new float[S][192];
@@ -77,38 +69,35 @@ public class SmolLMFastEngine {
             for (int pos = 0; pos < S; pos++) {
                 float[] r = MNorm1[pos];
 
-                // Q Projection: 576 -> 576
-                for (int j = 0; j < embDim; j++) qAcc[j] = 0.0;
-                for (int i = 0; i < embDim; i++) {
-                    double v = r[i];
-                    int rowOff = i * embDim;
-                    for (int j = 0; j < embDim; j++) {
-                        qAcc[j] += v * qw[rowOff + j];
+                // Q Projection: in_dim=576, out_dim=576
+                for (int o = 0; o < embDim; o++) {
+                    double sum = 0.0;
+                    int rowOff = o * embDim;
+                    for (int i = 0; i < embDim; i++) {
+                        sum += r[i] * qw[rowOff + i];
                     }
+                    Q[pos][o] = (float) clamp(sum);
                 }
-                for (int j = 0; j < embDim; j++) Q[pos][j] = (float) clamp(qAcc[j]);
 
-                // K Projection: 576 -> 192
-                for (int j = 0; j < 192; j++) kAcc[j] = 0.0;
-                for (int i = 0; i < embDim; i++) {
-                    double v = r[i];
-                    int rowOff = i * 192;
-                    for (int j = 0; j < 192; j++) {
-                        kAcc[j] += v * kw[rowOff + j];
+                // K Projection: in_dim=576, out_dim=192
+                for (int o = 0; o < 192; o++) {
+                    double sum = 0.0;
+                    int rowOff = o * embDim;
+                    for (int i = 0; i < embDim; i++) {
+                        sum += r[i] * kw[rowOff + i];
                     }
+                    K[pos][o] = (float) clamp(sum);
                 }
-                for (int j = 0; j < 192; j++) K[pos][j] = (float) clamp(kAcc[j]);
 
-                // V Projection: 576 -> 192
-                for (int j = 0; j < 192; j++) vAcc[j] = 0.0;
-                for (int i = 0; i < embDim; i++) {
-                    double v = r[i];
-                    int rowOff = i * 192;
-                    for (int j = 0; j < 192; j++) {
-                        vAcc[j] += v * vw[rowOff + j];
+                // V Projection: in_dim=576, out_dim=192
+                for (int o = 0; o < 192; o++) {
+                    double sum = 0.0;
+                    int rowOff = o * embDim;
+                    for (int i = 0; i < embDim; i++) {
+                        sum += r[i] * vw[rowOff + i];
                     }
+                    V[pos][o] = (float) clamp(sum);
                 }
-                for (int j = 0; j < 192; j++) V[pos][j] = (float) clamp(vAcc[j]);
             }
 
             // 3. Apply RoPE to Q and K
@@ -116,7 +105,6 @@ public class SmolLMFastEngine {
                 double[] cosP = cosTable[pos];
                 double[] sinP = sinTable[pos];
 
-                // Rotate Q (9 heads)
                 for (int h = 0; h < numHeads; h++) {
                     int hOff = h * headDim;
                     for (int i = 0; i < 32; i++) {
@@ -128,7 +116,6 @@ public class SmolLMFastEngine {
                     }
                 }
 
-                // Rotate K (3 heads)
                 for (int h = 0; h < numKvHeads; h++) {
                     int hOff = h * headDim;
                     for (int i = 0; i < 32; i++) {
@@ -175,19 +162,18 @@ public class SmolLMFastEngine {
                 }
             }
 
-            // 5. Attn Output Projection: 576 -> 576
+            // 5. Output Projection: in_dim=576, out_dim=576
             float[][] AttnProj = new float[S][embDim];
             for (int pos = 0; pos < S; pos++) {
                 float[] r = AttnMerged[pos];
-                for (int j = 0; j < embDim; j++) oAcc[j] = 0.0;
-                for (int i = 0; i < embDim; i++) {
-                    double v = r[i];
-                    int rowOff = i * embDim;
-                    for (int j = 0; j < embDim; j++) {
-                        oAcc[j] += v * ow[rowOff + j];
+                for (int o = 0; o < embDim; o++) {
+                    double sum = 0.0;
+                    int rowOff = o * embDim;
+                    for (int i = 0; i < embDim; i++) {
+                        sum += r[i] * ow[rowOff + i];
                     }
+                    AttnProj[pos][o] = (float) clamp(sum);
                 }
-                for (int j = 0; j < embDim; j++) AttnProj[pos][j] = (float) clamp(oAcc[j]);
             }
 
             // 6. Residual 1
@@ -216,37 +202,29 @@ public class SmolLMFastEngine {
             for (int pos = 0; pos < S; pos++) {
                 float[] r = MNorm2[pos];
 
-                // Gate & Up projections: 576 -> 1536
-                for (int j = 0; j < intermediateSize; j++) {
-                    gateAcc[j] = 0.0;
-                    upAcc[j] = 0.0;
-                }
-                for (int i = 0; i < embDim; i++) {
-                    double v = r[i];
-                    int rowOff = i * intermediateSize;
-                    for (int j = 0; j < intermediateSize; j++) {
-                        gateAcc[j] += v * gw[rowOff + j];
-                        upAcc[j] += v * uw[rowOff + j];
+                // Gate & Up projections: in_dim=576, out_dim=1536
+                for (int o = 0; o < intermediateSize; o++) {
+                    double gSum = 0.0;
+                    double uSum = 0.0;
+                    int rowOff = o * embDim;
+                    for (int i = 0; i < embDim; i++) {
+                        double v = r[i];
+                        gSum += v * gw[rowOff + i];
+                        uSum += v * uw[rowOff + i];
                     }
+                    double siluG = gSum / (1.0 + Math.exp(-gSum));
+                    actUpOut[o] = (float) clamp(siluG * uSum);
                 }
 
-                for (int j = 0; j < intermediateSize; j++) {
-                    double gv = gateAcc[j];
-                    double uv = upAcc[j];
-                    double siluG = gv / (1.0 + Math.exp(-gv));
-                    actUpOut[j] = (float) clamp(siluG * uv);
-                }
-
-                // Down projection: 1536 -> 576
-                for (int j = 0; j < embDim; j++) downAcc[j] = 0.0;
-                for (int i = 0; i < intermediateSize; i++) {
-                    double v = actUpOut[i];
-                    int rowOff = i * embDim;
-                    for (int j = 0; j < embDim; j++) {
-                        downAcc[j] += v * dw[rowOff + j];
+                // Down projection: in_dim=1536, out_dim=576
+                for (int o = 0; o < embDim; o++) {
+                    double sum = 0.0;
+                    int rowOff = o * intermediateSize;
+                    for (int i = 0; i < intermediateSize; i++) {
+                        sum += actUpOut[i] * dw[rowOff + i];
                     }
+                    MMlp[pos][o] = (float) clamp(sum);
                 }
-                for (int j = 0; j < embDim; j++) MMlp[pos][j] = (float) clamp(downAcc[j]);
             }
 
             // 9. Residual 2
@@ -257,7 +235,7 @@ public class SmolLMFastEngine {
             }
         }
 
-        // Final RMSNorm on last position S-1
+        // Final RMSNorm on last token position S-1
         float[] lastRow = CurrM[S - 1];
         float[] finalNormed = new float[embDim];
         double sumSq = 0.0;
