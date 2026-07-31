@@ -35,3 +35,12 @@
         ^MemorySegment mapped-seg (.map fc FileChannel$MapMode/READ_ONLY (+ 8 header-size) weight-bytes-len arena)]
     {:header metadata
      :segment mapped-seg}))
+
+(defn get-tensor-slice
+  "Extracts off-heap memory segment slice for tensor `tensor-name` from mapped weights."
+  [{:keys [header segment]} tensor-name]
+  (if-let [tensor-info (get header tensor-name)]
+    (let [[start end] (get tensor-info "data_offsets")
+          len (- end start)]
+      (.asSlice ^MemorySegment segment start len))
+    (throw (ex-info "Tensor key not found in Safetensors header" {:tensor tensor-name}))))

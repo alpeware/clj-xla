@@ -37,8 +37,19 @@
         mlp-out (gpt2-mlp x-norm2 mlp-fc-w mlp-fc-b mlp-proj-w mlp-proj-b)]
     (+ x-res1 mlp-out)))
 
+(defn full-gpt2-forward
+  "Full GPT-2 Transformer forward pass: multi-block sequence -> final LayerNorm -> LM head vocabulary projection."
+  [x layers-weights ln-f-g ln-f-b lm-head-w]
+  (let [x-out (reduce (fn [h layer-w]
+                        (gpt2-block h layer-w 12))
+                      x
+                      layers-weights)
+        normed (layer-norm x-out ln-f-g ln-f-b)
+        logits (linear normed lm-head-w nil)]
+    logits))
+
 (defn weight-key-map
-  "Maps HuggingFace GPT-2 Safetensors tensor names to internal key names."
+  "Maps HuggingFace GPT-2 Safetensors tensor names to internal key names for layer `layer-idx`."
   [layer-idx]
   (let [prefix (str "h." layer-idx ".")]
     {:ln1-g (str prefix "ln_1.weight")

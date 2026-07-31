@@ -33,31 +33,33 @@
 (defn byte-encoded->string
   "Decodes GPT-2 byte-unicode representation back into a UTF-8 string."
   [s]
-  (let [byte-arr (byte-array (map #(get unicode->bytes % (byte 0)) s))]
-    (String. ^bytes byte-arr "UTF-8")))
+  (let [bs (mapv #(get unicode->bytes % (byte 0)) s)
+        arr (byte-array (count bs) (map byte bs))]
+    (String. arr "UTF-8")))
 
 ;; -----------------------------------------------------------------------------
 ;; BPE Merge Algorithm
 ;; -----------------------------------------------------------------------------
 
 (defn- get-pairs [word]
-  (map vector word (rest word)))
+  (mapv vector word (rest word)))
 
 (defn- bpe-word [word bpe-ranks]
   (loop [w (mapv str word)]
     (let [pairs (get-pairs w)]
       (if (empty? pairs)
         (str/join " " w)
-        (let [pair (min-key #(get bpe-ranks % Double/POSITIVE_INFINITY) pairs)]
-          (if (not (contains? bpe-ranks pair))
+        (let [valid-pairs (filter #(contains? bpe-ranks %) pairs)]
+          (if (empty? valid-pairs)
             (str/join " " w)
-            (let [[first-part second-part] pair
+            (let [pair (first (sort-by #(get bpe-ranks %) valid-pairs))
+                  [first-part second-part] pair
                   new-w (loop [in w out []]
                           (cond
                             (empty? in) out
-                            (and (= (nth in 0) first-part)
+                            (and (= (first in) first-part)
                                  (> (count in) 1)
-                                 (= (nth in 1) second-part))
+                                 (= (second in) second-part))
                             (recur (subvec in 2) (conj out (str first-part second-part)))
                             :else
                             (recur (subvec in 1) (conj out (first in)))))]

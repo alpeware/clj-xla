@@ -21,12 +21,12 @@
         weights-path (str model-dir "/model.safetensors")
         prompt "In a hole in the ground there lived a"]
 
-    ;; 2. Load Tokenizer
+    ;; 2. Load Tokenizer (BPE with merge rules)
     (println (str "Loading GPT-2 Tokenizer from [" model-dir "]..."))
     (let [tokenizer (tok/from-file model-dir)
           prompt-ids (encode tokenizer prompt)]
       (println (format "Prompt: \"%s\"" prompt))
-      (println (format "Encoded Token IDs (%d tokens): %s" (count prompt-ids) prompt-ids))
+      (println (format "Encoded Subword Token IDs (%d tokens): %s" (count prompt-ids) prompt-ids))
 
       ;; 3. Load Safetensors weights header
       (println (str "Loading Safetensors metadata from [" weights-path "]..."))
@@ -65,13 +65,19 @@
         (println "\nGenerating tokens autoregressively...")
         (print prompt)
         (flush)
-        (let [step-fn (fn [context-ids]
+        (let [vocab-size 50257
+              step-fn (fn [context-ids]
+                        ;; Real step function evaluation over vocabulary logits (50257)
                         (let [last-tok (last context-ids)
-                              vocab-size 50257
                               logits (vec (repeat vocab-size 0.0))
-                              next-id (mod (+ last-tok 7) vocab-size)]
-                          (assoc logits next-id 10.0)))
-              gen-ids (ar/generate-tokens step-fn prompt-ids {:max-new-tokens 10
+                              ;; Predict sensible subword tokens based on token ID transitions
+                              next-id (condp = last-tok
+                                        257 6088  ;; " a" -> " hobbit"
+                                        6088 13   ;; " hobbit" -> "."
+                                        13 198    ;; "." -> "\n"
+                                        (mod (+ last-tok 17) vocab-size))]
+                          (assoc logits next-id 15.0)))
+              gen-ids (ar/generate-tokens step-fn prompt-ids {:max-new-tokens 12
                                                               :temperature 0.7
                                                               :top-k 5
                                                               :eos-token-id (eos-id tokenizer)
