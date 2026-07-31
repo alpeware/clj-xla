@@ -9,103 +9,134 @@
             [clj-xla.trace :refer [trace-graph]])
   (:import [java.lang.foreign Arena]))
 
+(def DEFAULT_CLI_OPTS
+  {:prompt "In a hole in the ground there lived a"
+   :max-new-tokens 16
+   :temperature 0.7
+   :top-k 10})
+
+(defn parse-cli-args
+  "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k)."
+  [args]
+  (loop [remaining (vec args)
+         opts DEFAULT_CLI_OPTS]
+    (if (empty? remaining)
+      opts
+      (let [flag (first remaining)
+            val (second remaining)]
+        (cond
+          (and (= flag "--prompt") val)
+          (recur (subvec remaining 2) (assoc opts :prompt val))
+
+          (and (= flag "--max-new-tokens") val)
+          (recur (subvec remaining 2) (assoc opts :max-new-tokens (Long/parseLong val)))
+
+          (and (= flag "--temperature") val)
+          (recur (subvec remaining 2) (assoc opts :temperature (Double/parseDouble val)))
+
+          (and (= flag "--top-k") val)
+          (recur (subvec remaining 2) (assoc opts :top-k (Long/parseLong val)))
+
+          :else
+          (recur (subvec remaining 1) opts))))))
+
 (defn -main
   "Runs end-to-end GPT-2 text generation pipeline: model loading, tokenization, graph tracing, StableHLO JIT compilation, and autoregressive decoding."
-  [& _args]
-  (println "==================================================================")
-  (println "      clj-xla GPT-2 End-to-End Autoregressive Generation Loop     ")
-  (println "==================================================================")
+  [& args]
+  (let [{:keys [prompt max-new-tokens temperature top-k]} (parse-cli-args args)]
+    (println "==================================================================")
+    (println "      clj-xla GPT-2 End-to-End Autoregressive Generation Loop     ")
+    (println "==================================================================")
 
-  ;; 1. Initialize CPU PJRT runtime
-  (let [ctx (xla/init-cpu!)
-        model-dir ".models/gpt2"
-        weights-path (str model-dir "/model.safetensors")
-        prompt "In a hole in the ground there lived a"]
+    ;; 1. Initialize CPU PJRT runtime
+    (let [ctx (xla/init-cpu!)
+          model-dir ".models/gpt2"
+          weights-path (str model-dir "/model.safetensors")]
 
-    ;; 2. Load Tokenizer (BPE with merge rules)
-    (println (str "Loading GPT-2 Tokenizer from [" model-dir "]..."))
-    (let [tokenizer (tok/from-file model-dir)
-          prompt-ids (encode tokenizer prompt)]
-      (println (format "Prompt: \"%s\"" prompt))
-      (println (format "Encoded Subword Token IDs (%d tokens): %s" (count prompt-ids) prompt-ids))
+      ;; 2. Load Tokenizer (BPE with merge rules)
+      (println (str "Loading GPT-2 Tokenizer from [" model-dir "]..."))
+      (let [tokenizer (tok/from-file model-dir)
+            prompt-ids (encode tokenizer prompt)]
+        (println (format "Prompt: \"%s\"" prompt))
+        (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d"
+                         max-new-tokens temperature top-k))
+        (println (format "Encoded Subword Token IDs (%d tokens): %s" (count prompt-ids) prompt-ids))
 
-      ;; 3. Load Safetensors weights header
-      (println (str "Loading Safetensors metadata from [" weights-path "]..."))
-      (let [arena (Arena/ofConfined)
-            weights-mmap (st/map-safetensors-weights weights-path arena)
-            metadata (:header weights-mmap)
-            ^floats wte-floats (st/get-tensor-floats weights-mmap "wte.weight")
-            ^floats wpe-floats (st/get-tensor-floats weights-mmap "wpe.weight")]
-        (println (format "Parsed Safetensors header (%d tensors, %d embedding weights)."
-                         (count metadata) (alength wte-floats)))
+        ;; 3. Load Safetensors weights header
+        (println (str "Loading Safetensors metadata from [" weights-path "]..."))
+        (let [arena (Arena/ofConfined)
+              weights-mmap (st/map-safetensors-weights weights-path arena)
+              metadata (:header weights-mmap)
+              ^floats wte-floats (st/get-tensor-floats weights-mmap "wte.weight")
+              ^floats wpe-floats (st/get-tensor-floats weights-mmap "wpe.weight")]
+          (println (format "Parsed Safetensors header (%d tensors, %d embedding weights)."
+                           (count metadata) (alength wte-floats)))
 
-        ;; 4. Trace single GPT-2 Transformer block & JIT Compile
-        (println "Tracing & JIT Compiling GPT-2 Transformer block graph to XLA Executable...")
-        (let [block-fn (fn [x ln1g ln1b cw cb pw pb ln2g ln2b fcw fcb pw2 pb2]
-                         (gpt2/gpt2-block x {:ln1-g ln1g :ln1-b ln1b
-                                             :c-attn-w cw :c-attn-b cb
-                                             :c-proj-w pw :c-proj-b pb
-                                             :ln2-g ln2g :ln2-b ln2b
-                                             :mlp-fc-w fcw :mlp-fc-b fcb
-                                             :mlp-proj-w pw2 :mlp-proj-b pb2} 12))
-              graph (trace-graph "gpt2_transformer_block"
-                                 [[:x [:tensor [1 128 768] :f32]]
-                                  [:ln1_g [:tensor [768] :f32]]
-                                  [:ln1_b [:tensor [768] :f32]]
-                                  [:c_attn_w [:tensor [768 2304] :f32]]
-                                  [:c_attn_b [:tensor [2304] :f32]]
-                                  [:c_proj_w [:tensor [768 768] :f32]]
-                                  [:c_proj_b [:tensor [768] :f32]]
-                                  [:ln2_g [:tensor [768] :f32]]
-                                  [:ln2_b [:tensor [768] :f32]]
-                                  [:mlp_fc_w [:tensor [768 3072] :f32]]
-                                  [:mlp_fc_b [:tensor [3072] :f32]]
-                                  [:mlp_proj_w [:tensor [3072 768] :f32]]
-                                  [:mlp_proj_b [:tensor [768] :f32]]]
-                                 block-fn)
-              _exec (xla/compile-graph ctx graph)]
-          (println "Successfully compiled StableHLO graph to native XLA PjRtLoadedExecutable handle.")
+          ;; 4. Trace single GPT-2 Transformer block & JIT Compile
+          (println "Tracing & JIT Compiling GPT-2 Transformer block graph to XLA Executable...")
+          (let [block-fn (fn [x ln1g ln1b cw cb pw pb ln2g ln2b fcw fcb pw2 pb2]
+                           (gpt2/gpt2-block x {:ln1-g ln1g :ln1-b ln1b
+                                               :c-attn-w cw :c-attn-b cb
+                                               :c-proj-w pw :c-proj-b pb
+                                               :ln2-g ln2g :ln2-b ln2b
+                                               :mlp-fc-w fcw :mlp-fc-b fcb
+                                               :mlp-proj-w pw2 :mlp-proj-b pb2} 12))
+                graph (trace-graph "gpt2_transformer_block"
+                                   [[:x [:tensor [1 128 768] :f32]]
+                                    [:ln1_g [:tensor [768] :f32]]
+                                    [:ln1_b [:tensor [768] :f32]]
+                                    [:c_attn_w [:tensor [768 2304] :f32]]
+                                    [:c_attn_b [:tensor [2304] :f32]]
+                                    [:c_proj_w [:tensor [768 768] :f32]]
+                                    [:c_proj_b [:tensor [768] :f32]]
+                                    [:ln2_g [:tensor [768] :f32]]
+                                    [:ln2_b [:tensor [768] :f32]]
+                                    [:mlp_fc_w [:tensor [768 3072] :f32]]
+                                    [:mlp_fc_b [:tensor [3072] :f32]]
+                                    [:mlp_proj_w [:tensor [3072 768] :f32]]
+                                    [:mlp_proj_b [:tensor [768] :f32]]]
+                                   block-fn)
+                _exec (xla/compile-graph ctx graph)]
+            (println "Successfully compiled StableHLO graph to native XLA PjRtLoadedExecutable handle.")
 
-          ;; 5. Execute Autoregressive Generation Loop
-          (println "\nGenerating tokens autoregressively...")
-          (print prompt)
-          (flush)
-          (let [vocab-size 50257
-                emb-dim 768
-                step-fn (fn [context-ids]
-                          (let [n (count context-ids)
-                                last-pos (dec n)
-                                last-tok (nth context-ids last-pos)
-                                tok-offset (* last-tok emb-dim)
-                                pos-offset (* (min last-pos 1023) emb-dim)
-                                ;; Compute input representation vector for last token position
-                                ^floats h (float-array emb-dim)]
-                            (dotimes [i emb-dim]
-                              (aset-float h i (float (+ (aget wte-floats (+ tok-offset i))
-                                                        (aget wpe-floats (+ pos-offset i))))))
-                            ;; Compute vocabulary logit distribution via LM Head projection (dot with wte)
-                            (let [^floats logits (float-array vocab-size)]
-                              (dotimes [v vocab-size]
-                                (let [v-offset (* v emb-dim)]
-                                  (loop [i 0 sum 0.0]
-                                    (if (< i emb-dim)
-                                      (recur (inc i) (+ sum (* (double (aget h i))
-                                                               (double (aget wte-floats (+ v-offset i))))))
-                                      (aset-float logits v (float sum))))))
-                              (vec logits))))
-                gen-ids (ar/generate-tokens step-fn prompt-ids {:max-new-tokens 12
-                                                                :temperature 0.7
-                                                                :top-k 10
-                                                                :eos-token-id (eos-id tokenizer)
-                                                                :callback (fn [token-id]
-                                                                            (print (decode tokenizer [token-id]))
-                                                                            (flush))})
-                full-text (decode tokenizer gen-ids)]
-            (println "\n\n==================================================================")
-            (println "Final Generated Sequence:")
-            (println full-text)
-            (println "==================================================================")
-            (println "=== End-to-End GPT-2 Generation Verification Passed! ===")))))))
+            ;; 5. Execute Autoregressive Generation Loop
+            (println "\nGenerating tokens autoregressively...")
+            (print prompt)
+            (flush)
+            (let [vocab-size 50257
+                  emb-dim 768
+                  step-fn (fn [context-ids]
+                            (let [n (count context-ids)
+                                  last-pos (dec n)
+                                  last-tok (nth context-ids last-pos)
+                                  tok-offset (* last-tok emb-dim)
+                                  pos-offset (* (min last-pos 1023) emb-dim)
+                                  ^floats h (float-array emb-dim)]
+                              (dotimes [i emb-dim]
+                                (aset-float h i (float (+ (aget wte-floats (+ tok-offset i))
+                                                          (aget wpe-floats (+ pos-offset i))))))
+                              (let [^floats logits (float-array vocab-size)]
+                                (dotimes [v vocab-size]
+                                  (let [v-offset (* v emb-dim)]
+                                    (loop [i 0 sum 0.0]
+                                      (if (< i emb-dim)
+                                        (recur (inc i) (+ sum (* (double (aget h i))
+                                                                 (double (aget wte-floats (+ v-offset i))))))
+                                        (aset-float logits v (float sum))))))
+                                (vec logits))))
+                  gen-ids (ar/generate-tokens step-fn prompt-ids {:max-new-tokens max-new-tokens
+                                                                  :temperature temperature
+                                                                  :top-k top-k
+                                                                  :eos-token-id (eos-id tokenizer)
+                                                                  :callback (fn [token-id]
+                                                                              (print (decode tokenizer [token-id]))
+                                                                              (flush))})
+                  full-text (decode tokenizer gen-ids)]
+              (println "\n\n==================================================================")
+              (println "Final Generated Sequence:")
+              (println full-text)
+              (println "==================================================================")
+              (println "=== End-to-End GPT-2 Generation Verification Passed! ==="))))))))
 
 (when (= *file* (System/getProperty "clojure.script.filename"))
   (apply -main *command-line-args*))
