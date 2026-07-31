@@ -133,9 +133,8 @@
             lhs-type (get var-types lhs "tensor<1x128x768xf32>")
             rhs-type (get var-types rhs "tensor<768x768xf32>")
             out-type (get var-types out-var "tensor<f32>")
-            lhs-k (or (second (re-find #"tensor<\d+x\d+x(\d+)xf32>" lhs-type)) "768")
-            [_rhs-d0 rhs-d1] (or (rest (re-find #"tensor<(\d+)x(\d+)xf32>" rhs-type)) ["768" "768"])
-            rhs-c (if (= rhs-d1 lhs-k) "1" "0")]
+            contracting (get attrs :contracting_dims [[2] [0]])
+            rhs-c (str (first (second contracting)))]
         (str "    %" (name out-var) " = \"stablehlo.dot_general\"(%" (name lhs) ", %" (name rhs) ") {"
              "dot_dimension_numbers = #stablehlo.dot<lhs_contracting_dimensions = [2], rhs_contracting_dimensions = [" rhs-c "]>} : "
              "(" lhs-type ", " rhs-type ") -> " out-type))

@@ -23,12 +23,12 @@
   (eos-id [_this] eos-token-id))
 
 (defn load-hf-json-tokenizer
-  "Loads HuggingFace `tokenizer.json` file."
+  "Loads HuggingFace `tokenizer.json` file keeping raw string tokens intact."
   [json-path]
-  (let [data (json/read-str (slurp json-path) :key-fn keyword)
-        vocab-map (get-in data [:model :vocab])
-        merges (get-in data [:model :merges])
-        encoder (into {} (map (fn [[k v]] [(name k) (int v)]) vocab-map))
+  (let [data (json/read-str (slurp json-path))
+        vocab-map (get-in data ["model" "vocab"])
+        merges (get-in data ["model" "merges"])
+        encoder (into {} (map (fn [[k v]] [k (int v)]) vocab-map))
         vocab (into {} (map (fn [[k v]] [v k]) encoder))
         merge-pairs (for [item merges
                           :let [parts (str/split item #" ")]
