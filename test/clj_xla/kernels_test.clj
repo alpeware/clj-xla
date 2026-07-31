@@ -1,6 +1,5 @@
 (ns clj-xla.kernels-test
   "Unit and generative tests for high-level neural network kernels."
-  (:refer-clojure :exclude [+ * - /])
   (:require [clj-xla.compile :as compile]
             [clj-xla.example.kernels :as k]
             [clj-xla.pjrt :as pjrt]

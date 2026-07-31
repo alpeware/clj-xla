@@ -109,7 +109,16 @@
   [x & {:keys [axes keep-dims] :or {axes [-1] keep-dims true}}]
   (if (or (tracer? x) (some? *trace-ctx*))
     (let [tx (emit-constant! x nil)
-          target-type (:type tx)
+          [t-kw shape dtype] (:type tx)
+          axes-set (set (map #(if (neg? %) (+ (count shape) %) %) axes))
+          out-shape (mapv (fn [idx dim]
+                            (if (contains? axes-set idx)
+                              (if keep-dims 1 nil)
+                              dim))
+                          (range (count shape))
+                          shape)
+          out-shape-clean (vec (remove nil? out-shape))
+          out-type [t-kw out-shape-clean dtype]
           out-id (gen-var-id! "t")
           eqn {:op :stablehlo/reduce_mean
                :invars [(:id tx)]
@@ -117,5 +126,5 @@
                :attrs {:axes axes :keep_dims keep-dims}}]
       (when *trace-ctx*
         (swap! (:eqns *trace-ctx*) conj eqn))
-      (->Tracer out-id target-type))
+      (->Tracer out-id out-type))
     x))

@@ -3,6 +3,11 @@
   (:require [clj-xla.autodiff-test]
             [clj-xla.compile-test]
             [clj-xla.kernels-test]
+            [clj-xla.models.gpt2-test]
+            [clj-xla.nn.activations-test]
+            [clj-xla.nn.attention-test]
+            [clj-xla.nn.loss-test]
+            [clj-xla.nn.norm-test]
             [clj-xla.opt-test]
             [clj-xla.pjrt-test]
             [clj-xla.safetensors-test]
@@ -22,7 +27,12 @@
                            'clj-xla.autodiff-test
                            'clj-xla.opt-test
                            'clj-xla.safetensors-test
-                           'clj-xla.kernels-test)
+                           'clj-xla.kernels-test
+                           'clj-xla.nn.activations-test
+                           'clj-xla.nn.norm-test
+                           'clj-xla.nn.attention-test
+                           'clj-xla.nn.loss-test
+                           'clj-xla.models.gpt2-test)
         {:keys [fail error]} results]
     (if (and (zero? fail) (zero? error))
       (do (println "All tests passed successfully.")
