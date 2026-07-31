@@ -1,236 +1,266 @@
 (ns clj-xla.tensor
-  "Shadowed operators and scalar auto-lifting for symbolic tensor operations."
+  "Symbolic execution tracer and high-level Clojure Tensor Operator primitives."
   (:refer-clojure :exclude [+ * - /]))
 
 (defrecord Tracer [id type])
 
-(defn tracer?
-  "Returns true if `x` is a Tracer instance."
-  [x]
-  (or (instance? Tracer x)
-      (and (map? x) (contains? x :id) (contains? x :type))))
+(def ^:dynamic *trace-ctx* nil)
 
-(def ^:dynamic *trace-ctx*
-  "Thread-local dynamic variable bound to an atom holding the active trace state during tracing."
-  nil)
+(defn tracer?
+  "Checks if val is a Tracer record."
+  [val]
+  (instance? Tracer val))
 
 (defn- gen-var-id! [prefix]
   (if *trace-ctx*
-    (keyword (str (name prefix) "_" (swap! (:var-counter *trace-ctx*) inc)))
-    (keyword (str (name prefix) "_" (gensym)))))
+    (keyword (str prefix "_" (swap! (:var-counter *trace-ctx*) inc)))
+    (keyword (str prefix "_" (gensym)))))
 
 (defn emit-constant!
-  "Emits an explicit SSA constant equation if `x` is a number and returns a new Tracer."
-  [x target-type]
-  (if (tracer? x)
-    x
-    (let [cid (gen-var-id! "c")
-          eqn {:op :stablehlo/constant :value x :outvars [cid]}]
+  "Emits a :stablehlo/constant equation into *trace-ctx* if val is a primitive number."
+  [val target-type]
+  (cond
+    (tracer? val)
+    val
+
+    (number? val)
+    (let [out-id (gen-var-id! "c")
+          out-type (or target-type [:tensor [] :f32])
+          eqn {:op :stablehlo/constant :outvars [out-id] :value val}]
       (when *trace-ctx*
         (swap! (:eqns *trace-ctx*) conj eqn))
-      (->Tracer cid (or target-type [:tensor [] :f32])))))
+      (->Tracer out-id out-type))
 
-(defn- emit-binary-op! [op a b]
-  (let [target-type (or (when (tracer? a) (:type a))
-                        (when (tracer? b) (:type b))
-                        [:tensor [] :f32])
-        ta (emit-constant! a target-type)
-        tb (emit-constant! b target-type)
-        out-id (gen-var-id! "t")
-        eqn {:op op :invars [(:id ta) (:id tb)] :outvars [out-id]}]
-    (when *trace-ctx*
-      (swap! (:eqns *trace-ctx*) conj eqn))
-    (->Tracer out-id target-type)))
+    (vector? val)
+    (let [out-id (gen-var-id! "c_vec")
+          out-type (or target-type [:tensor [128 128] :f32])
+          eqn {:op :stablehlo/constant :outvars [out-id] :value val}]
+      (when *trace-ctx*
+        (swap! (:eqns *trace-ctx*) conj eqn))
+      (->Tracer out-id out-type))
 
-(defn- emit-unary-op! [op a]
+    :else
+    (throw (ex-info "Cannot emit constant for unsupported value" {:value val}))))
+
+(defn- rank-of [[_kw shape _dtype]]
+  (clojure.core/count shape))
+
+(defn- binary-elementwise-op [op-kw prefix a b]
   (let [ta (emit-constant! a nil)
-        target-type (:type ta)
-        out-id (gen-var-id! "t")
-        eqn {:op op :invars [(:id ta)] :outvars [out-id]}]
+        tb (emit-constant! b (:type ta))
+        out-type (if (>= (rank-of (:type ta)) (rank-of (:type tb)))
+                   (:type ta)
+                   (:type tb))
+        out-id (gen-var-id! prefix)
+        eqn {:op op-kw :invars [(:id ta) (:id tb)] :outvars [out-id]}]
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))
-    (->Tracer out-id target-type)))
-
-;; Shadowed Clojure Operators
+    (->Tracer out-id out-type)))
 
 (defn +
-  "Shadowed addition operator supporting Tensors and scalars."
-  ([a] a)
-  ([a b] (emit-binary-op! :stablehlo/add a b))
-  ([a b & more] (reduce + (+ a b) more)))
+  "Elementwise tensor addition."
+  ([a b]
+   (binary-elementwise-op :stablehlo/add "t_add" a b))
+  ([a b & more]
+   (reduce + (+ a b) more)))
 
 (defn -
-  "Shadowed subtraction operator supporting Tensors and scalars."
-  ([a] (emit-binary-op! :stablehlo/subtract 0.0 a))
-  ([a b] (emit-binary-op! :stablehlo/subtract a b))
-  ([a b & more] (reduce - (- a b) more)))
+  "Elementwise tensor subtraction or unary negation."
+  ([a]
+   (binary-elementwise-op :stablehlo/subtract "t_sub" 0.0 a))
+  ([a b]
+   (binary-elementwise-op :stablehlo/subtract "t_sub" a b))
+  ([a b & more]
+   (reduce - (- a b) more)))
 
 (defn *
-  "Shadowed multiplication operator supporting Tensors and scalars."
-  ([a] a)
-  ([a b] (emit-binary-op! :stablehlo/multiply a b))
-  ([a b & more] (reduce * (* a b) more)))
+  "Elementwise tensor multiplication."
+  ([a b]
+   (binary-elementwise-op :stablehlo/multiply "t_mul" a b))
+  ([a b & more]
+   (reduce * (* a b) more)))
 
 (defn /
-  "Shadowed division operator supporting Tensors and scalars."
-  ([a] (emit-binary-op! :stablehlo/divide 1.0 a))
-  ([a b] (emit-binary-op! :stablehlo/divide a b))
-  ([a b & more] (reduce / (/ a b) more)))
-
-(defn pow
-  "Shadowed elementwise exponentiation (power)."
-  [a b]
-  (emit-binary-op! :stablehlo/power a b))
+  "Elementwise tensor division."
+  ([a b]
+   (binary-elementwise-op :stablehlo/divide "t_div" a b))
+  ([a b & more]
+   (reduce / (/ a b) more)))
 
 (defn exp
-  "Shadowed elementwise exponential function."
-  [a]
-  (emit-unary-op! :stablehlo/exp a))
-
-(defn tanh
-  "Shadowed elementwise hyperbolic tangent."
-  [a]
-  (emit-unary-op! :stablehlo/tanh a))
-
-(defn sqrt
-  "Shadowed elementwise square root."
-  [a]
-  (emit-unary-op! :stablehlo/sqrt a))
-
-(defn gather
-  "Performs index-based table lookup.
-   operand: [vocab_size, hidden_dim]
-   start-indices: [batch, seq_len]
-   Returns: [batch, seq_len, hidden_dim]"
-  [operand start-indices]
-  (let [t-op (emit-constant! operand nil)
-        t-idx (emit-constant! start-indices nil)
-        [_kw op-shape dtype] (:type t-op)
-        [_kw2 idx-shape _] (:type t-idx)
-        hidden-dim (last op-shape)
-        out-shape (conj (vec idx-shape) hidden-dim)
-        out-id (gen-var-id! "t_gather")
-        eqn {:op :stablehlo/gather
-             :invars [(:id t-op) (:id t-idx)]
-             :outvars [out-id]
-             :attrs {:offset_dims [(clojure.core/dec (clojure.core/count out-shape))]
-                     :collapsed_slice_dims [0]
-                     :start_index_map [0]
-                     :index_vector_dim (clojure.core/count idx-shape)
-                     :slice_sizes [1 hidden-dim]}}]
+  "Elementwise natural exponential function."
+  [x]
+  (let [tx (emit-constant! x nil)
+        out-id (gen-var-id! "t_exp")
+        eqn {:op :stablehlo/exp :invars [(:id tx)] :outvars [out-id]}]
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))
-    (->Tracer out-id [:tensor out-shape dtype])))
+    (->Tracer out-id (:type tx))))
+
+(defn sqrt
+  "Elementwise square root function."
+  [x]
+  (let [tx (emit-constant! x nil)
+        out-id (gen-var-id! "t_sqrt")
+        eqn {:op :stablehlo/sqrt :invars [(:id tx)] :outvars [out-id]}]
+    (when *trace-ctx*
+      (swap! (:eqns *trace-ctx*) conj eqn))
+    (->Tracer out-id (:type tx))))
+
+(defn rsqrt
+  "Elementwise reciprocal square root: 1 / sqrt(x)."
+  [x]
+  (/ 1.0 (sqrt x)))
+
+(defn pow
+  "Elementwise power function."
+  [x p]
+  (cond
+    (= p 2.0) (* x x)
+    (= p 3.0) (* x (* x x))
+    :else (let [tx (emit-constant! x nil)
+                out-id (gen-var-id! "t_pow")
+                eqn {:op :stablehlo/power :invars [(:id tx)] :outvars [out-id] :value p}]
+            (when *trace-ctx*
+              (swap! (:eqns *trace-ctx*) conj eqn))
+            (->Tracer out-id (:type tx)))))
+
+(defn tanh
+  "Elementwise hyperbolic tangent function."
+  [x]
+  (let [tx (emit-constant! x nil)
+        out-id (gen-var-id! "t_tanh")
+        eqn {:op :stablehlo/tanh :invars [(:id tx)] :outvars [out-id]}]
+    (when *trace-ctx*
+      (swap! (:eqns *trace-ctx*) conj eqn))
+    (->Tracer out-id (:type tx))))
 
 (defn dot-general
-  "General matrix multiplication and tensor contraction.
-   attrs map requires :contracting_dims and optional :batch_dims."
-  [lhs rhs attrs]
+  "Batched matrix multiplication with explicit contracting and batching dimensions."
+  [lhs rhs {:keys [contracting_dims batch_dims] :as attrs}]
   (let [tlhs (emit-constant! lhs nil)
         trhs (emit-constant! rhs nil)
-        [_kw lhs-shape dtype] (:type tlhs)
-        [_kw2 rhs-shape _] (:type trhs)
-        out-id (gen-var-id! "t_dot")
-        c-lhs (or (get-in attrs [:contracting_dims :lhs])
-                  (get-in attrs [:contracting-dims :lhs])
-                  [(clojure.core/dec (clojure.core/count lhs-shape))])
-        c-rhs (or (get-in attrs [:contracting_dims :rhs])
-                  (get-in attrs [:contracting-dims :rhs])
-                  [0])
-        b-lhs (or (get-in attrs [:batch_dims :lhs])
-                  (get-in attrs [:batch-dims :lhs])
-                  [])
-        b-rhs (or (get-in attrs [:batch_dims :rhs])
-                  (get-in attrs [:batch-dims :rhs])
-                  [])
-        c-lhs-set (set c-lhs)
-        c-rhs-set (set c-rhs)
-        b-lhs-set (set b-lhs)
-        b-rhs-set (set b-rhs)
-        batch-dims (mapv #(nth lhs-shape %) b-lhs)
-        lhs-free (keep-indexed (fn [idx dim] (when-not (or (contains? c-lhs-set idx) (contains? b-lhs-set idx)) dim)) lhs-shape)
-        rhs-free (keep-indexed (fn [idx dim] (when-not (or (contains? c-rhs-set idx) (contains? b-rhs-set idx)) dim)) rhs-shape)
+        [t-kw lhs-shape dtype] (:type tlhs)
+        [_ rhs-shape _] (:type trhs)
+        c-lhs (set (get contracting_dims :lhs [(dec (clojure.core/count lhs-shape))]))
+        c-rhs (set (get contracting_dims :rhs [0]))
+        b-lhs (set (get batch_dims :lhs []))
+        b-rhs (set (get batch_dims :rhs []))
+        batch-dims (mapv #(nth lhs-shape %) (get batch_dims :lhs []))
+        lhs-free (keep-indexed (fn [idx dim] (when-not (or (c-lhs idx) (b-lhs idx)) dim)) lhs-shape)
+        rhs-free (keep-indexed (fn [idx dim] (when-not (or (c-rhs idx) (b-rhs idx)) dim)) rhs-shape)
         out-shape (vec (concat batch-dims lhs-free rhs-free))
+        out-type [t-kw out-shape dtype]
+        out-id (gen-var-id! "t_dot")
         eqn {:op :stablehlo/dot_general
              :invars [(:id tlhs) (:id trhs)]
              :outvars [out-id]
              :attrs attrs}]
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))
-    (->Tracer out-id [:tensor out-shape dtype])))
+    (->Tracer out-id out-type)))
 
 (defn matmul
-  "Standard 2D/3D matrix multiplication (wrapper around dot-general)."
-  [a b]
-  (let [ta (emit-constant! a nil)
-        tb (emit-constant! b nil)
-        [_kw a-shape _] (:type ta)
-        [_kw2 b-shape _] (:type tb)
-        a-rank (clojure.core/count a-shape)
-        b-rank (clojure.core/count b-shape)
-        lhs-c [(clojure.core/dec a-rank)]
-        rhs-c (if (clojure.core/>= b-rank 2) [(clojure.core/- b-rank 2)] [0])]
-    (dot-general ta tb {:contracting_dims {:lhs lhs-c :rhs rhs-c}})))
+  "Standard matrix multiplication (dot product over trailing dimension of lhs and leading dimension of rhs)."
+  [lhs rhs]
+  (let [tlhs (emit-constant! lhs nil)
+        trhs (emit-constant! rhs nil)
+        [_ lhs-shape _] (:type tlhs)
+        rank (clojure.core/count lhs-shape)]
+    (dot-general tlhs trhs {:contracting_dims {:lhs [(dec rank)] :rhs [0]}})))
 
 (defn reshape
-  "Reshapes input tensor `x` to `new-shape`."
+  "Reshapes tensor to new shape array."
   [x new-shape]
   (let [tx (emit-constant! x nil)
-        [_kw _shape dtype] (:type tx)
+        [t-kw _shape dtype] (:type tx)
+        out-type [t-kw new-shape dtype]
         out-id (gen-var-id! "t_reshape")
         eqn {:op :stablehlo/reshape
              :invars [(:id tx)]
              :outvars [out-id]
-             :attrs {:shape (vec new-shape)}}]
+             :attrs {:shape new-shape}}]
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))
-    (->Tracer out-id [:tensor (vec new-shape) dtype])))
+    (->Tracer out-id out-type)))
 
 (defn transpose
-  "Permutes dimensions of tensor `x` according to `permutation` vector."
+  "Permutes dimensions of tensor according to permutation vector."
   [x permutation]
   (let [tx (emit-constant! x nil)
-        [_kw shape dtype] (:type tx)
-        new-shape (mapv #(nth shape %) permutation)
+        [t-kw in-shape dtype] (:type tx)
+        out-shape (mapv #(nth in-shape %) permutation)
+        out-type [t-kw out-shape dtype]
         out-id (gen-var-id! "t_transpose")
         eqn {:op :stablehlo/transpose
              :invars [(:id tx)]
              :outvars [out-id]
-             :attrs {:permutation (vec permutation)}}]
+             :attrs {:permutation permutation}}]
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))
-    (->Tracer out-id [:tensor new-shape dtype])))
+    (->Tracer out-id out-type)))
 
-(defn- extract-num [v]
-  (cond
-    (number? v) (long v)
-    :else 0))
+(defn broadcast-in-dim
+  "Broadcasts tracer x to new target shape and broadcast dimensions."
+  [x target-shape bcast-dims]
+  (let [tx (emit-constant! x nil)
+        [t-kw _shape dtype] (:type tx)
+        out-id (gen-var-id! "t_bcast")
+        out-type [t-kw target-shape dtype]
+        eqn {:op :stablehlo/broadcast_in_dim
+             :invars [(:id tx)]
+             :outvars [out-id]
+             :attrs {:broadcast_dimensions bcast-dims :target_shape target-shape}}]
+    (when *trace-ctx*
+      (swap! (:eqns *trace-ctx*) conj eqn))
+    (->Tracer out-id out-type)))
 
 (defn slice
-  "Extracts a sub-tensor slice from `x` between `start-indices` and `limit-indices` using `strides`."
+  "Slices tensor along specified start, limit, and stride indices."
   [x start-indices limit-indices strides]
   (let [tx (emit-constant! x nil)
-        [_kw shape dtype] (:type tx)
-        rank (clojure.core/count shape)
-        starts (mapv extract-num start-indices)
-        limits (mapv extract-num limit-indices)
-        step-strides (or (when (seq strides) (mapv extract-num strides)) (vec (repeat rank 1)))
+        [t-kw in-shape dtype] (:type tx)
+        rank (clojure.core/count in-shape)
         out-shape (mapv (fn [i]
-                          (let [s (nth starts i)
-                                l (nth limits i)
-                                st (nth step-strides i)]
+                          (let [s (nth start-indices i 0)
+                                l (nth limit-indices i (nth in-shape i))
+                                st (nth strides i 1)]
                             (long (Math/ceil (clojure.core// (double (clojure.core/- l s)) (double st))))))
                         (range rank))
+        out-type [t-kw out-shape dtype]
         out-id (gen-var-id! "t_slice")
         eqn {:op :stablehlo/slice
              :invars [(:id tx)]
              :outvars [out-id]
-             :attrs {:start_indices starts
-                     :limit_indices limits
-                     :strides step-strides}}]
+             :attrs {:start_indices start-indices
+                     :limit_indices limit-indices
+                     :strides strides}}]
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))
-    (->Tracer out-id [:tensor out-shape dtype])))
+    (->Tracer out-id out-type)))
+
+(defn gather
+  "Gathers slices from operand at specified start-indices."
+  [operand start-indices]
+  (let [t-op (emit-constant! operand nil)
+        t-idx (emit-constant! start-indices nil)
+        [t-kw op-shape dtype] (:type t-op)
+        [_ idx-shape _] (:type t-idx)
+        hidden-dim (last op-shape)
+        out-shape (conj idx-shape hidden-dim)
+        out-type [t-kw out-shape dtype]
+        out-id (gen-var-id! "t_gather")
+        eqn {:op :stablehlo/gather
+             :invars [(:id t-op) (:id t-idx)]
+             :outvars [out-id]
+             :attrs {:offset_dims [2]
+                     :collapsed_slice_dims [0]
+                     :start_index_map [0]
+                     :index_vector_dim 2
+                     :slice_sizes [1 hidden-dim]}}]
+    (when *trace-ctx*
+      (swap! (:eqns *trace-ctx*) conj eqn))
+    (->Tracer out-id out-type)))
 
 (defn reduce-sum
   "Computes tensor sum reduction across specified axes."

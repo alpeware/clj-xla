@@ -4,7 +4,7 @@
   (:require [clj-xla.nn.activations :refer [swiglu]]
             [clj-xla.nn.attention :refer [apply-rope gqa-causal-attention linear]]
             [clj-xla.nn.norm :refer [rms-norm]]
-            [clj-xla.tensor :refer [+]]))
+            [clj-xla.tensor :refer [+ gather transpose]]))
 
 (def DEFAULT_SMOLLM_CONFIG
   {:vocab-size 49152
@@ -24,14 +24,20 @@
 (defn smollm-mlp
   "SmolLM SwiGLU MLP Block: down_proj(silu(gate_proj(x)) * up_proj(x))."
   [x gate-w up-w down-w]
-  (swiglu x gate-w up-w down-w))
+  (let [gate-w-t (transpose gate-w [1 0])
+        up-w-t (transpose up-w [1 0])
+        down-w-t (transpose down-w [1 0])]
+    (swiglu x gate-w-t up-w-t down-w-t)))
 
 (defn smollm-attention
   "SmolLM Multi-Head Causal Self-Attention with RoPE and Grouped-Query Attention."
   [x q-w k-w v-w o-w num-heads num-kv-heads pos-ids]
-  (let [q (linear x q-w nil)
-        k (linear x k-w nil)
-        v (linear x v-w nil)
+  (let [q-w-t (transpose q-w [1 0])
+        k-w-t (transpose k-w [1 0])
+        v-w-t (transpose v-w [1 0])
+        q (linear x q-w-t nil)
+        k (linear x k-w-t nil)
+        v (linear x v-w-t nil)
         [q-rope k-rope] (apply-rope q k pos-ids)]
     (gqa-causal-attention q-rope k-rope v o-w num-heads num-kv-heads)))
 
@@ -49,13 +55,15 @@
 
 (defn full-smollm-forward
   "Full SmolLM Transformer forward pass: multi-block sequence -> final RMSNorm -> LM head vocabulary projection."
-  [x layers-weights final-norm-w lm-head-w pos-ids]
-  (let [x-out (reduce (fn [h layer-w]
+  [x embed-tokens layers-weights final-norm-w lm-head-w pos-ids]
+  (let [tok-embed (gather embed-tokens x)
+        x-out (reduce (fn [h layer-w]
                         (smollm-block h layer-w 9 3 pos-ids))
-                      x
+                      tok-embed
                       layers-weights)
         normed (rms-norm x-out final-norm-w 1e-5)
-        logits (linear normed lm-head-w nil)]
+        lm-head-t (transpose lm-head-w [1 0])
+        logits (linear normed lm-head-t nil)]
     logits))
 
 (defn weight-key-map [layer-idx]

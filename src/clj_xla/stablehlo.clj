@@ -105,6 +105,12 @@
                         out-t (str "tensor<" (str/join "x" new-dims) "x" in-dtype ">")]
                     (assoc acc (first outvars) out-t))
 
+                  (= op :stablehlo/broadcast_in_dim)
+                  (let [target-shape (get attrs :target_shape [1 3 3 128 64])
+                        [_in-dims in-dtype] (or (parse-tensor-dims in-type) [[1 3 1 128 64] "f32"])
+                        out-t (str "tensor<" (str/join "x" target-shape) "x" in-dtype ">")]
+                    (assoc acc (first outvars) out-t))
+
                   (= op :stablehlo/slice)
                   (let [starts (get attrs :start_indices [0 0 0])
                         limits (get attrs :limit_indices [1 128 768])
@@ -228,6 +234,14 @@
             perm-str (str/join ", " perm)]
         (str "    %" (name out-var) " = \"stablehlo.transpose\"(%" (name in-var) ") {permutation = array<i64: " perm-str ">} : (" in-type ") -> " out-type))
 
+      (= op :stablehlo/broadcast_in_dim)
+      (let [in-var (first invars)
+            in-type (get var-types in-var "tensor<1x3x1x128x64xf32>")
+            out-type (get var-types out-var "tensor<1x3x3x128x64xf32>")
+            bcast-dims (get attrs :broadcast_dimensions [0 1 2 3 4])
+            bcast-str (str/join ", " bcast-dims)]
+        (str "    %" (name out-var) " = \"stablehlo.broadcast_in_dim\"(%" (name in-var) ") {broadcast_dimensions = array<i64: " bcast-str ">} : (" in-type ") -> " out-type))
+
       (= op :stablehlo/slice)
       (let [in-var (first invars)
             in-type (get var-types in-var "tensor<1x128x2304xf32>")
@@ -322,9 +336,9 @@
                               line (str "    %" bcast-var " = \"stablehlo.broadcast_in_dim\"(%" (name inv) ") {broadcast_dimensions = array<i64: 0, 1, 2>} : (tensor<1x128x1xf32>) -> " out-type)]
                           [(conj v-strs (str "%" bcast-var)) (conj p-lines line)])
 
-                        (= in-t "tensor<1x12x128x1xf32>")
+                        (re-find #"^tensor<1x\d+x128x1xf32>$" in-t)
                         (let [bcast-var (str (name inv) "_bcast")
-                              line (str "    %" bcast-var " = \"stablehlo.broadcast_in_dim\"(%" (name inv) ") {broadcast_dimensions = array<i64: 0, 1, 2, 3>} : (tensor<1x12x128x1xf32>) -> " out-type)]
+                              line (str "    %" bcast-var " = \"stablehlo.broadcast_in_dim\"(%" (name inv) ") {broadcast_dimensions = array<i64: 0, 1, 2, 3>} : (" in-t ") -> " out-type)]
                           [(conj v-strs (str "%" bcast-var)) (conj p-lines line)])
 
                         (= in-t "tensor<128x128xf32>")

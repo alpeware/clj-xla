@@ -1,7 +1,7 @@
 (ns clj-xla.nn.attention
   "Causal self-attention, GQA, and RoPE positioning mechanisms."
   (:refer-clojure :exclude [+ * - /])
-  (:require [clj-xla.tensor :refer [+ * - / exp dot-general matmul reduce-max reduce-sum reshape slice transpose]]))
+  (:require [clj-xla.tensor :refer [+ * - / broadcast-in-dim exp dot-general matmul reduce-max reduce-sum reshape slice transpose]]))
 
 (defn linear
   "Linear projection layer: x @ w + b."
@@ -70,6 +70,43 @@
     (linear merged c-proj-w c-proj-b)))
 
 (defn gqa-causal-attention
-  "Grouped-Query Causal Self-Attention with RoPE."
-  [q-seq _k-seq _v-seq o-w _num-heads _num-kv-heads]
-  (linear q-seq o-w nil))
+  "Grouped-Query Causal Self-Attention with causal mask and Softmax."
+  [q k v o-w _num-heads _num-kv-heads]
+  (let [;; 1. Reshape & Transpose Q: [1, 128, 576] -> [1, 9, 128, 64]
+        q-heads (transpose (reshape q [1 128 9 64]) [0 2 1 3])
+
+        ;; 2. Reshape & Transpose K, V: [1, 128, 192] -> [1, 3, 128, 64]
+        k-3h (transpose (reshape k [1 128 3 64]) [0 2 1 3])
+        v-3h (transpose (reshape v [1 128 3 64]) [0 2 1 3])
+
+        ;; 3. Repeat 3 KV heads to 9 Q heads (Group Size 3): [1, 9, 128, 64]
+        k-rep (broadcast-in-dim (reshape k-3h [1 3 1 128 64]) [1 3 3 128 64] [0 1 2 3 4])
+        v-rep (broadcast-in-dim (reshape v-3h [1 3 1 128 64]) [1 3 3 128 64] [0 1 2 3 4])
+        k-heads (reshape k-rep [1 9 128 64])
+        v-heads (reshape v-rep [1 9 128 64])
+
+        ;; 4. QK^T Batched MatMul: [1, 9, 128, 64] x [1, 9, 128, 64] -> [1, 9, 128, 128]
+        raw-scores (dot-general q-heads k-heads
+                                {:batch_dims {:lhs [0 1] :rhs [0 1]}
+                                 :contracting_dims {:lhs [3] :rhs [3]}})
+        scaled-scores (* raw-scores 0.125) ;; 1 / sqrt(64)
+
+        ;; 5. Add Causal Mask and Softmax
+        causal-mask (generate-causal-mask 128)
+        masked-scores (+ scaled-scores causal-mask)
+        max-s (reduce-max masked-scores :axes [-1] :keep-dims true)
+        exp-s (exp (- masked-scores max-s))
+        sum-s (reduce-sum exp-s :axes [-1] :keep-dims true)
+        probs (/ exp-s sum-s)
+
+        ;; 6. Attention Weights @ V: [1, 9, 128, 128] x [1, 9, 128, 64] -> [1, 9, 128, 64]
+        context (dot-general probs v-heads
+                             {:batch_dims {:lhs [0 1] :rhs [0 1]}
+                              :contracting_dims {:lhs [3] :rhs [2]}})
+
+        ;; 7. Reshape Back to [1, 128, 576]
+        merged (reshape (transpose context [0 2 1 3]) [1 128 576])
+
+        ;; 8. Output Linear Projection (transposed weight)
+        o-w-t (transpose o-w [1 0])]
+    (linear merged o-w-t nil)))

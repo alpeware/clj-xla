@@ -10,17 +10,10 @@
   (:import [java.lang.foreign Arena]))
 
 (def DEFAULT_CLI_OPTS
-  {:prompt "Once upon a time, in a small village"
+  {:prompt "The capital of France is"
    :max-new-tokens 8
    :temperature 0.7
    :top-k 10})
-
-(defn- clamp-float ^double [^double d]
-  (cond
-    (Double/isNaN d) 0.0
-    (> d 3.4028234663852886E38) 3.4028234663852886E38
-    (< d -3.4028234663852886E38) -3.4028234663852886E38
-    :else d))
 
 (defn parse-cli-args
   "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k)."
@@ -46,6 +39,10 @@
 
           :else
           (recur (subvec remaining 1) opts))))))
+
+(defn- prepare-input-tensor [tokens max-len]
+  (let [padded (take max-len (concat tokens (repeat 0)))]
+    (int-array (vec padded))))
 
 (defn -main
   "Runs end-to-end SmolLM-135M text generation pipeline: model loading, tokenization, full-model graph tracing, StableHLO JIT compilation, and autoregressive decoding."
@@ -96,65 +93,74 @@
 
           ;; 4. Trace full SmolLM-135M Model graph & JIT Compile
           (println "Tracing & JIT Compiling full SmolLM-135M model graph to XLA Executable...")
-          (let [invars (into [[:x [:tensor [1 128 576] :f32]]
+          (let [max-seq-len 128
+                invars (into [[:x [:tensor [1 max-seq-len] :i32]]
+                              [:embed_tokens [:tensor [49152 576] :f32]]
                               [:final_norm_w [:tensor [576] :f32]]
-                              [:lm_head_w [:tensor [576 49152] :f32]]]
+                              [:lm_head_w [:tensor [49152 576] :f32]]]
                              (mapcat (fn [i]
                                        [[(keyword (str "input_ln_w_" i)) [:tensor [576] :f32]]
                                         [(keyword (str "q_w_" i)) [:tensor [576 576] :f32]]
-                                        [(keyword (str "k_w_" i)) [:tensor [576 192] :f32]]
-                                        [(keyword (str "v_w_" i)) [:tensor [576 192] :f32]]
+                                        [(keyword (str "k_w_" i)) [:tensor [192 576] :f32]]
+                                        [(keyword (str "v_w_" i)) [:tensor [192 576] :f32]]
                                         [(keyword (str "o_w_" i)) [:tensor [576 576] :f32]]
                                         [(keyword (str "post_attn_ln_w_" i)) [:tensor [576] :f32]]
-                                        [(keyword (str "gate_w_" i)) [:tensor [576 1536] :f32]]
-                                        [(keyword (str "up_w_" i)) [:tensor [576 1536] :f32]]
-                                        [(keyword (str "down_w_" i)) [:tensor [1536 576] :f32]]])
+                                        [(keyword (str "gate_w_" i)) [:tensor [1536 576] :f32]]
+                                        [(keyword (str "up_w_" i)) [:tensor [1536 576] :f32]]
+                                        [(keyword (str "down_w_" i)) [:tensor [576 1536] :f32]]])
                                      (range 30)))
-                trace-fn (fn [x fn-norm lm-hw & layer-args]
+                trace-fn (fn [x emb fn-norm lm-hw & layer-args]
                            (let [lw-seq (mapv (fn [[in-ln qw kw vw ow post-ln gw uw dw]]
                                                 {:input-ln-w in-ln :q-w qw :k-w kw :v-w vw :o-w ow :post-attn-ln-w post-ln :gate-w gw :up-w uw :down-w dw})
                                               (partition 9 layer-args))]
-                             (smollm/full-smollm-forward x lw-seq fn-norm lm-hw [0])))
+                             (smollm/full-smollm-forward x emb lw-seq fn-norm lm-hw [0])))
                 graph (trace-graph "full_smollm_model" invars trace-fn)
                 exec (xla/compile-graph ctx graph)]
             (println "Successfully compiled StableHLO graph to native XLA PjRtLoadedExecutable handle.")
 
-            ;; 5. Execute Autoregressive Generation Loop
-            (println "\nGenerating tokens autoregressively...")
-            (print prompt)
-            (flush)
-            (let [emb-dim 576
-                  flat-layer-weights (vec (mapcat (fn [m]
-                                                    [(:input-ln-w m) (:q-w m) (:k-w m) (:v-w m) (:o-w m) (:post-attn-ln-w m) (:gate-w m) (:up-w m) (:down-w m)])
-                                                  layers-weights))
-                  step-fn (fn [context-ids]
-                            (let [S (count context-ids)
-                                  X (mapv (fn [pos-idx]
-                                            (let [tok (nth context-ids pos-idx)
-                                                  tok-offset (* tok emb-dim)
-                                                  ^floats row (float-array emb-dim)]
-                                              (dotimes [i emb-dim]
-                                                (aset-float row i (float (clamp-float (aget embed-tokens (+ tok-offset i))))))
-                                              (vec row)))
-                                          (range S))
-                                  input-tensor [X]
-                                  input-args (into [input-tensor final-norm-w lm-head-w] flat-layer-weights)
-                                  logits-out (xla/execute exec input-args)
-                                  last-logits (xla/to-host-slice logits-out (dec S))]
-                              last-logits))
-                  gen-ids (ar/generate-tokens step-fn prompt-ids {:max-new-tokens max-new-tokens
-                                                                  :temperature temperature
-                                                                  :top-k top-k
-                                                                  :eos-token-id (eos-id tokenizer)
-                                                                  :callback (fn [token-id]
-                                                                              (print (decode tokenizer [token-id]))
-                                                                              (flush))})
-                  full-text (decode tokenizer gen-ids)]
-              (println "\n\n==================================================================")
-              (println "Final Generated Sequence:")
-              (println full-text)
-              (println "==================================================================")
-              (println "=== End-to-End SmolLM-135M Generation Verification Passed! ==="))))))))
+            (println "Transferring weights to PJRT Device Memory...")
+            (let [embed-buf (xla/buffer-from-host-buffer ctx (:client ctx) embed-tokens [49152 576] 11)
+                  final-norm-buf (xla/buffer-from-host-buffer ctx (:client ctx) final-norm-w [576] 11)
+                  lm-head-buf (xla/buffer-from-host-buffer ctx (:client ctx) lm-head-w [49152 576] 11)
+                  layer-bufs (mapv (fn [m]
+                                     [(xla/buffer-from-host-buffer ctx (:client ctx) (:input-ln-w m) [576] 11)
+                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:q-w m) [576 576] 11)
+                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:k-w m) [192 576] 11)
+                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:v-w m) [192 576] 11)
+                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:o-w m) [576 576] 11)
+                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:post-attn-ln-w m) [576] 11)
+                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:gate-w m) [1536 576] 11)
+                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:up-w m) [1536 576] 11)
+                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:down-w m) [576 1536] 11)])
+                                   layers-weights)
+                  flat-layer-bufs (vec (apply concat layer-bufs))
+                  flat-device-weights (into [embed-buf final-norm-buf lm-head-buf] flat-layer-bufs)]
+
+              ;; 5. Execute Autoregressive Generation Loop
+              (println "\nGenerating tokens autoregressively...")
+              (print prompt)
+              (flush)
+              (let [step-fn (fn [context-ids]
+                              (let [S (count context-ids)
+                                    input-array (prepare-input-tensor context-ids max-seq-len)
+                                    input-buf (xla/buffer-from-host-buffer ctx (:client ctx) input-array [1 max-seq-len] 4)
+                                    input-args (into [input-buf] flat-device-weights)
+                                    logits-out (xla/execute exec input-args)
+                                    last-logits (xla/to-host-slice logits-out (dec S) 49152)]
+                                last-logits))
+                    gen-ids (ar/generate-tokens step-fn prompt-ids {:max-new-tokens max-new-tokens
+                                                                    :temperature temperature
+                                                                    :top-k top-k
+                                                                    :eos-token-id (eos-id tokenizer)
+                                                                    :callback (fn [token-id]
+                                                                                (print (decode tokenizer [token-id]))
+                                                                                (flush))})
+                    full-text (decode tokenizer gen-ids)]
+                (println "\n\n==================================================================")
+                (println "Final Generated Sequence:")
+                (println full-text)
+                (println "==================================================================")
+                (println "=== End-to-End SmolLM-135M Generation Verification Passed! ===")))))))))
 
 (when (= *file* (System/getProperty "clojure.script.filename"))
   (apply -main *command-line-args*))
