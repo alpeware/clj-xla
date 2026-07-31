@@ -79,7 +79,7 @@
                     (assoc acc (first outvars) out-t))
 
                   (= op :stablehlo/convert)
-                  (assoc acc (first outvars) "tensor<1x128x768xf32>")
+                  (assoc acc (first outvars) (or in-type "tensor<1x128x768xf32>"))
 
                   (= op :stablehlo/gather)
                   (let [[operand start-indices] in-vars
@@ -190,10 +190,9 @@
 
       (= op :stablehlo/convert)
       (let [in-var (first invars)
-            in-type (get var-types in-var "tensor<1x128xi32>")
-            out-type (get var-types out-var "tensor<1x128x768xf32>")]
-        (str "    %" (name out-var) "_conv = \"stablehlo.convert\"(%" (name in-var) ") : (" in-type ") -> tensor<1x128xf32>\n"
-             "    %" (name out-var) " = \"stablehlo.broadcast_in_dim\"(%" (name out-var) "_conv) {broadcast_dimensions = array<i64: 0, 1>} : (tensor<1x128xf32>) -> " out-type))
+            in-type (get var-types in-var "tensor<1x128x768xf32>")
+            out-type (get var-types out-var in-type)]
+        (str "    %" (name out-var) " = \"stablehlo.convert\"(%" (name in-var) ") : (" in-type ") -> " out-type))
 
       (= op :stablehlo/gather)
       (let [[operand start-indices] invars

@@ -58,9 +58,7 @@
         logits (linear normed lm-head-w nil)]
     logits))
 
-(defn weight-key-map
-  "Maps HuggingFace SmolLM Safetensors tensor names to internal key names for layer `layer-idx`."
-  [layer-idx]
+(defn weight-key-map [layer-idx]
   (let [prefix (str "model.layers." layer-idx ".")]
     {:input-ln-w (str prefix "input_layernorm.weight")
      :q-w (str prefix "self_attn.q_proj.weight")

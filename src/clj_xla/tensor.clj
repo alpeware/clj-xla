@@ -283,26 +283,12 @@
     (->Tracer out-id out-type)))
 
 (defn reduce-mean
-  "Computes tensor mean reduction across specified axes."
+  "Computes tensor mean reduction across specified axes by dividing reduce-sum by dimension size."
   [x & {:keys [axes keep-dims] :or {axes [-1] keep-dims true}}]
   (let [tx (emit-constant! x nil)
-        [t-kw shape dtype] (:type tx)
+        [_kw shape _dtype] (:type tx)
         rank (clojure.core/count shape)
         norm-axes (mapv #(if (clojure.core/neg? %) (clojure.core/+ rank %) %) (or axes [-1]))
-        axes-set (set norm-axes)
-        out-shape (mapv (fn [idx dim]
-                          (if (contains? axes-set idx)
-                            (if keep-dims 1 nil)
-                            dim))
-                        (range rank)
-                        shape)
-        out-shape-clean (vec (remove nil? out-shape))
-        out-type [t-kw out-shape-clean dtype]
-        out-id (gen-var-id! "t_mean")
-        eqn {:op :stablehlo/reduce_mean
-             :invars [(:id tx)]
-             :outvars [out-id]
-             :attrs {:axes norm-axes :keep_dims keep-dims}}]
-    (when *trace-ctx*
-      (swap! (:eqns *trace-ctx*) conj eqn))
-    (->Tracer out-id out-type)))
+        red-count (double (reduce clojure.core/* (map #(nth shape %) norm-axes)))
+        sum-tracer (reduce-sum tx :axes norm-axes :keep-dims keep-dims)]
+    (/ sum-tracer red-count)))

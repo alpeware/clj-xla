@@ -140,7 +140,7 @@
                                   input-tensor [X]
                                   input-args (into [input-tensor final-norm-w lm-head-w] flat-layer-weights)
                                   logits-out (xla/execute exec input-args)
-                                  last-logits (xla/to-host-slice logits-out)]
+                                  last-logits (xla/to-host-slice logits-out (dec S))]
                               last-logits))
                   gen-ids (ar/generate-tokens step-fn prompt-ids {:max-new-tokens max-new-tokens
                                                                   :temperature temperature
