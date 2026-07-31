@@ -1,7 +1,8 @@
 (ns clj-xla.test-runner
-  "Main CLI entrypoint for running the test suite."
+  "Main CLI entrypoint for running the complete test suite."
   (:require [clj-xla.autodiff-test]
             [clj-xla.compile-test]
+            [clj-xla.generation-test]
             [clj-xla.kernels-test]
             [clj-xla.models.gpt2-test]
             [clj-xla.nn.activations-test]
@@ -11,8 +12,10 @@
             [clj-xla.opt-test]
             [clj-xla.pjrt-test]
             [clj-xla.safetensors-test]
+            [clj-xla.sampling-test]
             [clj-xla.stablehlo-test]
             [clj-xla.tensor-test]
+            [clj-xla.tokenizer-test]
             [clj-xla.trace-test]
             [clojure.test :refer [run-tests]]))
 
@@ -32,7 +35,10 @@
                            'clj-xla.nn.norm-test
                            'clj-xla.nn.attention-test
                            'clj-xla.nn.loss-test
-                           'clj-xla.models.gpt2-test)
+                           'clj-xla.models.gpt2-test
+                           'clj-xla.sampling-test
+                           'clj-xla.tokenizer-test
+                           'clj-xla.generation-test)
         {:keys [fail error]} results]
     (if (and (zero? fail) (zero? error))
       (do (println "All tests passed successfully.")
