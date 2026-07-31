@@ -3,6 +3,7 @@
   (:require [clojure.data.json :as json])
   (:import [java.io RandomAccessFile]
            [java.lang.foreign Arena MemorySegment]
+           [java.nio FloatBuffer]
            [java.nio.channels FileChannel FileChannel$MapMode]
            [java.nio.file Path StandardOpenOption]))
 
@@ -32,7 +33,7 @@
         fc (FileChannel/open path (into-array [StandardOpenOption/READ]))
         total-len (.size fc)
         weight-bytes-len (- total-len (+ 8 header-size))
-        ^MemorySegment mapped-seg (.map fc FileChannel$MapMode/READ_ONLY (+ 8 header-size) weight-bytes-len arena)]
+        ^MemorySegment mapped-seg (.map fc FileChannel$MapMode/READ_ONLY (+ 8 (long header-size)) (long weight-bytes-len) arena)]
     {:header metadata
      :segment mapped-seg}))
 
@@ -42,5 +43,19 @@
   (if-let [tensor-info (get header tensor-name)]
     (let [[start end] (get tensor-info "data_offsets")
           len (- end start)]
-      (.asSlice ^MemorySegment segment start len))
+      (.asSlice ^MemorySegment segment (long start) (long len)))
+    (throw (ex-info "Tensor key not found in Safetensors header" {:tensor tensor-name}))))
+
+(defn get-tensor-floats
+  "Reads Float32 tensor values from `mapped-weights` into a Java float array."
+  [{:keys [header segment]} tensor-name]
+  (if-let [tensor-info (get header tensor-name)]
+    (let [[start end] (get tensor-info "data_offsets")
+          len (- end start)
+          num-floats (quot len 4)
+          ^MemorySegment slice (.asSlice ^MemorySegment segment (long start) (long len))
+          ^FloatBuffer float-buf (.asFloatBuffer (.asByteBuffer slice))
+          arr (float-array num-floats)]
+      (.get float-buf arr)
+      arr)
     (throw (ex-info "Tensor key not found in Safetensors header" {:tensor tensor-name}))))
