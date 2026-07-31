@@ -3,6 +3,8 @@
   (:require [clj-xla.compile-test]
             [clj-xla.pjrt-test]
             [clj-xla.stablehlo-test]
+            [clj-xla.tensor-test]
+            [clj-xla.trace-test]
             [clojure.test :refer [run-tests]]))
 
 (defn -main
@@ -10,7 +12,9 @@
   [& _args]
   (let [results (run-tests 'clj-xla.stablehlo-test
                            'clj-xla.pjrt-test
-                           'clj-xla.compile-test)
+                           'clj-xla.compile-test
+                           'clj-xla.tensor-test
+                           'clj-xla.trace-test)
         {:keys [fail error]} results]
     (if (and (zero? fail) (zero? error))
       (do (println "All tests passed successfully.")
