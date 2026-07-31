@@ -1,0 +1,31 @@
+pom.xml
+pom.xml.asc
+*.jar
+*.class
+/lib/
+/classes/
+/target/
+/checkouts/
+data/
+backtests/
+logs/
+bin/
+.lein-deps-sum
+.lein-repl-history
+.lein-plugins/
+.lein-failures
+.nrepl-port
+.cpcache/
+.clojure-env/
+.clj-kondo/.cache
+
+# Persistence snapshots
+snapshot*.edn
+*.pid
+*.log
+
+# emacs
+.env
+*~
+\#*\#
+.\#*
