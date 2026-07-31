@@ -26,7 +26,7 @@
 (defn- generate-causal-mask [seq-len]
   (vec (for [i (range seq-len)]
          (vec (for [j (range seq-len)]
-                (if (<= j i) 0.0 -1e9))))))
+                (if (<= j i) 0.0 -10000.0))))))
 
 (defn causal-self-attention
   "Multi-head Causal Self-Attention block for GPT-2."

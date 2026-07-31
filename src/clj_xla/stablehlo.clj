@@ -257,12 +257,15 @@
                           :stablehlo/reduce_sum "stablehlo.add"
                           :stablehlo/reduce_max "stablehlo.maximum"
                           :stablehlo/reduce_mean "stablehlo.add")
+            init-const (if (= op :stablehlo/reduce_max)
+                         "-1.000000e+30"
+                         "0.000000e+00")
             norm-axes-set (set norm-axes)
             reduced-dims (mapv #(nth in-dims %) (filter #(not (norm-axes-set %)) (range rank)))
             red-type (if (seq reduced-dims)
                        (str "tensor<" (str/join "x" reduced-dims) "x" in-dtype ">")
                        (str "tensor<" in-dtype ">"))]
-        (str "    %" (name out-var) "_c0 = stablehlo.constant dense<0.000000e+00> : tensor<" in-dtype ">\n"
+        (str "    %" (name out-var) "_c0 = stablehlo.constant dense<" init-const "> : tensor<" in-dtype ">\n"
              "    %" (name out-var) "_red = \"stablehlo.reduce\"(%" (name in-var) ", %" (name out-var) "_c0) ({\n"
              "    ^bb0(%arg_a: tensor<" in-dtype ">, %arg_b: tensor<" in-dtype ">):\n"
              "      %arg_res = " red-op-name " %arg_a, %arg_b : tensor<" in-dtype ">\n"
