@@ -10,6 +10,8 @@ data/
 backtests/
 logs/
 bin/
+.models/
+*.safetensors
 .lein-deps-sum
 .lein-repl-history
 .lein-plugins/
