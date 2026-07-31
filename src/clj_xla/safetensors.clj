@@ -3,7 +3,7 @@
   (:require [clojure.data.json :as json])
   (:import [java.io RandomAccessFile]
            [java.lang.foreign Arena MemorySegment]
-           [java.nio FloatBuffer]
+           [java.nio ByteOrder FloatBuffer]
            [java.nio.channels FileChannel FileChannel$MapMode]
            [java.nio.file Path StandardOpenOption]))
 
@@ -47,14 +47,16 @@
     (throw (ex-info "Tensor key not found in Safetensors header" {:tensor tensor-name}))))
 
 (defn get-tensor-floats
-  "Reads Float32 tensor values from `mapped-weights` into a Java float array."
+  "Reads Float32 tensor values from `mapped-weights` into a Java float array using Little-Endian byte order."
   [{:keys [header segment]} tensor-name]
   (if-let [tensor-info (get header tensor-name)]
     (let [[start end] (get tensor-info "data_offsets")
           len (- end start)
           num-floats (quot len 4)
           ^MemorySegment slice (.asSlice ^MemorySegment segment (long start) (long len))
-          ^FloatBuffer float-buf (.asFloatBuffer (.asByteBuffer slice))
+          ^FloatBuffer float-buf (-> (.asByteBuffer slice)
+                                     (.order ByteOrder/LITTLE_ENDIAN)
+                                     .asFloatBuffer)
           arr (float-array num-floats)]
       (.get float-buf arr)
       arr)
