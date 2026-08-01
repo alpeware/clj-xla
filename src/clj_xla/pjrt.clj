@@ -179,37 +179,47 @@
   (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)
         cli (extract-client api-ctx client)
         num-dims (count shape)
-        arena (Arena/ofAuto)
-        dims-seg (.allocate arena ValueLayout/JAVA_LONG (long num-dims))]
-    (dotimes [i num-dims]
-      (.setAtIndex ^MemorySegment dims-seg ValueLayout/JAVA_LONG (long i) (long (nth shape i))))
-    (let [devs (addressable-devices api-ctx cli)
-          dev (first devs)
-          data-seg (cond
-                     (= (int dtype-enum) 4)
-                     (let [^ints ia (if (instance? (Class/forName "[I") host-data)
-                                      ^ints host-data
-                                      (int-array (map int (flatten host-data))))]
-                       (.allocateFrom arena ValueLayout/JAVA_INT ia))
+        devs (addressable-devices api-ctx cli)
+        dev (first devs)]
+    (with-open [arena (Arena/ofConfined)]
+      (let [dims-seg (.allocate arena ValueLayout/JAVA_LONG (long num-dims))]
+        (dotimes [i num-dims]
+          (.setAtIndex ^MemorySegment dims-seg ValueLayout/JAVA_LONG (long i) (long (nth shape i))))
+        (let [data-seg (cond
+                         (instance? MemorySegment host-data)
+                         (if (.isNative ^MemorySegment host-data)
+                           host-data
+                           (.allocateFrom arena ValueLayout/JAVA_BYTE ^MemorySegment host-data))
 
-                     :else
-                     (let [^floats fa (if (instance? (Class/forName "[F") host-data)
-                                        ^floats host-data
-                                        (float-array (map float (flatten host-data))))]
-                       (.allocateFrom arena ValueLayout/JAVA_FLOAT fa)))
-          args (.allocate arena (long 120))]
-      (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 120))
-      (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) cli)
-      (.set ^MemorySegment args ValueLayout/ADDRESS (long 24) data-seg)
-      (.set ^MemorySegment args ValueLayout/JAVA_INT (long 32) (int dtype-enum))
-      (.set ^MemorySegment args ValueLayout/ADDRESS (long 40) dims-seg)
-      (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-dims))
-      (when dev
-        (.set ^MemorySegment args ValueLayout/ADDRESS (long 80) dev))
-      (let [handle (downcall-ptr linker api-ptr OFFSET_CLIENT_BUFFER_FROM_HOST_BUFFER ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-            err (.invokeWithArguments ^MethodHandle handle [args])]
-        (check-error! api-ctx err)
-        (.get ^MemorySegment args ValueLayout/ADDRESS (long 112))))))
+                         (= (int dtype-enum) 4)
+                         (let [^ints ia (if (instance? (Class/forName "[I") host-data)
+                                          ^ints host-data
+                                          (int-array (map int (flatten host-data))))]
+                           (.allocateFrom arena ValueLayout/JAVA_INT ia))
+
+                         :else
+                         (let [^floats fa (if (instance? (Class/forName "[F") host-data)
+                                            ^floats host-data
+                                            (float-array (map float (flatten host-data))))
+                               num-floats (alength fa)
+                               byte-size (* (long num-floats) 4)
+                               seg (.allocate arena byte-size (long 64))]
+                           (MemorySegment/copy fa 0 seg ValueLayout/JAVA_FLOAT (long 0) num-floats)
+                           seg))
+              args (.allocate arena (long 120))]
+          (.fill args (byte 0))
+          (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 120))
+          (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) cli)
+          (.set ^MemorySegment args ValueLayout/ADDRESS (long 24) data-seg)
+          (.set ^MemorySegment args ValueLayout/JAVA_INT (long 32) (int dtype-enum))
+          (.set ^MemorySegment args ValueLayout/ADDRESS (long 40) dims-seg)
+          (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-dims))
+          (when dev
+            (.set ^MemorySegment args ValueLayout/ADDRESS (long 80) dev))
+          (let [handle (downcall-ptr linker api-ptr OFFSET_CLIENT_BUFFER_FROM_HOST_BUFFER ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                err (.invokeWithArguments ^MethodHandle handle [args])]
+            (check-error! api-ctx err)
+            (.get ^MemorySegment args ValueLayout/ADDRESS (long 112))))))))
 
 (defn destroy-buffer!
   "Frees native device PJRT_Buffer `buffer-handle`."

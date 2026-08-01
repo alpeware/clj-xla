@@ -11,6 +11,15 @@
   :smollm
   {:main-opts ["-m" "scripts.smollm-inference"]
    :jvm-opts ["--enable-native-access=ALL-UNNAMED" "-Xmx4g"]}
+  :gemma
+  {:main-opts ["-m" "scripts.gemma2-inference"]
+   :jvm-opts ["--enable-native-access=ALL-UNNAMED" "-Xmx12g"]}
+  :gemma2
+  {:main-opts ["-m" "scripts.gemma2-inference"]
+   :jvm-opts ["--enable-native-access=ALL-UNNAMED" "-Xmx12g"]}
+  :download-hf
+  {:main-opts ["-m" "scripts.download-hf"]
+   :jvm-opts ["--enable-native-access=ALL-UNNAMED" "-Xmx4g"]}
   :repl
   {:jvm-opts ["-Dclojure.server.repl={:port 5555 :accept clojure.core.server/repl}"
               "--enable-native-access=ALL-UNNAMED" "-Xmx4g"]}

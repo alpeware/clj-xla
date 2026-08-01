@@ -2,8 +2,10 @@
   "Main CLI entrypoint for running the complete test suite."
   (:require [clj-xla.autodiff-test]
             [clj-xla.compile-test]
+            [clj-xla.download-hf-test]
             [clj-xla.generation-test]
             [clj-xla.kernels-test]
+            [clj-xla.models.gemma-test]
             [clj-xla.models.gpt2-test]
             [clj-xla.nn.activations-test]
             [clj-xla.nn.attention-test]
@@ -35,10 +37,12 @@
                            'clj-xla.nn.norm-test
                            'clj-xla.nn.attention-test
                            'clj-xla.nn.loss-test
+                           'clj-xla.models.gemma-test
                            'clj-xla.models.gpt2-test
                            'clj-xla.sampling-test
                            'clj-xla.tokenizer-test
-                           'clj-xla.generation-test)
+                           'clj-xla.generation-test
+                           'clj-xla.download-hf-test)
         {:keys [fail error]} results]
     (if (and (zero? fail) (zero? error))
       (do (println "All tests passed successfully.")

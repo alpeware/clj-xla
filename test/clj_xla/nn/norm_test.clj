@@ -18,11 +18,17 @@
                       g-rms (trace-graph "rms_test"
                                          [[:x [:tensor [1 128 768] :f32]]
                                           [:weight [:tensor [768] :f32]]]
-                                         (fn [x w] (norm/rms-norm x w)))]
+                                         (fn [x w] (norm/rms-norm x w)))
+                      g-gemma-rms (trace-graph "gemma_rms_test"
+                                               [[:x [:tensor [1 128 2048] :f32]]
+                                                [:weight [:tensor [2048] :f32]]]
+                                               (fn [x w] (norm/gemma-rms-norm x w)))]
                   (and (= "ln_test" (:name g-ln))
                        (= "rms_test" (:name g-rms))
+                       (= "gemma_rms_test" (:name g-gemma-rms))
                        (seq (:eqns g-ln))
-                       (seq (:eqns g-rms))))))
+                       (seq (:eqns g-rms))
+                       (seq (:eqns g-gemma-rms))))))
 
 (deftest norm-tracer-test
   (testing "Normalization layers return Tracer on Tracer input"
@@ -30,4 +36,5 @@
           g (t/->Tracer :g [:tensor [768] :f32])
           b (t/->Tracer :b [:tensor [768] :f32])]
       (is (tracer? (norm/layer-norm x g b)))
-      (is (tracer? (norm/rms-norm x g))))))
+      (is (tracer? (norm/rms-norm x g)))
+      (is (tracer? (norm/gemma-rms-norm x g))))))

@@ -18,7 +18,7 @@
                                            [:c_proj_b [:tensor [768] :f32]]]
                                           (fn [x w b pw pb] (attn/causal-self-attention x w b pw pb 12)))
                       g-rope (trace-graph "rope_test"
-                                          [[:q [:tensor [1 16 96] :f32]]]
+                                          [[:q [:tensor [1 8 16 256] :f32]]]
                                           (fn [q] (attn/apply-rope q [0])))]
                   (and (= "causal_attn" (:name g-attn))
                        (= "rope_test" (:name g-rope))
@@ -32,5 +32,16 @@
           b (t/->Tracer :b [:tensor [2304] :f32])
           pw (t/->Tracer :pw [:tensor [768 768] :f32])
           pb (t/->Tracer :pb [:tensor [768] :f32])]
-      (is (tracer? (attn/causal-self-attention x w b pw pb 12)))
-      (is (tracer? (attn/apply-rope x [0]))))))
+      (is (tracer? (attn/causal-self-attention x w b pw pb 12)))))
+
+  (testing "apply-rope returns Tracer with matching 4D tensor shape"
+    (let [q (t/->Tracer :q [:tensor [1 8 16 256] :f32])
+          k (t/->Tracer :k [:tensor [1 4 16 256] :f32])
+          q-rope (attn/apply-rope q [0])
+          [q-r k-r] (attn/apply-rope q k [0])]
+      (is (tracer? q-rope))
+      (is (= [:tensor [1 8 16 256] :f32] (:type q-rope)))
+      (is (tracer? q-r))
+      (is (= [:tensor [1 8 16 256] :f32] (:type q-r)))
+      (is (tracer? k-r))
+      (is (= [:tensor [1 4 16 256] :f32] (:type k-r))))))

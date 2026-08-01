@@ -26,7 +26,7 @@
     (number? val)
     (let [out-id (gen-var-id! "c")
           out-type (or target-type [:tensor [] :f32])
-          eqn {:op :stablehlo/constant :outvars [out-id] :value val}]
+          eqn {:op :stablehlo/constant :outvars [out-id] :value val :type out-type}]
       (when *trace-ctx*
         (swap! (:eqns *trace-ctx*) conj eqn))
       (->Tracer out-id out-type))
@@ -34,7 +34,7 @@
     (vector? val)
     (let [out-id (gen-var-id! "c_vec")
           out-type (or target-type [:tensor [128 128] :f32])
-          eqn {:op :stablehlo/constant :outvars [out-id] :value val}]
+          eqn {:op :stablehlo/constant :outvars [out-id] :value val :type out-type}]
       (when *trace-ctx*
         (swap! (:eqns *trace-ctx*) conj eqn))
       (->Tracer out-id out-type))
@@ -134,6 +134,48 @@
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))
     (->Tracer out-id (:type tx))))
+
+(defn sin
+  "Elementwise sine function."
+  [x]
+  (let [tx (emit-constant! x nil)
+        out-id (gen-var-id! "t_sin")
+        eqn {:op :stablehlo/sine :invars [(:id tx)] :outvars [out-id]}]
+    (when *trace-ctx*
+      (swap! (:eqns *trace-ctx*) conj eqn))
+    (->Tracer out-id (:type tx))))
+
+(defn cos
+  "Elementwise cosine function."
+  [x]
+  (let [tx (emit-constant! x nil)
+        out-id (gen-var-id! "t_cos")
+        eqn {:op :stablehlo/cosine :invars [(:id tx)] :outvars [out-id]}]
+    (when *trace-ctx*
+      (swap! (:eqns *trace-ctx*) conj eqn))
+    (->Tracer out-id (:type tx))))
+
+(defn concatenate
+  "Concatenates tensors along `dimension`."
+  [tensors dimension]
+  (let [tracers (mapv #(emit-constant! % nil) tensors)
+        first-t (first tracers)
+        [t-kw first-shape dtype] (:type first-t)
+        rank (clojure.core/count first-shape)
+        dim (if (neg? dimension) (clojure.core/+ rank dimension) dimension)
+        total-dim-size (reduce clojure.core/+ (map (fn [tr] (nth (second (:type tr)) dim)) tracers))
+        out-shape (assoc first-shape dim total-dim-size)
+        out-type [t-kw out-shape dtype]
+        out-id (gen-var-id! "t_concat")
+        eqn {:op :stablehlo/concatenate
+             :invars (mapv :id tracers)
+             :outvars [out-id]
+             :attrs {:dimension dim}}]
+    (when *trace-ctx*
+      (swap! (:eqns *trace-ctx*) conj eqn))
+    (->Tracer out-id out-type)))
+
+(def concat-tensor concatenate)
 
 (defn dot-general
   "Batched matrix multiplication with explicit contracting and batching dimensions."

@@ -1,8 +1,8 @@
 (ns clj-xla.nn.activations
-  "Neural network activation functions (GELU, SiLU, SwiGLU, ReLU, Softmax)."
+  "Neural network activation functions (GELU, SiLU, SwiGLU, GeGLU, ReLU, Softmax)."
   (:refer-clojure :exclude [+ * - /])
   (:require [clj-xla.nn.attention :refer [linear]]
-            [clj-xla.tensor :refer [+ * - / exp pow tanh]]))
+            [clj-xla.tensor :refer [+ * - / exp pow tanh transpose]]))
 
 (defn gelu
   "Gaussian Error Linear Unit (GELU) activation function."
@@ -31,6 +31,16 @@
          up (linear x up-w up-b)
          act-up (* (silu gate) up)]
      (linear act-up down-w down-b))))
+
+(defn geglu
+  "GeGLU activation & projection block: down_proj(gelu(gate_proj(x)) * up_proj(x))."
+  ([gate-out up-out]
+   (* (gelu gate-out) up-out))
+  ([x gate-w up-w down-w]
+   (let [gate (linear x (transpose gate-w [1 0]) nil)
+         up (linear x (transpose up-w [1 0]) nil)
+         act-up (* (gelu gate) up)]
+     (linear act-up (transpose down-w [1 0]) nil))))
 
 (defn relu
   "Rectified Linear Unit (ReLU) activation function."

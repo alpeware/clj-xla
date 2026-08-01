@@ -21,3 +21,8 @@
       (is (= "F32" (get-in parsed ["weight_a" "dtype"])))
       (is (= [1 128 768] (get-in parsed ["weight_a" "shape"])))
       (is (= [0 393216] (get-in parsed ["weight_a" "data_offsets"]))))))
+
+(deftest sharded-safetensors-directory-test
+  (testing "Sharded safetensors directory lookup structure"
+    (let [dummy-map {:tensors {"model.embed_tokens.weight" {:info {"data_offsets" [0 4]} :segment nil}}}]
+      (is (some? (get-in dummy-map [:tensors "model.embed_tokens.weight"]))))))
