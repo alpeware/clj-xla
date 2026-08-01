@@ -14,10 +14,11 @@
   {:prompt "The capital of France is"
    :max-new-tokens 10
    :temperature 0.7
-   :top-k 10})
+   :top-k 10
+   :backend :cpu})
 
 (defn parse-cli-args
-  "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k)."
+  "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k, --backend)."
   [args]
   (loop [remaining (vec args)
          opts DEFAULT_CLI_OPTS]
@@ -37,6 +38,9 @@
 
           (and (= flag "--top-k") val)
           (recur (subvec remaining 2) (assoc opts :top-k (Long/parseLong val)))
+
+          (and (= flag "--backend") val)
+          (recur (subvec remaining 2) (assoc opts :backend (keyword val)))
 
           :else
           (recur (subvec remaining 1) opts))))))
@@ -62,13 +66,13 @@
 (defn -main
   "Runs end-to-end Gemma 2B text generation pipeline: model loading, tokenization, full-model graph tracing, StableHLO JIT compilation, and autoregressive decoding."
   [& args]
-  (let [{:keys [prompt max-new-tokens temperature top-k]} (parse-cli-args args)]
+  (let [{:keys [prompt max-new-tokens temperature top-k backend]} (parse-cli-args args)]
     (println "==================================================================")
     (println "     clj-xla Gemma 2B End-to-End Autoregressive Generation Loop  ")
     (println "==================================================================")
 
-    ;; 1. Initialize CPU PJRT runtime
-    (let [ctx (xla/init-cpu!)
+    ;; 1. Initialize PJRT runtime for specified backend
+    (let [ctx (xla/init-backend! (or backend :cpu))
           model-dirs [".models/gemma-2-2b-it" ".models/gemma-2b" ".models/gemma-2-2b" ".models/gemma"]
           existing-dir (first (filter (fn [d]
                                         (let [f (io/file d)]

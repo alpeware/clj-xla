@@ -5,15 +5,36 @@
 
 (def ^:dynamic *default-context* nil)
 
-(defn init-cpu!
-  "Initializes PJRT CPU C API client runtime."
-  []
-  (let [lib-path (or (System/getenv "PJRT_CPU_LIBRARY_PATH") "bin/libpjrt_cpu.so")
-        api-ctx (pjrt/load-plugin! lib-path)
-        client (pjrt/create-client api-ctx)
-        ctx (assoc api-ctx :client client)]
-    (alter-var-root #'*default-context* (constantly ctx))
-    ctx))
+(def BACKEND-LIBRARY-MAP
+  {:cpu    {:default "bin/libpjrt_cpu.so"  :env "PJRT_CPU_LIBRARY_PATH"}
+   :sycl   {:default "bin/libpjrt_sycl.so" :env "PJRT_SYCL_LIBRARY_PATH"}
+   :rocm   {:default "bin/libpjrt_rocm.so" :env "PJRT_ROCM_LIBRARY_PATH"}
+   :cuda12 {:default "bin/libpjrt_cuda.so" :env "PJRT_CUDA_LIBRARY_PATH"}})
+
+(defn init-backend!
+  "Initializes PJRT C API client runtime for specified target (:cpu, :sycl, :rocm, :cuda12, or a custom string path).
+   Sets and returns the thread-root default context *default-context*."
+  ([] (init-backend! :cpu))
+  ([target]
+   (let [lib-path (cond
+                    (string? target) target
+                    (keyword? target) (let [{:keys [default env]} (get BACKEND-LIBRARY-MAP target)]
+                                        (or (when env (System/getenv env))
+                                            default
+                                            (throw (ex-info "Unknown backend target" {:target target}))))
+                    :else (throw (ex-info "Invalid backend target specifier" {:target target})))
+         api-ctx (pjrt/load-plugin! lib-path)
+         client (pjrt/create-client api-ctx)
+         pname (pjrt/platform-name api-ctx client)
+         ctx (assoc api-ctx :client client :platform pname :target target)]
+     (alter-var-root #'*default-context* (constantly ctx))
+     (println (format "clj-xla initialized PJRT Backend: [%s] via plugin [%s]" pname lib-path))
+     ctx)))
+
+(defn init-cpu! [] (init-backend! :cpu))
+(defn init-sycl! [] (init-backend! :sycl))
+(defn init-rocm! [] (init-backend! :rocm))
+(defn init-cuda! [] (init-backend! :cuda12))
 
 (defn get-context
   "Returns current default PJRT context or initializes CPU client."

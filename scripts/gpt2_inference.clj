@@ -13,7 +13,8 @@
          opts {:prompt "The quick brown fox"
                :max-new-tokens 15
                :temperature 0.70
-               :top-k 10}]
+               :top-k 10
+               :backend :cpu}]
     (if (seq cli-args)
       (let [arg (first cli-args)]
         (cond
@@ -28,6 +29,9 @@
 
           (= arg "--top-k")
           (recur (drop 2 cli-args) (assoc opts :top-k (Integer/parseInt (second cli-args))))
+
+          (= arg "--backend")
+          (recur (drop 2 cli-args) (assoc opts :backend (keyword (second cli-args))))
 
           :else
           (recur (rest cli-args) opts)))
@@ -71,11 +75,11 @@
     [(vec padded)]))
 
 (defn -main [& args]
-  (let [{:keys [prompt max-new-tokens temperature top-k]} (parse-cli-args args)]
+  (let [{:keys [prompt max-new-tokens temperature top-k backend]} (parse-cli-args args)]
     (println "==================================================================")
     (println "      clj-xla GPT-2 End-to-End Autoregressive Generation Loop     ")
     (println "==================================================================")
-    (let [ctx (xla/init-cpu!)
+    (let [ctx (xla/init-backend! (or backend :cpu))
           tokenizer-dir ".models/gpt2"
           safetensors-path ".models/gpt2/model.safetensors"]
 

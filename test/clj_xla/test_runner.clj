@@ -2,7 +2,9 @@
   "Main CLI entrypoint for running the complete test suite."
   (:require [clj-xla.autodiff-test]
             [clj-xla.compile-test]
+            [clj-xla.core-test]
             [clj-xla.download-hf-test]
+            [clj-xla.fetch-pjrt-binaries-test]
             [clj-xla.generation-test]
             [clj-xla.kernels-test]
             [clj-xla.models.gemma-test]
@@ -42,7 +44,9 @@
                            'clj-xla.sampling-test
                            'clj-xla.tokenizer-test
                            'clj-xla.generation-test
-                           'clj-xla.download-hf-test)
+                           'clj-xla.download-hf-test
+                           'clj-xla.fetch-pjrt-binaries-test
+                           'clj-xla.core-test)
         {:keys [fail error]} results]
     (if (and (zero? fail) (zero? error))
       (do (println "All tests passed successfully.")
