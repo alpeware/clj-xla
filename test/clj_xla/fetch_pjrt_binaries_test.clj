@@ -16,7 +16,15 @@
       (is (string? (:url config)) (str "Target " target " missing string url"))
       (is (re-find #"^https?://" (:url config)) (str "Target " target " url must start with http(s)://"))
       (is (string? (:so-name config)) (str "Target " target " missing string so-name"))
-      (is (instance? java.util.regex.Pattern (:entry-pattern config)) (str "Target " target " missing entry-pattern regex")))))
+      (is (instance? java.util.regex.Pattern (:entry-pattern config)) (str "Target " target " missing entry-pattern regex"))))
+  (testing "SYCL target configuration"
+    (let [sycl-config (get fetch/SOURCES :sycl)]
+      (is (re-find #"intel_extension_for_openxla-0\.7\.0" (:url sycl-config)) "SYCL URL should point to 0.7.0 wheel")
+      (is (vector? (:deps sycl-config)) "SYCL target should have deps vector")
+      (is (>= (count (:deps sycl-config)) 8) "SYCL target should have at least 8 companion wheel dependencies")
+      (doseq [dep-url (:deps sycl-config)]
+        (is (string? dep-url))
+        (is (re-find #"^https?://" dep-url))))))
 
 (def gen-backend-target
   (gen/elements (conj (vec (keys fetch/SOURCES)) :all)))
@@ -27,3 +35,14 @@
                 (if (= target :all)
                   (= (set (keys fetch/SOURCES)) #{:cpu :cuda12 :sycl :rocm})
                   (some? (get fetch/SOURCES target)))))
+
+(defspec prop-dependencies-urls-invariant
+  50
+  (prop/for-all [target gen-backend-target]
+                (if (= target :all)
+                  true
+                  (let [config (get fetch/SOURCES target)]
+                    (if-let [deps (or (:deps config) (:dependencies config))]
+                      (and (vector? deps)
+                           (every? #(and (string? %) (re-find #"^https?://" %)) deps))
+                      true)))))

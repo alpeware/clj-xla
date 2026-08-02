@@ -1,5 +1,6 @@
 (ns clj-xla.pjrt
   "Project Panama FFM native bindings to OpenXLA PJRT C API (pjrt_c_api.h)."
+  (:require [clojure.java.io :as io])
   (:import [java.lang.foreign Arena FunctionDescriptor Linker Linker$Option MemoryLayout MemorySegment SymbolLookup ValueLayout]
            [java.lang.invoke MethodHandle]
            [java.nio.file Path]))
@@ -75,9 +76,34 @@
         (.invokeWithArguments ^MethodHandle destroy-handle [destroy-args])
         (throw (ex-info (str "PJRT Error: " err-msg) {:error-msg err-msg}))))))
 
+(defn- preload-libpython!
+  "Pre-loads system libpython library with RTLD_GLOBAL (0x102) if present, resolving Python C API symbols for PyPI PJRT plugins."
+  []
+  (let [paths ["/usr/lib64/libpython3.12.so"
+               "/usr/lib64/libpython3.13.so"
+               "/usr/lib64/libpython3.14.so"
+               "/usr/lib64/libpython3.so"
+               "/usr/lib/x86_64-linux-gnu/libpython3.12.so"
+               "/usr/lib/x86_64-linux-gnu/libpython3.11.so"
+               "/usr/lib/x86_64-linux-gnu/libpython3.10.so"
+               "/usr/lib/x86_64-linux-gnu/libpython3.so"]
+        existing (first (filter #(and (.exists (io/file %)) (not (.isDirectory (io/file %)))) paths))]
+    (when existing
+      (try
+        (let [linker (Linker/nativeLinker)
+              stdlib (.defaultLookup linker)
+              ^MemorySegment dlopen-seg (.get (.find stdlib "dlopen"))
+              ^FunctionDescriptor desc (FunctionDescriptor/of ValueLayout/ADDRESS (into-array MemoryLayout [ValueLayout/ADDRESS ValueLayout/JAVA_INT]))
+              dlopen-fn (.downcallHandle linker dlopen-seg desc (make-array Linker$Option 0))
+              arena (Arena/global)
+              py-path (.allocateFrom arena ^String existing)]
+          (.invokeWithArguments dlopen-fn [py-path (Integer/valueOf 258)]))
+        (catch Exception _ nil)))))
+
 (defn load-plugin!
   "Loads the PJRT shared object from `lib-path` and initializes the PJRT plugin."
   [lib-path]
+  (preload-libpython!)
   (let [arena (Arena/global)
         abs-path (.toAbsolutePath (Path/of lib-path (into-array String [])))
         lookup (SymbolLookup/libraryLookup abs-path arena)
