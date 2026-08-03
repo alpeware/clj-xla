@@ -120,3 +120,39 @@
                 arr (float-array num-floats)]
             (.get float-buf arr)
             arr))))))
+
+(defn get-tensor-bf16-shorts
+  "Reads BF16 or Float32 tensor values from `mapped-weights` into a Java short array (BF16 raw 16-bit values)."
+  [mapped-weights tensor-name]
+  (let [t-entry (or (get (:tensors mapped-weights) tensor-name)
+                    (when-let [info (get (:header mapped-weights) tensor-name)]
+                      {:info info :segment (:segment mapped-weights)}))]
+    (if-not t-entry
+      (throw (ex-info "Tensor key not found in Safetensors header" {:tensor tensor-name}))
+      (let [{:keys [info segment]} t-entry
+            [start end] (get info "data_offsets")
+            dtype (get info "dtype" "F32")
+            len (- end start)
+            ^MemorySegment slice (.asSlice ^MemorySegment segment (long start) (long len))]
+        (cond
+          (or (= dtype "BF16") (= dtype "BFLOAT16"))
+          (let [num-shorts (quot len 2)
+                ^java.nio.ShortBuffer sb (-> (.asByteBuffer slice)
+                                             (.order ByteOrder/LITTLE_ENDIAN)
+                                             .asShortBuffer)
+                arr (short-array num-shorts)]
+            (.get sb arr)
+            arr)
+
+          :else
+          (let [num-floats (quot len 4)
+                ^FloatBuffer float-buf (-> (.asByteBuffer slice)
+                                           (.order ByteOrder/LITTLE_ENDIAN)
+                                           .asFloatBuffer)
+                arr (short-array num-floats)]
+            (dotimes [i num-floats]
+              (let [f (.get float-buf i)
+                    bits (Float/floatToIntBits f)
+                    s (short (bit-shift-right bits 16))]
+                (aset arr i s)))
+            arr))))))

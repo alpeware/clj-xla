@@ -74,7 +74,7 @@
                                    (if (instance? java.lang.foreign.MemorySegment input-data)
                                      input-data
                                      (let [[_var-name [_kw shape dtype]] (nth invars idx)
-                                           dtype-enum (case dtype :i32 4 :f32 11 11)]
+                                           dtype-enum (case dtype :i32 4 :f32 11 :bf16 13 :f16 10 11)]
                                        (pjrt/buffer-from-host-buffer ctx (:client ctx) input-data shape dtype-enum))))
                                  (range (count flat-inputs))
                                  flat-inputs)
@@ -84,15 +84,17 @@
 (defn to-host-slice
   "Transfers a slice of PJRT output device buffer back to host float array."
   ([out-buf]
-   (to-host-slice out-buf 0 50257))
+   (to-host-slice out-buf 0 256000 256000))
   ([out-buf slice-idx]
-   (to-host-slice out-buf slice-idx 50257))
+   (to-host-slice out-buf slice-idx 256000 256000))
   ([out-buf slice-idx vocab-size]
+   (to-host-slice out-buf slice-idx vocab-size (* (inc slice-idx) vocab-size)))
+  ([out-buf slice-idx vocab-size total-elements]
    (let [ctx (get-context)
-         total-floats (* 128 vocab-size)
-         all-floats (pjrt/buffer-to-host-buffer ctx out-buf total-floats)
+         n-floats (max (long total-elements) (long (* (inc slice-idx) vocab-size)))
+         all-floats (pjrt/buffer-to-host-buffer ctx out-buf n-floats)
          offset (* slice-idx vocab-size)]
-     (if (<= (+ offset vocab-size) (alength ^floats all-floats))
+     (if (and (>= offset 0) (<= (+ offset vocab-size) (alength ^floats all-floats)))
        (let [slice (float-array vocab-size)]
          (System/arraycopy all-floats offset slice 0 vocab-size)
          slice)

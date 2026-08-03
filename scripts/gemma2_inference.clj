@@ -1,9 +1,10 @@
 (ns scripts.gemma2-inference
-  "Top-level runnable integration script for end-to-end Gemma 2B text generation via pure XLA execution with KV caching."
+  "Top-level runnable integration script for end-to-end Gemma 2B text generation via pure XLA execution with Single-Pass Prefill and BF16/FP16 precision."
   (:require [clj-xla.core :as xla]
             [clj-xla.models.gemma :as gemma]
             [clj-xla.safetensors :as st]
             [clj-xla.sampling :as sampling]
+            [clj-xla.tensor :as t]
             [clj-xla.tokenizer.core :as tok]
             [clj-xla.tokenizer.protocol :refer [bos-id decode encode eos-id]]
             [clj-xla.trace :refer [trace-graph]]
@@ -15,10 +16,11 @@
    :max-new-tokens 10
    :temperature 0.7
    :top-k 10
-   :backend :cpu})
+   :backend :cpu
+   :precision :bf16})
 
 (defn parse-cli-args
-  "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k, --backend)."
+  "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k, --backend, --precision)."
   [args]
   (loop [remaining (vec args)
          opts DEFAULT_CLI_OPTS]
@@ -42,6 +44,9 @@
           (and (= flag "--backend") val)
           (recur (subvec remaining 2) (assoc opts :backend (keyword val)))
 
+          (and (= flag "--precision") val)
+          (recur (subvec remaining 2) (assoc opts :precision (keyword val)))
+
           :else
           (recur (subvec remaining 1) opts))))))
 
@@ -60,11 +65,11 @@
   (eos-id [_] 1))
 
 (defn -main
-  "Runs end-to-end Gemma 2B text generation pipeline with KV caching."
+  "Runs end-to-end Gemma 2B text generation pipeline with Single-Pass Prefill and BF16 precision."
   [& args]
-  (let [{:keys [prompt max-new-tokens temperature top-k backend]} (parse-cli-args args)]
+  (let [{:keys [prompt max-new-tokens temperature top-k backend precision]} (parse-cli-args args)]
     (println "==================================================================")
-    (println "  clj-xla Gemma 2B End-to-End Autoregressive Loop with KV Caching  ")
+    (println "  clj-xla Gemma 2B Single-Pass Prefill & BF16 KV-Cached Generation ")
     (println "==================================================================")
 
     ;; 1. Initialize PJRT runtime for specified backend
@@ -81,17 +86,18 @@
           has-real-weights (some? existing-dir)]
 
       (if has-real-weights
-        (println (str "Loading Gemma model weights from [" model-dir "]..."))
+        (println (str "Loading Gemma model weights from [" model-dir "] in [" (name precision) "] mode..."))
         (println (str "Safetensors files not found at [" model-dir "]. Using Gemma 2B architecture tracing mode...")))
 
       (let [tokenizer (if has-real-weights
                         (tok/from-file model-dir)
                         (->DummyGemmaTokenizer))
-            prompt-ids (into [(bos-id tokenizer)] (encode tokenizer prompt))]
+            prompt-ids (into [(bos-id tokenizer)] (encode tokenizer prompt))
+            prompt-len (count prompt-ids)]
         (println (format "Prompt: \"%s\"" prompt))
-        (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d"
-                         max-new-tokens temperature top-k))
-        (println (format "Encoded Token IDs (%d tokens): %s" (count prompt-ids) prompt-ids))
+        (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d, precision=%s"
+                         max-new-tokens temperature top-k (name precision)))
+        (println (format "Encoded Token IDs (%d tokens): %s" prompt-len prompt-ids))
 
         (let [arena (Arena/ofConfined)
               dummy-cache (atom {})
@@ -125,64 +131,111 @@
               max-seq-len 128
               kv-cache-shape [1 num-kv-heads max-seq-len head-dim]
 
+              weight-dtype (or precision :bf16)
+              weight-enum (if (= weight-dtype :f32) 11 13)
+
               load-weight-buf (fn [tensor-name shape]
                                 (let [host-data (if (and has-real-weights tensor-name)
-                                                  (st/get-tensor-floats weights-mmap tensor-name)
+                                                  (if (= weight-dtype :f32)
+                                                    (st/get-tensor-floats weights-mmap tensor-name)
+                                                    (st/get-tensor-bf16-shorts weights-mmap tensor-name))
                                                   (make-dummy-seg shape))]
-                                  (xla/buffer-from-host-buffer ctx (:client ctx) host-data shape 11)))]
+                                  (xla/buffer-from-host-buffer ctx (:client ctx) host-data shape weight-enum)))]
 
-          (println (format "Prepared weight configuration for %d layers (hidden_dim=%d, vocab_size=%d, q_dim=%d, kv_dim=%d)."
-                           num-layers hidden-dim vocab-size q-dim kv-dim))
+          (println (format "Prepared weight configuration for %d layers (hidden_dim=%d, vocab_size=%d, precision=%s)."
+                           num-layers hidden-dim vocab-size (name weight-dtype)))
 
-          ;; 1. Allocate PJRT Device Buffers for KV Caches (52 buffers for 26 layers: [1 1 128 256])
+          ;; 1. Allocate PJRT Device Buffers for KV Caches
           (println (format "Allocating %d PJRT Device KV-Cache Buffers (2 per layer, shape=%s)..."
                            (* 2 num-layers) kv-cache-shape))
           (let [initial-device-kv-bufs
                 (mapv (fn [_i]
-                        [(xla/buffer-from-host-buffer ctx (:client ctx) (make-dummy-seg kv-cache-shape) kv-cache-shape 11)
-                         (xla/buffer-from-host-buffer ctx (:client ctx) (make-dummy-seg kv-cache-shape) kv-cache-shape 11)])
+                        [(xla/buffer-from-host-buffer ctx (:client ctx) (make-dummy-seg kv-cache-shape) kv-cache-shape weight-enum)
+                         (xla/buffer-from-host-buffer ctx (:client ctx) (make-dummy-seg kv-cache-shape) kv-cache-shape weight-enum)])
                       (range num-layers))
 
-                ;; 2. Trace Graph for Single-Token Decode with KV Cache
-                invars (vec (concat
-                              [[:x [:tensor [1 1] :i32]]
-                               [:pos [:tensor [1] :i32]]
-                               [:embed_tokens [:tensor [vocab-size hidden-dim] :f32]]
-                               [:final_norm_w [:tensor [hidden-dim] :f32]]]
-                              (mapcat (fn [i]
-                                        [[(keyword (str "input_ln_w_" i)) [:tensor [hidden-dim] :f32]]
-                                         [(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] :f32]]
-                                         [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] :f32]]
-                                         [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] :f32]]
-                                         [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] :f32]]
-                                         [(keyword (str "post_attn_ln_w_" i)) [:tensor [hidden-dim] :f32]]
-                                         [(keyword (str "pre_mlp_ln_w_" i)) [:tensor [hidden-dim] :f32]]
-                                         [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] :f32]]
-                                         [(keyword (str "gate_w_" i)) [:tensor [intermediate-dim hidden-dim] :f32]]
-                                         [(keyword (str "up_w_" i)) [:tensor [intermediate-dim hidden-dim] :f32]]
-                                         [(keyword (str "down_w_" i)) [:tensor [hidden-dim intermediate-dim] :f32]]])
-                                      (range num-layers))
-                              (mapcat (fn [i]
-                                        [[(keyword (str "k_cache_" i)) [:tensor kv-cache-shape :f32]]
-                                         [(keyword (str "v_cache_" i)) [:tensor kv-cache-shape :f32]]])
-                                      (range num-layers))))
+                ;; 2a. Trace Single-Pass Prompt Prefill Graph [1 prompt-len]
+                prefill-invars (vec (concat
+                                     [[:x [:tensor [1 prompt-len] :i32]]
+                                      [:pos [:tensor [prompt-len] :i32]]
+                                      [:embed_tokens [:tensor [vocab-size hidden-dim] weight-dtype]]
+                                      [:final_norm_w [:tensor [hidden-dim] weight-dtype]]]
+                                     (mapcat (fn [i]
+                                               [[(keyword (str "input_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                                [(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] weight-dtype]]
+                                                [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
+                                                [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
+                                                [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] weight-dtype]]
+                                                [(keyword (str "post_attn_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                                [(keyword (str "pre_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                                [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                                [(keyword (str "gate_w_" i)) [:tensor [intermediate-dim hidden-dim] weight-dtype]]
+                                                [(keyword (str "up_w_" i)) [:tensor [intermediate-dim hidden-dim] weight-dtype]]
+                                                [(keyword (str "down_w_" i)) [:tensor [hidden-dim intermediate-dim] weight-dtype]]])
+                                             (range num-layers))
+                                     (mapcat (fn [i]
+                                               [[(keyword (str "k_cache_" i)) [:tensor kv-cache-shape weight-dtype]]
+                                                [(keyword (str "v_cache_" i)) [:tensor kv-cache-shape weight-dtype]]])
+                                             (range num-layers))))
 
-                trace-fn (fn [x pos-tracer emb fn-norm & rest-args]
-                           (let [weight-args (take (* 11 num-layers) rest-args)
-                                 kv-cache-args (drop (* 11 num-layers) rest-args)
-                                 lw-seq (mapv (fn [[in-ln qw kw vw ow post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw]]
-                                                {:input-ln-w in-ln :q-w qw :k-w kw :v-w vw :o-w ow
-                                                 :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
-                                                 :gate-w gw :up-w uw :down-w dw})
-                                              (partition 11 weight-args))
-                                 kv-seq (mapv vec (partition 2 kv-cache-args))
-                                 [logits updated-kv-caches] (gemma/full-gemma-forward x emb lw-seq fn-norm pos-tracer num-heads num-kv-heads kv-seq pos-tracer)]
-                             (into [logits] (apply concat updated-kv-caches))))
+                prefill-trace-fn (fn [x _pos-tracer emb fn-norm & rest-args]
+                                   (let [weight-args (take (* 11 num-layers) rest-args)
+                                         kv-cache-args (drop (* 11 num-layers) rest-args)
+                                         lw-seq (mapv (fn [[in-ln qw kw vw ow post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw]]
+                                                        {:input-ln-w in-ln :q-w qw :k-w kw :v-w vw :o-w ow
+                                                         :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
+                                                         :gate-w gw :up-w uw :down-w dw})
+                                                      (partition 11 weight-args))
+                                         kv-seq (mapv vec (partition 2 kv-cache-args))
+                                         [logits updated-kv-caches] (gemma/full-gemma-forward x emb lw-seq fn-norm (vec (range prompt-len)) num-heads num-kv-heads kv-seq 0)
+                                         f32-logits (t/convert logits :f32)]
+                                     (into [f32-logits] (apply concat updated-kv-caches))))
 
-                _ (println "Tracing & JIT Compiling KV-Cached Gemma 2B model graph to XLA Executable...")
-                graph (trace-graph "full_gemma_kv_cached" invars trace-fn)
-                exec (xla/compile-graph ctx graph)
-                _ (println "Successfully compiled StableHLO graph to native XLA PjRtLoadedExecutable handle.")
+                ;; 2b. Trace Single-Token Autoregressive Decoding Graph [1 1]
+                decode-invars (vec (concat
+                                    [[:x [:tensor [1 1] :i32]]
+                                     [:pos [:tensor [1] :i32]]
+                                     [:embed_tokens [:tensor [vocab-size hidden-dim] weight-dtype]]
+                                     [:final_norm_w [:tensor [hidden-dim] weight-dtype]]]
+                                    (mapcat (fn [i]
+                                              [[(keyword (str "input_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                               [(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] weight-dtype]]
+                                               [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
+                                               [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
+                                               [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] weight-dtype]]
+                                               [(keyword (str "post_attn_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                               [(keyword (str "pre_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                               [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                               [(keyword (str "gate_w_" i)) [:tensor [intermediate-dim hidden-dim] weight-dtype]]
+                                               [(keyword (str "up_w_" i)) [:tensor [intermediate-dim hidden-dim] weight-dtype]]
+                                               [(keyword (str "down_w_" i)) [:tensor [hidden-dim intermediate-dim] weight-dtype]]])
+                                            (range num-layers))
+                                    (mapcat (fn [i]
+                                              [[(keyword (str "k_cache_" i)) [:tensor kv-cache-shape weight-dtype]]
+                                               [(keyword (str "v_cache_" i)) [:tensor kv-cache-shape weight-dtype]]])
+                                            (range num-layers))))
+
+                decode-trace-fn (fn [x pos-tracer emb fn-norm & rest-args]
+                                  (let [weight-args (take (* 11 num-layers) rest-args)
+                                        kv-cache-args (drop (* 11 num-layers) rest-args)
+                                        lw-seq (mapv (fn [[in-ln qw kw vw ow post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw]]
+                                                       {:input-ln-w in-ln :q-w qw :k-w kw :v-w vw :o-w ow
+                                                        :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
+                                                        :gate-w gw :up-w uw :down-w dw})
+                                                     (partition 11 weight-args))
+                                        kv-seq (mapv vec (partition 2 kv-cache-args))
+                                        [logits updated-kv-caches] (gemma/full-gemma-forward x emb lw-seq fn-norm pos-tracer num-heads num-kv-heads kv-seq pos-tracer)
+                                        f32-logits (t/convert logits :f32)]
+                                    (into [f32-logits] (apply concat updated-kv-caches))))
+
+                _ (println "Tracing & JIT Compiling Single-Pass Prefill Graph...")
+                prefill-graph (trace-graph "gemma2_prefill" prefill-invars prefill-trace-fn)
+                prefill-exec (xla/compile-graph ctx prefill-graph)
+
+                _ (println "Tracing & JIT Compiling Single-Token Decoding Graph...")
+                decode-graph (trace-graph "gemma2_decode" decode-invars decode-trace-fn)
+                decode-exec (xla/compile-graph ctx decode-graph)
+                _ (println "Successfully compiled StableHLO prefill and decode graphs to native XLA PjRtLoadedExecutable handles.")
 
                 _ (println "Transferring model weights to PJRT Device Memory...")
                 embed-buf (load-weight-buf "model.embed_tokens.weight" [vocab-size hidden-dim])
@@ -204,46 +257,31 @@
                 flat-layer-bufs (vec (apply concat layer-bufs))
                 flat-device-weights (into [embed-buf final-norm-buf] flat-layer-bufs)]
 
-            ;; 3. Autoregressive Loop with KV Caching
-            (println "\nGenerating tokens autoregressively with KV Caching...")
+            ;; 3. Autoregressive Loop with Single-Pass Prefill
+            (println "\nGenerating tokens autoregressively with Single-Pass Prefill...")
             (print prompt)
             (flush)
 
-            (let [prompt-len (count prompt-ids)
-                  eos (eos-id tokenizer)
+            (let [eos (eos-id tokenizer)
 
-                  ;; Step execution helper: executes single token step on PJRT device
-                  step-exec (fn [token-id pos active-kv-bufs]
-                              (let [tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [token-id]) [1 1] 4)
-                                    pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [pos]) [1] 4)
-                                    flat-kv-bufs (vec (apply concat active-kv-bufs))
-                                    exec-args (into [tok-buf pos-buf] (concat flat-device-weights flat-kv-bufs))
-                                    res-bufs (xla/execute exec exec-args)
-                                    logits-buf (if (vector? res-bufs) (first res-bufs) res-bufs)
-                                    new-kv-flat (if (vector? res-bufs) (rest res-bufs) [])
-                                    updated-kv-bufs (mapv vec (partition 2 new-kv-flat))
-                                    logits (xla/to-host-slice logits-buf 0 vocab-size)]
-                                [logits updated-kv-bufs]))
-
-                  ;; Phase A: Prompt Prefill phase - populate KV caches up to prompt-len
-                  [prefill-logits prefill-kv-bufs]
-                  (loop [p 0
-                         current-kv-bufs initial-device-kv-bufs
-                         last-logits nil]
-                    (if (>= p prompt-len)
-                      [last-logits current-kv-bufs]
-                      (let [tok-id (nth prompt-ids p)
-                            [step-logits next-kv-bufs] (step-exec tok-id p current-kv-bufs)]
-                        (recur (inc p) next-kv-bufs step-logits))))
-
-                  first-gen-tok (sampling/sample-logits prefill-logits {:temperature temperature :top-k top-k})]
+                  ;; Phase A: Single-Pass Prompt Prefill (Invoked ONCE for prompt-len)
+                  prompt-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array prompt-ids) [1 prompt-len] 4)
+                  pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array (range prompt-len)) [prompt-len] 4)
+                  flat-kv-bufs (vec (apply concat initial-device-kv-bufs))
+                  prefill-args (into [prompt-buf pos-buf] (concat flat-device-weights flat-kv-bufs))
+                  prefill-res (xla/execute prefill-exec prefill-args)
+                  prefill-logits-buf (if (vector? prefill-res) (first prefill-res) prefill-res)
+                  prefill-kv-flat (if (vector? prefill-res) (rest prefill-res) [])
+                  prefill-kv-bufs (mapv vec (partition 2 prefill-kv-flat))
+                  last-logits (xla/to-host-slice prefill-logits-buf (dec prompt-len) vocab-size (* prompt-len vocab-size))
+                  first-gen-tok (sampling/sample-logits last-logits {:temperature temperature :top-k top-k})]
 
               (print (decode tokenizer [first-gen-tok]))
               (flush)
 
               (if (= first-gen-tok eos)
                 (println "\nReached EOS token.")
-                ;; Phase B: Single-token Decoding Loop
+                ;; Phase B: Single-token Autoregressive Decoding Loop
                 (loop [context (conj (vec prompt-ids) first-gen-tok)
                        current-kv-bufs prefill-kv-bufs
                        pos prompt-len
@@ -251,7 +289,15 @@
                   (if (>= step max-new-tokens)
                     context
                     (let [last-tok (last context)
-                          [step-logits updated-kv-bufs] (step-exec last-tok pos current-kv-bufs)
+                          tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [last-tok]) [1 1] 4)
+                          pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [pos]) [1] 4)
+                          flat-kv (vec (apply concat current-kv-bufs))
+                          exec-args (into [tok-buf pos-buf] (concat flat-device-weights flat-kv))
+                          res-bufs (xla/execute decode-exec exec-args)
+                          logits-buf (if (vector? res-bufs) (first res-bufs) res-bufs)
+                          new-kv-flat (if (vector? res-bufs) (rest res-bufs) [])
+                          updated-kv-bufs (mapv vec (partition 2 new-kv-flat))
+                          step-logits (xla/to-host-slice logits-buf 0 vocab-size vocab-size)
                           next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})
                           next-context (conj context next-tok)]
                       (print (decode tokenizer [next-tok]))
@@ -261,7 +307,7 @@
                         (recur next-context updated-kv-bufs (inc pos) (inc step)))))))
 
               (println "\n\n==================================================================")
-              (println "=== End-to-End Gemma 2B KV-Cached Generation Verification Passed! ===")
+              (println "=== End-to-End Gemma 2B Single-Pass Prefill Verification Passed! ===")
               (println "=================================================================="))))))))
 
 (when (= *file* (System/getProperty "clojure.script.filename"))

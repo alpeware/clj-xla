@@ -223,6 +223,14 @@
                                           (int-array (map int (flatten host-data))))]
                            (.allocateFrom arena ValueLayout/JAVA_INT ia))
 
+                         (instance? (Class/forName "[S") host-data)
+                         (let [^shorts sa ^shorts host-data
+                               num-shorts (alength sa)
+                               byte-size (* (long num-shorts) 2)
+                               seg (.allocate arena byte-size (long 64))]
+                           (MemorySegment/copy sa 0 seg ValueLayout/JAVA_SHORT (long 0) num-shorts)
+                           seg)
+
                          :else
                          (let [^floats fa (if (instance? (Class/forName "[F") host-data)
                                             ^floats host-data

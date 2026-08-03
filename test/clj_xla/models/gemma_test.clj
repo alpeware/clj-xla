@@ -90,5 +90,66 @@
           fn-norm (t/->Tracer :fn_norm [:tensor [2304] :f32])
           [logits updated-kv] (full-gemma-forward x emb [layer-w] fn-norm [0] 8 4 kv-caches 5)]
       (is (tracer? logits))
+      (is (= 1 (count updated-kv)))))
+
+  (testing "Single-Pass Prompt Prefill traces full prompt sequence [1 6]"
+    (let [layer-w {:input-ln-w (t/->Tracer :in_ln [:tensor [2304] :f32])
+                   :q-w (t/->Tracer :qw [:tensor [2048 2304] :f32])
+                   :k-w (t/->Tracer :kw [:tensor [1024 2304] :f32])
+                   :v-w (t/->Tracer :vw [:tensor [1024 2304] :f32])
+                   :o-w (t/->Tracer :ow [:tensor [2304 2048] :f32])
+                   :post-attn-ln-w (t/->Tracer :post_attn_ln [:tensor [2304] :f32])
+                   :pre-mlp-ln-w (t/->Tracer :pre_mlp_ln [:tensor [2304] :f32])
+                   :post-mlp-ln-w (t/->Tracer :post_mlp_ln [:tensor [2304] :f32])
+                   :gate-w (t/->Tracer :gw [:tensor [9216 2304] :f32])
+                   :up-w (t/->Tracer :uw [:tensor [9216 2304] :f32])
+                   :down-w (t/->Tracer :dw [:tensor [2304 9216] :f32])}
+          kv-caches [[(t/->Tracer :kc [:tensor [1 4 128 256] :f32])
+                      (t/->Tracer :vc [:tensor [1 4 128 256] :f32])]]
+          graph (trace-graph "prefill_test"
+                             [[:x [:tensor [1 6] :i32]]
+                              [:pos [:tensor [6] :i32]]
+                              [:emb [:tensor [256000 2304] :f32]]
+                              [:fn_norm [:tensor [2304] :f32]]
+                              [:in_ln [:tensor [2304] :f32]]
+                              [:qw [:tensor [2048 2304] :f32]]
+                              [:kw [:tensor [1024 2304] :f32]]
+                              [:vw [:tensor [1024 2304] :f32]]
+                              [:ow [:tensor [2304 2048] :f32]]
+                              [:post_attn_ln [:tensor [2304] :f32]]
+                              [:pre_mlp_ln [:tensor [2304] :f32]]
+                              [:post_mlp_ln [:tensor [2304] :f32]]
+                              [:gw [:tensor [9216 2304] :f32]]
+                              [:uw [:tensor [9216 2304] :f32]]
+                              [:dw [:tensor [2304 9216] :f32]]
+                              [:kc [:tensor [1 4 128 256] :f32]]
+                              [:vc [:tensor [1 4 128 256] :f32]]]
+                             (fn [x pos emb fn_norm & _rest]
+                               (let [[logits updated-kv] (full-gemma-forward x emb [layer-w] fn_norm pos 8 4 kv-caches 0)]
+                                 (into [logits] (apply concat updated-kv)))))]
+      (is (= "prefill_test" (:name graph)))
+      (is (seq (:eqns graph)))))
+
+  (testing "BF16 precision forward pass traces valid computation graph"
+    (let [layer-w {:input-ln-w (t/->Tracer :in_ln [:tensor [2304] :bf16])
+                   :q-w (t/->Tracer :qw [:tensor [2048 2304] :bf16])
+                   :k-w (t/->Tracer :kw [:tensor [1024 2304] :bf16])
+                   :v-w (t/->Tracer :vw [:tensor [1024 2304] :bf16])
+                   :o-w (t/->Tracer :ow [:tensor [2304 2048] :bf16])
+                   :post-attn-ln-w (t/->Tracer :post_attn_ln [:tensor [2304] :bf16])
+                   :pre-mlp-ln-w (t/->Tracer :pre_mlp_ln [:tensor [2304] :bf16])
+                   :post-mlp-ln-w (t/->Tracer :post_mlp_ln [:tensor [2304] :bf16])
+                   :gate-w (t/->Tracer :gw [:tensor [9216 2304] :bf16])
+                   :up-w (t/->Tracer :uw [:tensor [9216 2304] :bf16])
+                   :down-w (t/->Tracer :dw [:tensor [2304 9216] :bf16])}
+          kv-caches [[(t/->Tracer :kc [:tensor [1 4 128 256] :bf16])
+                      (t/->Tracer :vc [:tensor [1 4 128 256] :bf16])]]
+          x (t/->Tracer :x [:tensor [1 1] :i32])
+          emb (t/->Tracer :emb [:tensor [256000 2304] :bf16])
+          fn-norm (t/->Tracer :fn_norm [:tensor [2304] :bf16])
+          [logits updated-kv] (full-gemma-forward x emb [layer-w] fn-norm [0] 8 4 kv-caches 0)
+          f32-logits (t/convert logits :f32)]
+      (is (tracer? logits))
+      (is (= [:tensor [1 1 256000] :f32] (:type f32-logits)))
       (is (= 1 (count updated-kv))))))
 
