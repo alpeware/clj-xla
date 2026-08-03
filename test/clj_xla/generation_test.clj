@@ -26,3 +26,13 @@
                       step-fn (fn [_ctx] [1.0 2.0 3.0 4.0])
                       gen-ids (ar/generate-tokens step-fn prompt-ids {:max-new-tokens max-tokens :eos-token-id 9999})]
                   (= (+ (count prompt-ids) max-tokens) (count gen-ids)))))
+
+(defspec prop-autoregressive-cached-generation-invariants 20
+  (prop/for-all [max-tokens (gen/choose 1 5)]
+                (let [prompt-ids [15496 995]
+                      model-fn (fn [_ids kv-caches _pos]
+                                 (let [dummy-logits (vec (repeat 5000 0.0))]
+                                   [dummy-logits (or kv-caches [(vec (repeat 2 nil))])]))
+                      gen-ids (ar/generate-tokens-cached model-fn prompt-ids {:max-new-tokens max-tokens :eos-token-id 9999})]
+                  (= (+ (count prompt-ids) max-tokens) (count gen-ids)))))
+

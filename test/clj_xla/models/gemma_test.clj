@@ -69,4 +69,26 @@
                              (fn [x emb fn-norm]
                                (full-gemma-forward x emb [layer-w] fn-norm [0])))]
       (is (= "gemma2_test" (:name graph)))
-      (is (seq (:eqns graph))))))
+      (is (seq (:eqns graph)))))
+
+  (testing "Full Gemma forward pass with kv-caches returns [logits updated-kv-caches]"
+    (let [layer-w {:input-ln-w (t/->Tracer :in_ln [:tensor [2304] :f32])
+                   :q-w (t/->Tracer :qw [:tensor [2048 2304] :f32])
+                   :k-w (t/->Tracer :kw [:tensor [1024 2304] :f32])
+                   :v-w (t/->Tracer :vw [:tensor [1024 2304] :f32])
+                   :o-w (t/->Tracer :ow [:tensor [2304 2048] :f32])
+                   :post-attn-ln-w (t/->Tracer :post_attn_ln [:tensor [2304] :f32])
+                   :pre-mlp-ln-w (t/->Tracer :pre_mlp_ln [:tensor [2304] :f32])
+                   :post-mlp-ln-w (t/->Tracer :post_mlp_ln [:tensor [2304] :f32])
+                   :gate-w (t/->Tracer :gw [:tensor [9216 2304] :f32])
+                   :up-w (t/->Tracer :uw [:tensor [9216 2304] :f32])
+                   :down-w (t/->Tracer :dw [:tensor [2304 9216] :f32])}
+          kv-caches [[(t/->Tracer :kc [:tensor [1 4 32 256] :f32])
+                      (t/->Tracer :vc [:tensor [1 4 32 256] :f32])]]
+          x (t/->Tracer :x [:tensor [1 1] :i32])
+          emb (t/->Tracer :emb [:tensor [256000 2304] :f32])
+          fn-norm (t/->Tracer :fn_norm [:tensor [2304] :f32])
+          [logits updated-kv] (full-gemma-forward x emb [layer-w] fn-norm [0] 8 4 kv-caches 5)]
+      (is (tracer? logits))
+      (is (= 1 (count updated-kv))))))
+

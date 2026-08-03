@@ -65,7 +65,8 @@
         ctx (get-context)
         exec-handle (cond
                       (map? exec) (or (:handle exec) exec)
-                      :else exec)]
+                      :else exec)
+        num-outputs (if (map? exec) (count (get-in exec [:graph :outvars] [1])) 1)]
     (if-not exec-handle
       (throw (ex-info "Invalid executable handle" {:exec exec}))
       (let [invars (or (get-in exec [:graph :invars]) [])
@@ -77,7 +78,7 @@
                                        (pjrt/buffer-from-host-buffer ctx (:client ctx) input-data shape dtype-enum))))
                                  (range (count flat-inputs))
                                  flat-inputs)
-            out-buf (pjrt/execute-executable ctx exec-handle device-buffers)]
+            out-buf (pjrt/execute-executable ctx exec-handle device-buffers num-outputs)]
         out-buf))))
 
 (defn to-host-slice

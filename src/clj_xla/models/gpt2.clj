@@ -32,27 +32,48 @@
 
 (defn gpt2-block
   "Single GPT-2 Transformer layer block with pre-layer normalization and residual connections."
-  [x weights num-heads]
-  (let [{:keys [ln1-g ln1-b c-attn-w c-attn-b c-proj-w c-proj-b
-                ln2-g ln2-b mlp-fc-w mlp-fc-b mlp-proj-w mlp-proj-b]} weights
-        x-norm1 (layer-norm x ln1-g ln1-b)
-        attn-out (causal-self-attention x-norm1 c-attn-w c-attn-b c-proj-w c-proj-b num-heads)
-        x-res1 (+ x attn-out)
-        x-norm2 (layer-norm x-res1 ln2-g ln2-b)
-        mlp-out (gpt2-mlp x-norm2 mlp-fc-w mlp-fc-b mlp-proj-w mlp-proj-b)]
-    (+ x-res1 mlp-out)))
+  ([x weights num-heads] (gpt2-block x weights num-heads nil nil))
+  ([x weights num-heads past-kv pos]
+   (let [{:keys [ln1-g ln1-b c-attn-w c-attn-b c-proj-w c-proj-b
+                 ln2-g ln2-b mlp-fc-w mlp-fc-b mlp-proj-w mlp-proj-b]} weights
+         x-norm1 (layer-norm x ln1-g ln1-b)
+         attn-res (if (some? past-kv)
+                    (causal-self-attention x-norm1 c-attn-w c-attn-b c-proj-w c-proj-b num-heads past-kv pos)
+                    (causal-self-attention x-norm1 c-attn-w c-attn-b c-proj-w c-proj-b num-heads))
+         [attn-out updated-kv] (if (vector? attn-res) attn-res [attn-res nil])
+         x-res1 (+ x attn-out)
+         x-norm2 (layer-norm x-res1 ln2-g ln2-b)
+         mlp-out (gpt2-mlp x-norm2 mlp-fc-w mlp-fc-b mlp-proj-w mlp-proj-b)
+         x-out (+ x-res1 mlp-out)]
+     (if (some? past-kv)
+       [x-out updated-kv]
+       x-out))))
 
 (defn full-gpt2-forward
   "Full GPT-2 Transformer forward pass: embedding lookup -> multi-block sequence -> final LayerNorm -> LM head vocabulary projection."
-  [x pos-ids ln-f-g ln-f-b wte wpe layers-weights]
-  (let [h-embed (embed-lookup x pos-ids wte wpe)
-        x-out (reduce (fn [h layer-w]
-                        (gpt2-block h layer-w 12))
-                      h-embed
-                      layers-weights)
-        normed (layer-norm x-out ln-f-g ln-f-b)
-        logits (linear normed (tensor/transpose wte [1 0]) nil)]
-    logits))
+  ([x pos-ids ln-f-g ln-f-b wte wpe layers-weights]
+   (full-gpt2-forward x pos-ids ln-f-g ln-f-b wte wpe layers-weights nil nil))
+  ([x pos-ids ln-f-g ln-f-b wte wpe layers-weights kv-caches pos]
+   (let [h-embed (embed-lookup x pos-ids wte wpe)
+         use-kv? (some? kv-caches)
+         [x-out new-kv-caches]
+         (if use-kv?
+           (reduce (fn [[h updated-acc] [layer-w layer-kv]]
+                     (let [[h-next new-kv] (gpt2-block h layer-w 12 layer-kv pos)]
+                       [h-next (conj updated-acc new-kv)]))
+                   [h-embed []]
+                   (map vector layers-weights kv-caches))
+           [(reduce (fn [h layer-w]
+                      (gpt2-block h layer-w 12))
+                    h-embed
+                    layers-weights)
+            nil])
+         normed (layer-norm x-out ln-f-g ln-f-b)
+         logits (linear normed (tensor/transpose wte [1 0]) nil)]
+     (if use-kv?
+       [logits new-kv-caches]
+       logits))))
+
 
 (defn weight-key-map
   "Maps HuggingFace GPT-2 Safetensors tensor names to internal key names for layer `layer-idx`."

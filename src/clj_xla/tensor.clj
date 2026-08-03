@@ -125,6 +125,11 @@
               (swap! (:eqns *trace-ctx*) conj eqn))
             (->Tracer out-id (:type tx)))))
 
+(defn maximum
+  "Elementwise maximum function."
+  [x y]
+  (binary-elementwise-op :stablehlo/maximum "t_max" x y))
+
 (defn tanh
   "Elementwise hyperbolic tangent function."
   [x]
@@ -144,6 +149,19 @@
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))
     (->Tracer out-id (:type tx))))
+
+(defn convert
+  "Elementwise type conversion function."
+  [x target-dtype]
+  (let [tx (emit-constant! x nil)
+        [t-kw shape _dtype] (:type tx)
+        out-type [t-kw shape target-dtype]
+        out-id (gen-var-id! "t_convert")
+        eqn {:op :stablehlo/convert :invars [(:id tx)] :outvars [out-id] :attrs {:target_dtype target-dtype}}]
+    (when *trace-ctx*
+      (swap! (:eqns *trace-ctx*) conj eqn))
+    (->Tracer out-id out-type)))
+
 
 (defn cos
   "Elementwise cosine function."
@@ -277,6 +295,22 @@
              :attrs {:start_indices start-indices
                      :limit_indices limit-indices
                      :strides strides}}]
+    (when *trace-ctx*
+      (swap! (:eqns *trace-ctx*) conj eqn))
+    (->Tracer out-id out-type)))
+
+(defn dynamic-update-slice
+  "Updates `operand` tensor with `update` slice starting at `start-indices`."
+  [operand update start-indices]
+  (let [t-op (emit-constant! operand nil)
+        t-up (emit-constant! update nil)
+        [t-kw in-shape dtype] (:type t-op)
+        out-type [t-kw in-shape dtype]
+        out-id (gen-var-id! "t_dus")
+        eqn {:op :stablehlo/dynamic_update_slice
+             :invars [(:id t-op) (:id t-up)]
+             :outvars [out-id]
+             :attrs {:start_indices start-indices}}]
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))
     (->Tracer out-id out-type)))

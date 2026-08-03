@@ -31,40 +31,66 @@
 
 (defn smollm-attention
   "SmolLM Multi-Head Causal Self-Attention with RoPE and Grouped-Query Attention."
-  [x q-w k-w v-w o-w num-heads num-kv-heads pos-ids]
-  (let [q-w-t (transpose q-w [1 0])
-        k-w-t (transpose k-w [1 0])
-        v-w-t (transpose v-w [1 0])
-        q (linear x q-w-t nil)
-        k (linear x k-w-t nil)
-        v (linear x v-w-t nil)
-        [q-rope k-rope] (apply-rope q k pos-ids)]
-    (gqa-causal-attention q-rope k-rope v o-w num-heads num-kv-heads)))
+  ([x q-w k-w v-w o-w num-heads num-kv-heads pos-ids]
+   (smollm-attention x q-w k-w v-w o-w num-heads num-kv-heads pos-ids nil nil))
+  ([x q-w k-w v-w o-w num-heads num-kv-heads pos-ids past-kv pos]
+   (let [q-w-t (transpose q-w [1 0])
+         k-w-t (transpose k-w [1 0])
+         v-w-t (transpose v-w [1 0])
+         q (linear x q-w-t nil)
+         k (linear x k-w-t nil)
+         v (linear x v-w-t nil)
+         [q-rope k-rope] (apply-rope q k pos-ids)]
+     (if (some? past-kv)
+       (gqa-causal-attention q-rope k-rope v o-w num-heads num-kv-heads 50.0 past-kv pos)
+       (gqa-causal-attention q-rope k-rope v o-w num-heads num-kv-heads)))))
 
 (defn smollm-block
   "Single SmolLM Llama-style Transformer layer block."
-  [x weights num-heads num-kv-heads pos-ids]
-  (let [{:keys [input-ln-w q-w k-w v-w o-w
-                post-attn-ln-w gate-w up-w down-w]} weights
-        x-norm1 (rms-norm x input-ln-w 1e-5)
-        attn-out (smollm-attention x-norm1 q-w k-w v-w o-w num-heads num-kv-heads pos-ids)
-        x-res1 (+ x attn-out)
-        x-norm2 (rms-norm x-res1 post-attn-ln-w 1e-5)
-        mlp-out (smollm-mlp x-norm2 gate-w up-w down-w)]
-    (+ x-res1 mlp-out)))
+  ([x weights num-heads num-kv-heads pos-ids]
+   (smollm-block x weights num-heads num-kv-heads pos-ids nil nil))
+  ([x weights num-heads num-kv-heads pos-ids past-kv pos]
+   (let [{:keys [input-ln-w q-w k-w v-w o-w
+                 post-attn-ln-w gate-w up-w down-w]} weights
+         x-norm1 (rms-norm x input-ln-w 1e-5)
+         attn-res (if (some? past-kv)
+                    (smollm-attention x-norm1 q-w k-w v-w o-w num-heads num-kv-heads pos-ids past-kv pos)
+                    (smollm-attention x-norm1 q-w k-w v-w o-w num-heads num-kv-heads pos-ids))
+         [attn-out updated-kv] (if (vector? attn-res) attn-res [attn-res nil])
+         x-res1 (+ x attn-out)
+         x-norm2 (rms-norm x-res1 post-attn-ln-w 1e-5)
+         mlp-out (smollm-mlp x-norm2 gate-w up-w down-w)
+         x-out (+ x-res1 mlp-out)]
+     (if (some? past-kv)
+       [x-out updated-kv]
+       x-out))))
 
 (defn full-smollm-forward
   "Full SmolLM Transformer forward pass: multi-block sequence -> final RMSNorm -> LM head vocabulary projection."
-  [x embed-tokens layers-weights final-norm-w lm-head-w pos-ids]
-  (let [tok-embed (gather embed-tokens x)
-        x-out (reduce (fn [h layer-w]
-                        (smollm-block h layer-w 9 3 pos-ids))
-                      tok-embed
-                      layers-weights)
-        normed (rms-norm x-out final-norm-w 1e-5)
-        lm-head-t (transpose lm-head-w [1 0])
-        logits (linear normed lm-head-t nil)]
-    logits))
+  ([x embed-tokens layers-weights final-norm-w lm-head-w pos-ids]
+   (full-smollm-forward x embed-tokens layers-weights final-norm-w lm-head-w pos-ids nil nil))
+  ([x embed-tokens layers-weights final-norm-w lm-head-w pos-ids kv-caches pos]
+   (let [tok-embed (gather embed-tokens x)
+         use-kv? (some? kv-caches)
+         [x-out new-kv-caches]
+         (if use-kv?
+           (reduce (fn [[h updated-acc] [layer-w layer-kv]]
+                     (let [[h-next new-kv] (smollm-block h layer-w 9 3 pos-ids layer-kv pos)]
+                       [h-next (conj updated-acc new-kv)]))
+                   [tok-embed []]
+                   (map vector layers-weights kv-caches))
+           [(reduce (fn [h layer-w]
+                      (smollm-block h layer-w 9 3 pos-ids))
+                    tok-embed
+                    layers-weights)
+            nil])
+         normed (rms-norm x-out final-norm-w 1e-5)
+         lm-head-t (transpose lm-head-w [1 0])
+         logits (linear normed lm-head-t nil)]
+     (if use-kv?
+       [logits new-kv-caches]
+       logits))))
+
 
 (defn weight-key-map [layer-idx]
   (let [prefix (str "model.layers." layer-idx ".")]

@@ -50,19 +50,20 @@
         (str/replace n "/" ".")
         (str "stablehlo." n)))))
 
-(defn- find-tensor-type [invars var-types]
-  (some (fn [inv]
-          (when-let [t (get var-types inv)]
-            (when (re-find #"^tensor<\d+x" t)
-              t)))
-        invars))
-
 (defn- parse-tensor-dims [type-str]
   (when type-str
     (when-let [m (re-find #"tensor<([0-9x]+)x([a-z0-9]+)>" type-str)]
       (let [dims (mapv #(Integer/parseInt %) (str/split (nth m 1) #"x"))
             dtype (nth m 2)]
         [dims dtype]))))
+
+(defn- find-tensor-type [invars var-types]
+  (let [types (keep #(get var-types %) invars)]
+    (last (sort-by (fn [t]
+                     (if-let [[dims _] (parse-tensor-dims t)]
+                       [(count dims) (reduce clojure.core/* 1 dims)]
+                       [0 0]))
+                   types))))
 
 (defn- infer-var-types [invars eqns]
   (let [initial-types (into {} (map (fn [[v t]] [v (type->mlir-string t)]) invars))]
@@ -80,9 +81,6 @@
                                 (if (vector? val) "tensor<128x128xf32>" "tensor<f32>"))]
                     (assoc acc (first outvars) out-t))
 
-                  (= op :stablehlo/convert)
-                  (assoc acc (first outvars) (or in-type "tensor<1x128x768xf32>"))
-
                   (= op :stablehlo/gather)
                   (let [[operand start-indices] in-vars
                         operand-t (get acc operand "tensor<50257x768xf32>")
@@ -92,6 +90,12 @@
                         hidden-dim (last op-dims)
                         out-dims (conj idx-dims hidden-dim)
                         out-t (str "tensor<" (str/join "x" out-dims) "x" op-dtype ">")]
+                    (assoc acc (first outvars) out-t))
+
+                  (= op :stablehlo/convert)
+                  (let [target-dtype (name (get attrs :target_dtype :f32))
+                        [in-dims _] (or (parse-tensor-dims in-type) [[1] "i32"])
+                        out-t (str "tensor<" (str/join "x" in-dims) "x" target-dtype ">")]
                     (assoc acc (first outvars) out-t))
 
                   (= op :stablehlo/reshape)
@@ -216,7 +220,9 @@
       (= op :stablehlo/convert)
       (let [in-var (first invars)
             in-type (get var-types in-var "tensor<1x128x768xf32>")
-            out-type (get var-types out-var in-type)]
+            target-dtype (name (get attrs :target_dtype :f32))
+            [in-dims _] (or (parse-tensor-dims in-type) [[1] "i32"])
+            out-type (str "tensor<" (str/join "x" in-dims) "x" target-dtype ">")]
         (str "    %" (name out-var) " = \"stablehlo.convert\"(%" (name in-var) ") : (" in-type ") -> " out-type))
 
       (= op :stablehlo/gather)
@@ -275,6 +281,37 @@
              "start_indices = array<i64: " starts-str ">, "
              "limit_indices = array<i64: " limits-str ">, "
              "strides = array<i64: " strides-str ">} : (" in-type ") -> " out-type))
+
+      (= op :stablehlo/dynamic_update_slice)
+      (let [[op-var up-var] invars
+            op-type (get var-types op-var "tensor<1x4x128x256xf32>")
+            up-type (get var-types up-var "tensor<1x4x1x256xf32>")
+            out-type (get var-types out-var op-type)
+            starts (get attrs :start_indices [0 0 0 0])
+            [in-dims _in-dtype] (or (parse-tensor-dims op-type) [[1 4 128 256] "f32"])
+            rank (count in-dims)
+            prep-info (mapv (fn [i idx]
+                              (let [c-var (str (name out-var) "_c" i)]
+                                (cond
+                                  (or (and (map? idx) (:id idx)) (keyword? idx) (symbol? idx))
+                                  (let [v-id (if (map? idx) (:id idx) idx)
+                                        v-type (get var-types v-id "tensor<1xi32>")
+                                        [v-dims _] (or (parse-tensor-dims v-type) [[1] "i32"])
+                                        v-1d (str "tensor<" (str/join "x" v-dims) "xi64>")]
+                                    [(str "    %" c-var "_1d = \"stablehlo.convert\"(%" (name v-id) ") : (" v-type ") -> " v-1d "\n"
+                                          "    %" c-var " = stablehlo.reshape %" c-var "_1d : (" v-1d ") -> tensor<i64>")
+                                     (str "%" c-var)])
+
+                                  :else
+                                  [(str "    %" c-var " = stablehlo.constant dense<" (long idx) "> : tensor<i64>")
+                                   (str "%" c-var)])))
+                            (range rank) starts)
+            const-lines (vec (remove nil? (map first prep-info)))
+            idx-args (str/join ", " (map second prep-info))
+            op-line (str "    %" (name out-var) " = \"stablehlo.dynamic_update_slice\"(%" (name op-var) ", %" (name up-var) ", " idx-args ") : ("
+                         op-type ", " up-type ", " (str/join ", " (repeat rank "tensor<i64>")) ") -> " out-type)]
+        (str/join "\n" (concat const-lines [op-line])))
+
 
       (= op :stablehlo/concatenate)
       (let [in-args (str/join ", " (map #(str "%" (name %)) invars))
@@ -362,12 +399,12 @@
                               line (str "    %" bcast-var " = \"stablehlo.broadcast_in_dim\"(%" (name inv) ") {broadcast_dimensions = array<i64: " bcast-dim ">} : (" in-t ") -> " out-type)]
                           [(conj v-strs (str "%" bcast-var)) (conj p-lines line)])
 
-                        (= in-t "tensor<1x128x1xf32>")
+                        (re-find #"^tensor<1x\d+x1xf32>$" in-t)
                         (let [bcast-var (str (name inv) "_bcast")
-                              line (str "    %" bcast-var " = \"stablehlo.broadcast_in_dim\"(%" (name inv) ") {broadcast_dimensions = array<i64: 0, 1, 2>} : (tensor<1x128x1xf32>) -> " out-type)]
+                              line (str "    %" bcast-var " = \"stablehlo.broadcast_in_dim\"(%" (name inv) ") {broadcast_dimensions = array<i64: 0, 1, 2>} : (" in-t ") -> " out-type)]
                           [(conj v-strs (str "%" bcast-var)) (conj p-lines line)])
 
-                        (re-find #"^tensor<1x\d+x128x1xf32>$" in-t)
+                        (re-find #"^tensor<1x\d+x\d+x\d+xf32>$" in-t)
                         (let [bcast-var (str (name inv) "_bcast")
                               line (str "    %" bcast-var " = \"stablehlo.broadcast_in_dim\"(%" (name inv) ") {broadcast_dimensions = array<i64: 0, 1, 2, 3>} : (" in-t ") -> " out-type)]
                           [(conj v-strs (str "%" bcast-var)) (conj p-lines line)])

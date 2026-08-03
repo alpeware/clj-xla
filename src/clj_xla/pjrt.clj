@@ -262,37 +262,42 @@
 
 (defn execute-executable
   "Executes compiled PjRtLoadedExecutable native handle `exec-handle` with device `PjRtBuffer` handles `input-buffers`."
-  [api-ctx exec-handle input-buffers]
-  (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)
-        cli (extract-client api-ctx nil)
-        devs (when cli (addressable-devices api-ctx cli))
-        dev (first devs)
-        num-args (count input-buffers)
-        arena (Arena/ofAuto)
-        arg-ptrs (.allocate arena ValueLayout/ADDRESS (long num-args))]
-    (dotimes [i num-args]
-      (.setAtIndex ^MemorySegment arg-ptrs ValueLayout/ADDRESS (long i) (nth input-buffers i)))
-    (let [arg-lists (.allocate arena ValueLayout/ADDRESS (long 1))
-          _ (.setAtIndex ^MemorySegment arg-lists ValueLayout/ADDRESS (long 0) arg-ptrs)
-          out-ptrs (.allocate arena ValueLayout/ADDRESS (long 1))
-          out-lists (.allocate arena ValueLayout/ADDRESS (long 1))
-          _ (.setAtIndex ^MemorySegment out-lists ValueLayout/ADDRESS (long 0) out-ptrs)
-          opts (.allocate arena (long 112))
-          _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 0) (long 112))
-          args (.allocate arena (long 80))]
-      (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 80))
-      (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) exec-handle)
-      (.set ^MemorySegment args ValueLayout/ADDRESS (long 24) opts)
-      (.set ^MemorySegment args ValueLayout/ADDRESS (long 32) arg-lists)
-      (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long 1))
-      (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-args))
-      (.set ^MemorySegment args ValueLayout/ADDRESS (long 56) out-lists)
-      (when dev
-        (.set ^MemorySegment args ValueLayout/ADDRESS (long 72) dev))
-      (let [handle (downcall-ptr linker api-ptr OFFSET_LOADED_EXECUTABLE_EXECUTE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-            err (.invokeWithArguments ^MethodHandle handle [args])]
-        (check-error! api-ctx err)
-        (.get ^MemorySegment out-ptrs ValueLayout/ADDRESS (long 0))))))
+  ([api-ctx exec-handle input-buffers]
+   (execute-executable api-ctx exec-handle input-buffers 1))
+  ([api-ctx exec-handle input-buffers num-outputs]
+   (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)
+         cli (extract-client api-ctx nil)
+         devs (when cli (addressable-devices api-ctx cli))
+         dev (first devs)
+         num-args (count input-buffers)
+         num-outs (max 1 (long (or num-outputs 1)))
+         arena (Arena/ofAuto)
+         arg-ptrs (.allocate arena ValueLayout/ADDRESS (long num-args))]
+     (dotimes [i num-args]
+       (.setAtIndex ^MemorySegment arg-ptrs ValueLayout/ADDRESS (long i) (nth input-buffers i)))
+     (let [arg-lists (.allocate arena ValueLayout/ADDRESS (long 1))
+           _ (.setAtIndex ^MemorySegment arg-lists ValueLayout/ADDRESS (long 0) arg-ptrs)
+           out-ptrs (.allocate arena ValueLayout/ADDRESS (long num-outs))
+           out-lists (.allocate arena ValueLayout/ADDRESS (long 1))
+           _ (.setAtIndex ^MemorySegment out-lists ValueLayout/ADDRESS (long 0) out-ptrs)
+           opts (.allocate arena (long 112))
+           _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 0) (long 112))
+           args (.allocate arena (long 80))]
+       (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 80))
+       (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) exec-handle)
+       (.set ^MemorySegment args ValueLayout/ADDRESS (long 24) opts)
+       (.set ^MemorySegment args ValueLayout/ADDRESS (long 32) arg-lists)
+       (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long 1))
+       (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-args))
+       (.set ^MemorySegment args ValueLayout/ADDRESS (long 56) out-lists)
+       (when dev
+         (.set ^MemorySegment args ValueLayout/ADDRESS (long 72) dev))
+       (let [handle (downcall-ptr linker api-ptr OFFSET_LOADED_EXECUTABLE_EXECUTE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+             err (.invokeWithArguments ^MethodHandle handle [args])]
+         (check-error! api-ctx err)
+         (if (= num-outs 1)
+           (.get ^MemorySegment out-ptrs ValueLayout/ADDRESS (long 0))
+           (mapv (fn [i] (.getAtIndex ^MemorySegment out-ptrs ValueLayout/ADDRESS (long i))) (range num-outs))))))))
 
 (defn buffer-to-host-buffer
   "Copies device PJRT_Buffer `buffer-handle` to host float array, awaiting asynchronous completion."

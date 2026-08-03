@@ -1,7 +1,7 @@
 (ns clj-xla.nn.attention
   "Causal self-attention, GQA, and RoPE positioning mechanisms."
   (:refer-clojure :exclude [+ * - /])
-  (:require [clj-xla.tensor :refer [+ * - / broadcast-in-dim concatenate exp dot-general matmul reduce-max reduce-sum reshape slice tanh transpose]]))
+  (:require [clj-xla.tensor :refer [+ * - / broadcast-in-dim concatenate convert cos sin dynamic-update-slice exp dot-general matmul maximum reduce-max reduce-sum reshape slice tanh transpose]]))
 
 (defn linear
   "Linear projection layer: x @ w + b."
@@ -9,20 +9,55 @@
   (let [h (matmul x w)]
     (if (some? b) (+ h b) h)))
 
-(defn- generate-rope-freq-tensors [seq-len head-dim theta-base]
-  (let [half-dim (quot head-dim 2)
-        freqs (vec (for [i (range half-dim)]
-                     (Math/pow theta-base (clojure.core// (clojure.core/* -2.0 i) (double head-dim)))))
-        cos-rows (vec (for [pos (range seq-len)]
-                        (let [half (vec (for [i (range half-dim)]
-                                          (Math/cos (clojure.core/* (double pos) (nth freqs i)))))]
-                          (vec (clojure.core/concat half half)))))
-        sin-rows (vec (for [pos (range seq-len)]
-                        (let [half (vec (for [i (range half-dim)]
-                                          (Math/sin (clojure.core/* (double pos) (nth freqs i)))))]
-                          (vec (clojure.core/concat half half)))))]
-    [(clj-xla.tensor/emit-constant! [[cos-rows]] [:tensor [1 1 seq-len head-dim] :f32])
-     (clj-xla.tensor/emit-constant! [[sin-rows]] [:tensor [1 1 seq-len head-dim] :f32])]))
+(defn- extract-pos-int [pos]
+  (cond
+    (nil? pos) 0
+    (number? pos) (long pos)
+    (sequential? pos) (long (or (first pos) 0))
+    :else 0))
+
+(defn- generate-rope-freq-tensors
+  ([seq-len head-dim theta-base] (generate-rope-freq-tensors seq-len head-dim theta-base 0))
+  ([seq-len head-dim theta-base pos-offset]
+   (if (clj-xla.tensor/tracer? pos-offset)
+     (let [half-dim (quot head-dim 2)
+           freqs-vec (vec (for [i (range half-dim)]
+                            (Math/pow theta-base (clojure.core// (clojure.core/* -2.0 i) (double head-dim)))))
+           freqs-const (clj-xla.tensor/emit-constant! [[[[freqs-vec]]]] [:tensor [1 1 1 half-dim] :f32])
+           pos-f32 (convert pos-offset :f32)
+           pos-4d (reshape pos-f32 [1 1 1 1])
+           angles (* pos-4d freqs-const)
+           cos-half (cos angles)
+           sin-half (sin angles)
+           cos-t (concatenate [cos-half cos-half] -1)
+           sin-t (concatenate [sin-half sin-half] -1)]
+       [cos-t sin-t])
+     (let [p-off (extract-pos-int pos-offset)
+           half-dim (quot head-dim 2)
+           freqs (vec (for [i (range half-dim)]
+                        (Math/pow theta-base (clojure.core// (clojure.core/* -2.0 i) (double head-dim)))))
+           cos-rows (vec (for [idx (range seq-len)]
+                           (let [pos (clojure.core/+ p-off idx)
+                                 half (vec (for [i (range half-dim)]
+                                             (Math/cos (clojure.core/* (double pos) (nth freqs i)))))]
+                             (vec (clojure.core/concat half half)))))
+           sin-rows (vec (for [idx (range seq-len)]
+                           (let [pos (clojure.core/+ p-off idx)
+                                 half (vec (for [i (range half-dim)]
+                                             (Math/sin (clojure.core/* (double pos) (nth freqs i)))))]
+                             (vec (clojure.core/concat half half)))))]
+       [(clj-xla.tensor/emit-constant! [[cos-rows]] [:tensor [1 1 seq-len head-dim] :f32])
+        (clj-xla.tensor/emit-constant! [[sin-rows]] [:tensor [1 1 seq-len head-dim] :f32])]))))
+
+(defn- apply-rope-single [x pos-ids head-dim theta-base]
+  (let [[_ [batch num-heads seq-len _] _] (:type x)
+        half-dim (quot head-dim 2)
+        x1 (slice x [0 0 0 0] [batch num-heads seq-len half-dim] [1 1 1 1])
+        x2 (slice x [0 0 0 half-dim] [batch num-heads seq-len head-dim] [1 1 1 1])
+        neg-x2 (- x2)
+        x-rot (concatenate [neg-x2 x1] -1)
+        [cos-t sin-t] (generate-rope-freq-tensors seq-len head-dim theta-base pos-ids)]
+    (+ (* x cos-t) (* x-rot sin-t))))
 
 (defn apply-rope
   "Applies Rotary Position Embeddings (RoPE) to query or key tensor `x` (or `[q k]`) based on sequence position indices `pos-ids`."
@@ -30,96 +65,203 @@
    (if (vector? x)
      (mapv #(apply-rope % pos-ids) x)
      (let [[_ [_batch _num-heads _seq-len head-dim] _] (:type x)]
-       (apply-rope x pos-ids head-dim))))
+       (apply-rope-single x pos-ids head-dim 10000.0))))
   ([x y z]
    (if (number? z)
-     (let [head-dim z
-           [_ [batch num-heads seq-len _] _] (:type x)
-           half-dim (quot head-dim 2)
-           x1 (slice x [0 0 0 0] [batch num-heads seq-len half-dim] [1 1 1 1])
-           x2 (slice x [0 0 0 half-dim] [batch num-heads seq-len head-dim] [1 1 1 1])
-           neg-x2 (- x2)
-           x-rot (concatenate [neg-x2 x1] -1)
-           [cos-t sin-t] (generate-rope-freq-tensors seq-len head-dim 10000.0)]
-       (+ (* x cos-t) (* x-rot sin-t)))
-     [(apply-rope x z) (apply-rope y z)])))
+     (apply-rope-single x y z 10000.0)
+     [(apply-rope x z) (apply-rope y z)]))
+  ([x y z head-dim]
+   (if (some? y)
+     [(apply-rope x z head-dim) (apply-rope y z head-dim)]
+     (apply-rope-single x z head-dim 10000.0)))
+  ([x y z head-dim theta-base]
+   (if (some? y)
+     (let [seq-len (nth (second (:type x)) 2)
+           [cos-t sin-t] (generate-rope-freq-tensors seq-len head-dim theta-base z)
+           rope-one (fn [t]
+                      (let [[_ [batch num-heads s-len _] _] (:type t)
+                            half-dim (quot head-dim 2)
+                            t1 (slice t [0 0 0 0] [batch num-heads s-len half-dim] [1 1 1 1])
+                            t2 (slice t [0 0 0 half-dim] [batch num-heads s-len head-dim] [1 1 1 1])
+                            neg-t2 (- t2)
+                            t-rot (concatenate [neg-t2 t1] -1)]
+                        (+ (* t cos-t) (* t-rot sin-t))))]
+       [(rope-one x) (rope-one y)])
+     (apply-rope-single x z head-dim theta-base))))
 
-(defn- generate-causal-mask [seq-len]
-  (vec (for [i (range seq-len)]
-         (vec (for [j (range seq-len)]
-                (if (<= j i) 0.0 -10000.0))))))
+(defn- update-single-cache [cache new-val pos]
+  (if (nil? cache)
+    [new-val new-val]
+    (let [c-type (if (clj-xla.tensor/tracer? cache) (:type cache) cache)
+          [_ shape _] c-type
+          rank (count shape)
+          seq-dim (clojure.core/- rank 2)
+          max-len (nth shape seq-dim)
+          nv-type (if (clj-xla.tensor/tracer? new-val) (:type new-val) new-val)
+          [_ new-shape _] nv-type
+          len (nth new-shape seq-dim)
+          pos-val (if (clj-xla.tensor/tracer? pos) pos (extract-pos-int pos))
+          starts (assoc (vec (repeat rank 0)) seq-dim pos-val)
+          updated (dynamic-update-slice cache new-val starts)
+          active (if (clj-xla.tensor/tracer? pos)
+                   updated
+                   (let [end-pos (clojure.core/+ pos-val len)
+                         starts-1 (assoc (vec (repeat rank 0)) seq-dim 0)
+                         active-limits (assoc (vec shape) seq-dim end-pos)
+                         strides (vec (repeat rank 1))]
+                     (if (= end-pos max-len)
+                       updated
+                       (slice updated starts-1 active-limits strides))))]
+      [updated active])))
+
+(defn update-kv-cache
+  "Updates pre-allocated K/V tensors at position `pos` with `new-k` and `new-v`.
+   Returns `[updated-kv-pair active-kv-pair]`."
+  ([past-kv new-k new-v pos]
+   (if (vector? past-kv)
+     (let [[k-cache v-cache] past-kv
+           [updated-k active-k] (update-single-cache k-cache new-k pos)
+           [updated-v active-v] (update-single-cache v-cache new-v pos)]
+       [[updated-k updated-v] [active-k active-v]])
+     (let [[k-cache v-cache] past-kv
+           [updated-k active-k] (update-single-cache k-cache new-k pos)
+           [updated-v active-v] (update-single-cache v-cache new-v pos)]
+       [[updated-k updated-v] [active-k active-v]])))
+  ([k-cache v-cache new-k new-v pos]
+   (update-kv-cache [k-cache v-cache] new-k new-v pos)))
+
+(defn generate-causal-mask
+  ([seq-len] (generate-causal-mask seq-len seq-len 0))
+  ([q-len kv-len pos]
+   (if (clj-xla.tensor/tracer? pos)
+     (let [indices-vec (vec (for [j (range kv-len)] (double j)))
+           indices-const (clj-xla.tensor/emit-constant! [[[[indices-vec]]]] [:tensor [1 1 1 kv-len] :f32])
+           zero-const (clj-xla.tensor/emit-constant! 0.0 [:tensor [] :f32])
+           mask-scale (clj-xla.tensor/emit-constant! -10000.0 [:tensor [] :f32])
+           pos-f32 (convert pos :f32)
+           pos-4d (reshape pos-f32 [1 1 1 1])
+           diff (- indices-const pos-4d)
+           relu-diff (maximum diff zero-const)
+           causal-mask (* relu-diff mask-scale)]
+       causal-mask)
+     (let [p (extract-pos-int pos)]
+       (clj-xla.tensor/emit-constant!
+        [[(vec (for [i (range q-len)]
+                 (vec (for [j (range kv-len)]
+                        (if (clojure.core/<= j (clojure.core/+ p i)) 0.0 -10000.0)))))]]
+        [:tensor [1 1 q-len kv-len] :f32])))))
 
 (defn causal-self-attention
   "Multi-head Causal Self-Attention block for GPT-2."
-  [x c-attn-w c-attn-b c-proj-w c-proj-b _num-heads]
-  (let [;; 1. Linear QKV Projection: [1, 128, 768] -> [1, 128, 2304]
-        qkv (linear x c-attn-w c-attn-b)
+  ([x c-attn-w c-attn-b c-proj-w c-proj-b num-heads]
+   (causal-self-attention x c-attn-w c-attn-b c-proj-w c-proj-b num-heads nil nil))
+  ([x c-attn-w c-attn-b c-proj-w c-proj-b num-heads past-kv pos]
+   (let [[_ [batch seq-len _] _] (:type x)
+         num-heads (or num-heads 12)
+         ;; 1. Linear QKV Projection
+         qkv (linear x c-attn-w c-attn-b)
 
-        ;; 2. Slice into Q, K, V: each [1, 128, 768]
-        q (slice qkv [0 0 0] [1 128 768] [1 1 1])
-        k (slice qkv [0 0 768] [1 128 1536] [1 1 1])
-        v (slice qkv [0 0 1536] [1 128 2304] [1 1 1])
+         ;; 2. Slice into Q, K, V
+         [_ [_ _ qkv-dim] _] (:type qkv)
+         embed-dim (quot qkv-dim 3)
+         head-dim (quot embed-dim num-heads)
+         q (slice qkv [0 0 0] [batch seq-len embed-dim] [1 1 1])
+         k (slice qkv [0 0 embed-dim] [batch seq-len (clojure.core/* 2 embed-dim)] [1 1 1])
+         v (slice qkv [0 0 (clojure.core/* 2 embed-dim)] [batch seq-len qkv-dim] [1 1 1])
 
-        ;; 3. Reshape and Transpose to Multi-Head Shape: [1, 12, 128, 64]
-        q-heads (transpose (reshape q [1 128 12 64]) [0 2 1 3])
-        k-heads (transpose (reshape k [1 128 12 64]) [0 2 1 3])
-        v-heads (transpose (reshape v [1 128 12 64]) [0 2 1 3])
+         ;; 3. Reshape and Transpose to Multi-Head Shape
+         q-heads (transpose (reshape q [batch seq-len num-heads head-dim]) [0 2 1 3])
+         k-heads (transpose (reshape k [batch seq-len num-heads head-dim]) [0 2 1 3])
+         v-heads (transpose (reshape v [batch seq-len num-heads head-dim]) [0 2 1 3])
 
-        ;; 4. QK^T Batched MatMul: [1, 12, 128, 64] x [1, 12, 128, 64] -> [1, 12, 128, 128]
-        raw-scores (dot-general q-heads k-heads
-                                {:batch_dims {:lhs [0 1] :rhs [0 1]}
-                                 :contracting_dims {:lhs [3] :rhs [3]}})
-        scaled-scores (* raw-scores 0.125) ;; 1 / sqrt(64)
+         ;; 3b. Update KV Cache if past-kv present
+         [updated-kv [k-active v-active]]
+         (if (some? past-kv)
+           (update-kv-cache past-kv k-heads v-heads (or pos 0))
+           [nil [k-heads v-heads]])
 
-        ;; 5. Add Causal Mask and Softmax across last dimension
-        causal-mask (clj-xla.tensor/emit-constant! [[(generate-causal-mask 128)]] [:tensor [1 1 128 128] :f32])
-        masked-scores (+ scaled-scores causal-mask)
-        max-s (reduce-max masked-scores :axes [-1] :keep-dims true)
-        exp-s (exp (- masked-scores max-s))
-        sum-s (reduce-sum exp-s :axes [-1] :keep-dims true)
-        probs (/ exp-s sum-s)
+         [_ [_ _ kv-len _] _] (:type k-active)
+         scale (/ 1.0 (Math/sqrt (double head-dim)))
 
-        ;; 6. Attention Weights @ V: [1, 12, 128, 128] x [1, 12, 128, 64] -> [1, 12, 128, 64]
-        context (dot-general probs v-heads
-                             {:batch_dims {:lhs [0 1] :rhs [0 1]}
-                              :contracting_dims {:lhs [3] :rhs [2]}})
+         ;; 4. QK^T Batched MatMul
+         raw-scores (dot-general q-heads k-active
+                                 {:batch_dims {:lhs [0 1] :rhs [0 1]}
+                                  :contracting_dims {:lhs [3] :rhs [3]}})
+         scaled-scores (* raw-scores scale)
 
-        ;; 7. Reshape Back to [1, 128, 768]
-        merged (reshape (transpose context [0 2 1 3]) [1 128 768])]
+         ;; 5. Causal Mask and Softmax
+         causal-mask (generate-causal-mask seq-len kv-len (or pos 0))
+         masked-scores (+ scaled-scores causal-mask)
+         max-s (reduce-max masked-scores :axes [-1] :keep-dims true)
+         exp-s (exp (- masked-scores max-s))
+         sum-s (reduce-sum exp-s :axes [-1] :keep-dims true)
+         probs (/ exp-s sum-s)
 
-    ;; 8. Output Linear Projection: [1, 128, 768] -> [1, 128, 768]
-    (linear merged c-proj-w c-proj-b)))
+         ;; 6. Attention Weights @ V
+         context (dot-general probs v-active
+                              {:batch_dims {:lhs [0 1] :rhs [0 1]}
+                               :contracting_dims {:lhs [3] :rhs [2]}})
+
+         ;; 7. Reshape Back
+         merged (reshape (transpose context [0 2 1 3]) [batch seq-len embed-dim])
+
+         ;; 8. Output Linear Projection
+         attn-out (linear merged c-proj-w c-proj-b)]
+     (if (some? past-kv)
+       [attn-out updated-kv]
+       attn-out))))
 
 (defn gqa-causal-attention
   "Grouped-Query Causal Self-Attention with causal mask, Softmax, and optional attention logit soft-capping."
   ([q k v o-w num-heads num-kv-heads]
-   (gqa-causal-attention q k v o-w num-heads num-kv-heads 50.0))
+   (gqa-causal-attention q k v o-w num-heads num-kv-heads 50.0 nil nil))
   ([q k v o-w num-heads num-kv-heads attn-softcap]
-   (let [[_ [batch seq-len q-dim] _] (:type q)
+   (gqa-causal-attention q k v o-w num-heads num-kv-heads attn-softcap nil nil))
+  ([q k v o-w num-heads num-kv-heads attn-softcap past-kv pos]
+   (let [q-type (:type q)
+         k-type (:type k)
+         is-q-4d (= (count (second q-type)) 4)
+         is-k-4d (= (count (second k-type)) 4)
+         batch (first (second q-type))
+         q-len (if is-q-4d (nth (second q-type) 2) (nth (second q-type) 1))
+         q-dim (if is-q-4d (clojure.core/* (nth (second q-type) 1) (nth (second q-type) 3)) (nth (second q-type) 2))
          num-heads (or num-heads 8)
          num-kv-heads (or num-kv-heads 4)
          head-dim (quot q-dim num-heads)
+
+         k-4d (if is-k-4d k (transpose (reshape k [batch q-len num-kv-heads head-dim]) [0 2 1 3]))
+         v-4d (if is-k-4d v (transpose (reshape v [batch q-len num-kv-heads head-dim]) [0 2 1 3]))
+
+         [updated-kv [k-act v-act]]
+         (if (some? past-kv)
+           (update-kv-cache past-kv k-4d v-4d (or pos 0))
+           [nil [k-4d v-4d]])
+
+         k-act-type (:type k-act)
+         kv-len (nth (second k-act-type) 2)
          group-size (quot num-heads num-kv-heads)
          scale (/ 1.0 (Math/sqrt (double head-dim)))
 
-         ;; 1. Reshape & Transpose Q: [batch, seq-len, q-dim] -> [batch, num-heads, seq-len, head-dim]
-         q-heads (transpose (reshape q [batch seq-len num-heads head-dim]) [0 2 1 3])
+         ;; 1. Reshape & Transpose Q
+         q-heads (if is-q-4d
+                   q
+                   (transpose (reshape q [batch q-len num-heads head-dim]) [0 2 1 3]))
 
-         ;; 2. Reshape & Transpose K, V: [batch, seq-len, kv-dim] -> [batch, num-kv-heads, seq-len, head-dim]
-         k-kvh (transpose (reshape k [batch seq-len num-kv-heads head-dim]) [0 2 1 3])
-         v-kvh (transpose (reshape v [batch seq-len num-kv-heads head-dim]) [0 2 1 3])
+         ;; 2. K and V are already 4D
+         k-kvh k-act
+         v-kvh v-act
 
          ;; 3. Repeat KV heads to Q heads if group-size > 1
          [k-heads v-heads] (if (= group-size 1)
                              [k-kvh v-kvh]
-                             (let [k-rep (broadcast-in-dim (reshape k-kvh [batch num-kv-heads 1 seq-len head-dim])
-                                                           [batch num-kv-heads group-size seq-len head-dim]
+                             (let [k-rep (broadcast-in-dim (reshape k-kvh [batch num-kv-heads 1 kv-len head-dim])
+                                                           [batch num-kv-heads group-size kv-len head-dim]
                                                            [0 1 2 3 4])
-                                   v-rep (broadcast-in-dim (reshape v-kvh [batch num-kv-heads 1 seq-len head-dim])
-                                                           [batch num-kv-heads group-size seq-len head-dim]
+                                   v-rep (broadcast-in-dim (reshape v-kvh [batch num-kv-heads 1 kv-len head-dim])
+                                                           [batch num-kv-heads group-size kv-len head-dim]
                                                            [0 1 2 3 4])]
-                               [(reshape k-rep [batch num-heads seq-len head-dim])
-                                (reshape v-rep [batch num-heads seq-len head-dim])]))
+                               [(reshape k-rep [batch num-heads kv-len head-dim])
+                                (reshape v-rep [batch num-heads kv-len head-dim])]))
 
          ;; 4. QK^T Batched MatMul
          raw-scores (dot-general q-heads k-heads
@@ -127,13 +269,13 @@
                                   :contracting_dims {:lhs [3] :rhs [3]}})
          scaled-scores (* raw-scores scale)
 
-         ;; 4b. Attention Logit Soft-Capping (Gemma 2: 50.0 * tanh(scores / 50.0))
+         ;; 4b. Attention Logit Soft-Capping
          capped-scores (if (and (number? attn-softcap) (pos? attn-softcap))
                          (* attn-softcap (tanh (/ scaled-scores attn-softcap)))
                          scaled-scores)
 
-         ;; 5. Add Causal Mask and Softmax
-         causal-mask (clj-xla.tensor/emit-constant! [[(generate-causal-mask seq-len)]] [:tensor [1 1 seq-len seq-len] :f32])
+         ;; 5. Causal Mask and Softmax
+         causal-mask (generate-causal-mask q-len kv-len (or pos 0))
          masked-scores (+ capped-scores causal-mask)
          max-s (reduce-max masked-scores :axes [-1] :keep-dims true)
          exp-s (exp (- masked-scores max-s))
@@ -145,9 +287,13 @@
                               {:batch_dims {:lhs [0 1] :rhs [0 1]}
                                :contracting_dims {:lhs [3] :rhs [2]}})
 
-         ;; 7. Reshape Back to [batch, seq-len, q-dim]
-         merged (reshape (transpose context [0 2 1 3]) [batch seq-len q-dim])
+         ;; 7. Reshape Back to [batch, q-len, q-dim]
+         merged (reshape (transpose context [0 2 1 3]) [batch q-len q-dim])
 
-         ;; 8. Output Linear Projection (transposed weight)
-         o-w-t (transpose o-w [1 0])]
-     (linear merged o-w-t nil))))
+         ;; 8. Output Linear Projection
+         o-w-t (transpose o-w [1 0])
+         attn-out (linear merged o-w-t nil)]
+     (if (some? past-kv)
+       [attn-out updated-kv]
+       attn-out))))
+
