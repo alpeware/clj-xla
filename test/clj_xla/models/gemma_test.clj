@@ -6,7 +6,8 @@
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
-            [clojure.test.check.properties :as prop]))
+            [clojure.test.check.properties :as prop]
+            [scripts.gemma2-inference :as gemma2-script]))
 
 (defspec prop-gemma-config-defaults 50
   (prop/for-all [vocab-sz (gen/choose 1000 300000)]
@@ -152,4 +153,14 @@
       (is (tracer? logits))
       (is (= [:tensor [1 1 256000] :f32] (:type f32-logits)))
       (is (= 1 (count updated-kv))))))
+
+(deftest gemma2-cli-args-test
+  (testing "parse-cli-args parses --verbose flag correctly"
+    (let [opts-default (gemma2-script/parse-cli-args [])
+          opts-verbose (gemma2-script/parse-cli-args ["--verbose"])
+          opts-combined (gemma2-script/parse-cli-args ["--prompt" "Hello" "--verbose"])]
+      (is (false? (:verbose opts-default)))
+      (is (true? (:verbose opts-verbose)))
+      (is (true? (:verbose opts-combined)))
+      (is (= "Hello" (:prompt opts-combined))))))
 

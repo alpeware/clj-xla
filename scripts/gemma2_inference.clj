@@ -8,7 +8,8 @@
             [clj-xla.tokenizer.core :as tok]
             [clj-xla.tokenizer.protocol :refer [bos-id decode encode eos-id]]
             [clj-xla.trace :refer [trace-graph]]
-            [clojure.java.io :as io])
+            [clojure.java.io :as io]
+            [clojure.pprint :as pprint])
   (:import [java.lang.foreign Arena]))
 
 (def DEFAULT_CLI_OPTS
@@ -17,10 +18,11 @@
    :temperature 0.7
    :top-k 10
    :backend :cpu
-   :precision :bf16})
+   :precision :bf16
+   :verbose false})
 
 (defn parse-cli-args
-  "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k, --backend, --precision)."
+  "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k, --backend, --precision, --verbose)."
   [args]
   (loop [remaining (vec args)
          opts DEFAULT_CLI_OPTS]
@@ -47,6 +49,9 @@
           (and (= flag "--precision") val)
           (recur (subvec remaining 2) (assoc opts :precision (keyword val)))
 
+          (= flag "--verbose")
+          (recur (subvec remaining 1) (assoc opts :verbose true))
+
           :else
           (recur (subvec remaining 1) opts))))))
 
@@ -67,7 +72,7 @@
 (defn -main
   "Runs end-to-end Gemma 2B text generation pipeline with Single-Pass Prefill and BF16 precision."
   [& args]
-  (let [{:keys [prompt max-new-tokens temperature top-k backend precision]} (parse-cli-args args)]
+  (let [{:keys [prompt max-new-tokens temperature top-k backend precision verbose]} (parse-cli-args args)]
     (println "==================================================================")
     (println "  clj-xla Gemma 2B Single-Pass Prefill & BF16 KV-Cached Generation ")
     (println "==================================================================")
@@ -236,6 +241,14 @@
                 decode-graph (trace-graph "gemma2_decode" decode-invars decode-trace-fn)
                 decode-exec (xla/compile-graph ctx decode-graph)
                 _ (println "Successfully compiled StableHLO prefill and decode graphs to native XLA PjRtLoadedExecutable handles.")
+
+                _ (when verbose
+                    (println "\n==================================================================")
+                    (println "--- Single-Pass Prefill EDN SSA Graph ---")
+                    (pprint/pprint prefill-graph)
+                    (println "\n--- Single-Token Decode EDN SSA Graph ---")
+                    (pprint/pprint decode-graph)
+                    (println "==================================================================\n"))
 
                 _ (println "Transferring model weights to PJRT Device Memory...")
                 embed-buf (load-weight-buf "model.embed_tokens.weight" [vocab-size hidden-dim])
