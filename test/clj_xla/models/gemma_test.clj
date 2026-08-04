@@ -164,3 +164,8 @@
       (is (true? (:verbose opts-combined)))
       (is (= "Hello" (:prompt opts-combined))))))
 
+(deftest gemma2-find-model-dir-test
+  (testing "find-model-dir throws ex-info when safetensors file does not exist in any model-dir"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Model directory with safetensors not found"
+                          (gemma2-script/find-model-dir ["/non/existent/path/1" "/non/existent/path/2"])))))
+
