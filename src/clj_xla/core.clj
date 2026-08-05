@@ -84,11 +84,11 @@
 (defn to-host-slice
   "Transfers a slice of PJRT output device buffer back to host float array."
   ([out-buf]
-   (to-host-slice out-buf 0 256000 256000))
+   (to-host-slice out-buf 0 256000 (* 128 256000)))
   ([out-buf slice-idx]
-   (to-host-slice out-buf slice-idx 256000 256000))
+   (to-host-slice out-buf slice-idx 256000 (* 128 256000)))
   ([out-buf slice-idx vocab-size]
-   (to-host-slice out-buf slice-idx vocab-size (* (inc slice-idx) vocab-size)))
+   (to-host-slice out-buf slice-idx vocab-size (* 128 vocab-size)))
   ([out-buf slice-idx vocab-size total-elements]
    (let [ctx (get-context)
          n-floats (max (long total-elements) (long (* (inc slice-idx) vocab-size)))

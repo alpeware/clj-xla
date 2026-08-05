@@ -185,7 +185,7 @@
                                     input-tensor (prepare-input-tensor @cur-tokens max-seq-len)
                                     input-args (into [input-tensor] flat-device-weights)
                                     out (xla/execute exec input-args)
-                                    logits (xla/to-host-slice out (dec seq-len))
+                                    logits (xla/to-host-slice out (dec seq-len) 50257 (* max-seq-len 50257))
                                     next-id (sample-logits logits temperature top-k)]
                                 (swap! cur-tokens conj next-id)
                                 (let [tok-str (bpe-token->str (get id->tok next-id next-id))]
