@@ -314,7 +314,6 @@
                          op-type ", " up-type ", " (str/join ", " (repeat rank "tensor<i64>")) ") -> " out-type)]
         (str/join "\n" (concat const-lines [op-line])))
 
-
       (= op :stablehlo/concatenate)
       (let [in-args (str/join ", " (map #(str "%" (name %)) invars))
             in-types (str/join ", " (map #(get var-types % "tensor<1x8x128x64xf32>") invars))

@@ -162,7 +162,6 @@
       (swap! (:eqns *trace-ctx*) conj eqn))
     (->Tracer out-id out-type)))
 
-
 (defn cos
   "Elementwise cosine function."
   [x]

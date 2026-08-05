@@ -50,14 +50,15 @@
         (clj-xla.tensor/emit-constant! [[sin-rows]] [:tensor [1 1 seq-len head-dim] :f32])]))))
 
 (defn- apply-rope-single [x pos-ids head-dim theta-base]
-  (let [[_ [batch num-heads seq-len _] _] (:type x)
+  (let [[_ [batch num-heads seq-len _] dtype] (:type x)
         half-dim (quot head-dim 2)
         x1 (slice x [0 0 0 0] [batch num-heads seq-len half-dim] [1 1 1 1])
         x2 (slice x [0 0 0 half-dim] [batch num-heads seq-len head-dim] [1 1 1 1])
         neg-x2 (- x2)
         x-rot (concatenate [neg-x2 x1] -1)
-        [cos-t sin-t] (generate-rope-freq-tensors seq-len head-dim theta-base pos-ids)]
-    (+ (* x cos-t) (* x-rot sin-t))))
+        [cos-t sin-t] (generate-rope-freq-tensors seq-len head-dim theta-base pos-ids)
+        res (+ (* x cos-t) (* x-rot sin-t))]
+    (if (= dtype :f32) res (convert res dtype))))
 
 (defn apply-rope
   "Applies Rotary Position Embeddings (RoPE) to query or key tensor `x` (or `[q k]`) based on sequence position indices `pos-ids`."
@@ -79,13 +80,14 @@
      (let [seq-len (nth (second (:type x)) 2)
            [cos-t sin-t] (generate-rope-freq-tensors seq-len head-dim theta-base z)
            rope-one (fn [t]
-                      (let [[_ [batch num-heads s-len _] _] (:type t)
+                      (let [[_ [batch num-heads s-len _] dtype] (:type t)
                             half-dim (quot head-dim 2)
                             t1 (slice t [0 0 0 0] [batch num-heads s-len half-dim] [1 1 1 1])
                             t2 (slice t [0 0 0 half-dim] [batch num-heads s-len head-dim] [1 1 1 1])
                             neg-t2 (- t2)
-                            t-rot (concatenate [neg-t2 t1] -1)]
-                        (+ (* t cos-t) (* t-rot sin-t))))]
+                            t-rot (concatenate [neg-t2 t1] -1)
+                            res (+ (* t cos-t) (* t-rot sin-t))]
+                        (if (= dtype :f32) res (convert res dtype))))]
        [(rope-one x) (rope-one y)])
      (apply-rope-single x z head-dim theta-base))))
 
@@ -93,16 +95,17 @@
   (if (nil? cache)
     [new-val new-val]
     (let [c-type (if (clj-xla.tensor/tracer? cache) (:type cache) cache)
-          [_ shape _] c-type
+          [_ shape cache-dtype] c-type
           rank (count shape)
           seq-dim (clojure.core/- rank 2)
           max-len (nth shape seq-dim)
           nv-type (if (clj-xla.tensor/tracer? new-val) (:type new-val) new-val)
-          [_ new-shape _] nv-type
+          [_ new-shape nv-dtype] nv-type
           len (nth new-shape seq-dim)
           pos-val (if (clj-xla.tensor/tracer? pos) pos (extract-pos-int pos))
           starts (assoc (vec (repeat rank 0)) seq-dim pos-val)
-          updated (dynamic-update-slice cache new-val starts)
+          new-val-typed (if (= cache-dtype nv-dtype) new-val (convert new-val cache-dtype))
+          updated (dynamic-update-slice cache new-val-typed starts)
           active (if (clj-xla.tensor/tracer? pos)
                    updated
                    (let [end-pos (clojure.core/+ pos-val len)
