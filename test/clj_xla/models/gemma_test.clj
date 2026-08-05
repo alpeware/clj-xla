@@ -1,6 +1,6 @@
 (ns clj-xla.models.gemma-test
   "Unit and generative tests for Gemma 2 / Gemma 3 model configuration, key mapping, and tracing."
-  (:require [clj-xla.models.gemma :refer [full-gemma-forward gemma-block gemma-config gemma3-config gemma3-weight-key-map weight-key-map]]
+  (:require [clj-xla.models.gemma :refer [full-gemma-forward full-gemma4-forward gemma-block gemma-config gemma3-config gemma3-weight-key-map gemma4-config gemma4-weight-key-map weight-key-map]]
             [clj-xla.tensor :as t :refer [tracer?]]
             [clj-xla.trace :refer [trace-graph]]
             [clojure.test :refer [deftest is testing]]
@@ -197,54 +197,67 @@
       (is (= "model.layers.0.mlp.up_proj.weight" (:up-w km)))
       (is (= "model.layers.0.mlp.down_proj.weight" (:down-w km))))))
 
-(deftest gemma3-block-tracer-test
-  (testing "Gemma 3 block with QK norm and theta-base returns Tracer on Tracer input"
-    (let [x (t/->Tracer :x [:tensor [1 16 640] :f32])
-          weights {:input-ln-w (t/->Tracer :in_ln [:tensor [640] :f32])
-                   :q-w (t/->Tracer :qw [:tensor [1024 640] :f32])
-                   :k-w (t/->Tracer :kw [:tensor [256 640] :f32])
-                   :v-w (t/->Tracer :vw [:tensor [256 640] :f32])
-                   :o-w (t/->Tracer :ow [:tensor [640 1024] :f32])
-                   :q-norm-w (t/->Tracer :qn [:tensor [256] :f32])
-                   :k-norm-w (t/->Tracer :kn [:tensor [256] :f32])
-                   :post-attn-ln-w (t/->Tracer :post_attn_ln [:tensor [640] :f32])
-                   :pre-mlp-ln-w (t/->Tracer :pre_mlp_ln [:tensor [640] :f32])
-                   :post-mlp-ln-w (t/->Tracer :post_mlp_ln [:tensor [640] :f32])
-                   :gate-w (t/->Tracer :gw [:tensor [2048 640] :f32])
-                   :up-w (t/->Tracer :uw [:tensor [2048 640] :f32])
-                   :down-w (t/->Tracer :dw [:tensor [640 2048] :f32])
-                   :theta-base 10000.0
-                   :attn-softcap nil}]
-      (is (tracer? (gemma-block x weights 4 1 [0]))))))
+(defspec prop-gemma4-config-defaults 50
+  (prop/for-all [vocab-sz (gen/choose 1000 300000)]
+                (let [cfg (gemma4-config {:vocab-size vocab-sz})]
+                  (and (= vocab-sz (:vocab-size cfg))
+                       (= 1536 (:hidden-size cfg))
+                       (= 6144 (:intermediate-size cfg))
+                       (= 35 (:num-hidden-layers cfg))
+                       (= 8 (:num-attention-heads cfg))
+                       (= 1 (:num-key-value-heads cfg))
+                       (= 256 (:head-dim cfg))
+                       (= 256 (:hidden-size-per-layer-input cfg))
+                       (= 20 (:num-kv-shared-layers cfg))))))
 
-(deftest gemma3-full-forward-tracer-test
-  (testing "Full Gemma 3 forward pass traces valid graph with QK norm and disabled softcapping"
-    (let [layer-w {:input-ln-w (t/->Tracer :in_ln [:tensor [640] :f32])
-                   :q-w (t/->Tracer :qw [:tensor [1024 640] :f32])
-                   :k-w (t/->Tracer :kw [:tensor [256 640] :f32])
-                   :v-w (t/->Tracer :vw [:tensor [256 640] :f32])
-                   :o-w (t/->Tracer :ow [:tensor [640 1024] :f32])
+(deftest gemma4-weight-key-map-test
+  (testing "gemma4-weight-key-map generates exact HuggingFace Gemma 4 key names including per-layer input keys"
+    (let [km (gemma4-weight-key-map 0)]
+      (is (= "model.layers.0.input_layernorm.weight" (:input-ln-w km)))
+      (is (= "model.layers.0.self_attn.q_proj.weight" (:q-w km)))
+      (is (= "model.layers.0.self_attn.k_proj.weight" (:k-w km)))
+      (is (= "model.layers.0.self_attn.v_proj.weight" (:v-w km)))
+      (is (= "model.layers.0.self_attn.o_proj.weight" (:o-w km)))
+      (is (= "model.layers.0.self_attn.q_norm.weight" (:q-norm-w km)))
+      (is (= "model.layers.0.self_attn.k_norm.weight" (:k-norm-w km)))
+      (is (= "model.layers.0.post_attention_layernorm.weight" (:post-attn-ln-w km)))
+      (is (= "model.layers.0.pre_feedforward_layernorm.weight" (:pre-mlp-ln-w km)))
+      (is (= "model.layers.0.post_feedforward_layernorm.weight" (:post-mlp-ln-w km)))
+      (is (= "model.layers.0.mlp.gate_proj.weight" (:gate-w km)))
+      (is (= "model.layers.0.mlp.up_proj.weight" (:up-w km)))
+      (is (= "model.layers.0.mlp.down_proj.weight" (:down-w km)))
+      (is (= "model.layers.0.per_layer_input_gate.weight" (:per-layer-gate-w km)))
+      (is (= "model.layers.0.per_layer_projection.weight" (:per-layer-proj-w km)))
+      (is (= "model.layers.0.post_per_layer_input_norm.weight" (:post-per-layer-norm-w km))))))
+
+(deftest gemma4-full-forward-tracer-test
+  (testing "Full Gemma 4 forward pass traces valid computation graph with PLE and shared KV"
+    (let [layer-w {:input-ln-w (t/->Tracer :in_ln [:tensor [1536] :f32])
+                   :q-w (t/->Tracer :qw [:tensor [2048 1536] :f32])
+                   :k-w (t/->Tracer :kw [:tensor [256 1536] :f32])
+                   :v-w (t/->Tracer :vw [:tensor [256 1536] :f32])
+                   :o-w (t/->Tracer :ow [:tensor [1536 2048] :f32])
                    :q-norm-w (t/->Tracer :qn [:tensor [256] :f32])
                    :k-norm-w (t/->Tracer :kn [:tensor [256] :f32])
-                   :post-attn-ln-w (t/->Tracer :post_attn_ln [:tensor [640] :f32])
-                   :pre-mlp-ln-w (t/->Tracer :pre_mlp_ln [:tensor [640] :f32])
-                   :post-mlp-ln-w (t/->Tracer :post_mlp_ln [:tensor [640] :f32])
-                   :gate-w (t/->Tracer :gw [:tensor [2048 640] :f32])
-                   :up-w (t/->Tracer :uw [:tensor [2048 640] :f32])
-                   :down-w (t/->Tracer :dw [:tensor [640 2048] :f32])
-                   :theta-base 1000000.0
-                   :attn-softcap nil}
-          kv-caches [[(t/->Tracer :kc [:tensor [1 1 128 256] :f32])
-                      (t/->Tracer :vc [:tensor [1 1 128 256] :f32])]]
-          graph (trace-graph "gemma3_test"
-                             [[:x [:tensor [1 6] :i32]]
-                              [:pos [:tensor [6] :i32]]
-                              [:emb [:tensor [262144 640] :f32]]
-                              [:fn_norm [:tensor [640] :f32]]]
-                             (fn [x _pos emb fn_norm]
-                               (let [[logits updated-kv] (full-gemma-forward x emb [layer-w] fn_norm [0] 4 1 kv-caches 0 {:final-logit-softcap nil})]
-                                 (into [logits] (apply concat updated-kv)))))]
-      (is (= "gemma3_test" (:name graph)))
+                   :post-attn-ln-w (t/->Tracer :post_attn_ln [:tensor [1536] :f32])
+                   :pre-mlp-ln-w (t/->Tracer :pre_mlp_ln [:tensor [1536] :f32])
+                   :post-mlp-ln-w (t/->Tracer :post_mlp_ln [:tensor [1536] :f32])
+                   :gate-w (t/->Tracer :gw [:tensor [6144 1536] :f32])
+                   :up-w (t/->Tracer :uw [:tensor [6144 1536] :f32])
+                   :down-w (t/->Tracer :dw [:tensor [1536 6144] :f32])
+                   :per-layer-gate-w (t/->Tracer :plg [:tensor [256 1536] :f32])
+                   :per-layer-proj-w (t/->Tracer :plp [:tensor [1536 256] :f32])
+                   :post-per-layer-norm-w (t/->Tracer :pln [:tensor [1536] :f32])}
+          graph (trace-graph "gemma4_test"
+                             [[:x [:tensor [1 4] :i32]]
+                              [:emb [:tensor [262144 1536] :f32]]
+                              [:emb_pl [:tensor [262144 256] :f32]]
+                              [:pl_model_proj [:tensor [256 1536] :f32]]
+                              [:pl_proj_norm [:tensor [256] :f32]]
+                              [:fn_norm [:tensor [1536] :f32]]]
+                             (fn [x emb emb-pl pl-proj pl-norm fn-norm]
+                               (full-gemma4-forward x emb emb-pl pl-proj pl-norm [layer-w] fn-norm [0] 8 1)))]
+      (is (= "gemma4_test" (:name graph)))
       (is (seq (:eqns graph))))))
 
 

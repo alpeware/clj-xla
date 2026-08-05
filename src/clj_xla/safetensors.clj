@@ -3,8 +3,7 @@
   (:require [clojure.data.json :as json]
             [clojure.java.io :as io])
   (:import [java.io RandomAccessFile]
-           [java.lang.foreign Arena MemorySegment]
-           [java.nio ByteOrder FloatBuffer]
+           [java.lang.foreign Arena MemorySegment ValueLayout]
            [java.nio.channels FileChannel FileChannel$MapMode]
            [java.nio.file Path StandardOpenOption]))
 
@@ -102,23 +101,19 @@
         (cond
           (or (= dtype "BF16") (= dtype "BFLOAT16"))
           (let [num-elements (quot len 2)
-                ^java.nio.ShortBuffer sb (-> (.asByteBuffer slice)
-                                             (.order ByteOrder/LITTLE_ENDIAN)
-                                             .asShortBuffer)
+                sa (short-array num-elements)
+                _ (MemorySegment/copy slice ValueLayout/JAVA_SHORT (long 0) sa (long 0) (long num-elements))
                 arr (float-array num-elements)]
             (dotimes [i num-elements]
-              (let [s (int (.get sb i))
+              (let [s (int (aget sa i))
                     bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))]
                 (aset arr i (Float/intBitsToFloat bits))))
             arr)
 
           :else
           (let [num-floats (quot len 4)
-                ^FloatBuffer float-buf (-> (.asByteBuffer slice)
-                                           (.order ByteOrder/LITTLE_ENDIAN)
-                                           .asFloatBuffer)
                 arr (float-array num-floats)]
-            (.get float-buf arr)
+            (MemorySegment/copy slice ValueLayout/JAVA_FLOAT (long 0) arr (long 0) (long num-floats))
             arr))))))
 
 (defn get-tensor-bf16-shorts
@@ -137,21 +132,17 @@
         (cond
           (or (= dtype "BF16") (= dtype "BFLOAT16"))
           (let [num-shorts (quot len 2)
-                ^java.nio.ShortBuffer sb (-> (.asByteBuffer slice)
-                                             (.order ByteOrder/LITTLE_ENDIAN)
-                                             .asShortBuffer)
                 arr (short-array num-shorts)]
-            (.get sb arr)
+            (MemorySegment/copy slice ValueLayout/JAVA_SHORT (long 0) arr (long 0) (long num-shorts))
             arr)
 
           :else
           (let [num-floats (quot len 4)
-                ^FloatBuffer float-buf (-> (.asByteBuffer slice)
-                                           (.order ByteOrder/LITTLE_ENDIAN)
-                                           .asFloatBuffer)
+                fa (float-array num-floats)
+                _ (MemorySegment/copy slice ValueLayout/JAVA_FLOAT (long 0) fa (long 0) (long num-floats))
                 arr (short-array num-floats)]
             (dotimes [i num-floats]
-              (let [f (.get float-buf i)
+              (let [f (aget fa i)
                     bits (Float/floatToIntBits f)
                     s (short (bit-shift-right bits 16))]
                 (aset arr i s)))

@@ -33,6 +33,29 @@
                  "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"
                  "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"]})
 
+(def DEFAULT_GEMMA4_E2B_CONFIG
+  {:vocab-size 262144
+   :hidden-size 1536
+   :intermediate-size 6144
+   :num-hidden-layers 35
+   :num-attention-heads 8
+   :num-key-value-heads 1
+   :head-dim 256
+   :rms-norm-eps 1e-6
+   :hidden-size-per-layer-input 256
+   :num-kv-shared-layers 20
+   :sliding-window 512
+   :rope-parameters {:full-attention {:rope-theta 1000000.0 :partial-rotary-factor 0.25}
+                     :sliding-attention {:rope-theta 10000.0}}
+   :final-logit-softcap 30.0
+   :layer-types ["sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"
+                 "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"
+                 "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"
+                 "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"
+                 "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"
+                 "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"
+                 "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"]})
+
 (defn gemma-config
   "Returns Gemma 1/2 configuration map with optional custom overrides."
   ([] DEFAULT_GEMMA_CONFIG)
@@ -42,6 +65,11 @@
   "Returns Gemma 3 configuration map with optional custom overrides."
   ([] DEFAULT_GEMMA3_270M_CONFIG)
   ([overrides] (merge DEFAULT_GEMMA3_270M_CONFIG overrides)))
+
+(defn gemma4-config
+  "Returns Gemma 4 configuration map with optional custom overrides."
+  ([] DEFAULT_GEMMA4_E2B_CONFIG)
+  ([overrides] (merge DEFAULT_GEMMA4_E2B_CONFIG overrides)))
 
 (defn- embed-lookup [x embed-tokens hidden-dim]
   (let [raw-embed (gather embed-tokens x)
@@ -60,7 +88,7 @@
   ([x q-w k-w v-w o-w num-heads num-kv-heads pos-ids past-kv pos]
    (gemma-attention x q-w k-w v-w o-w num-heads num-kv-heads pos-ids past-kv pos {}))
   ([x q-w k-w v-w o-w num-heads num-kv-heads pos-ids past-kv pos opts]
-   (let [{:keys [q-norm-w k-norm-w theta-base attn-softcap]
+   (let [{:keys [q-norm-w k-norm-w theta-base attn-softcap rotary-dim]
           :or {theta-base 10000.0 attn-softcap 50.0}} opts
          q-w-t (transpose q-w [1 0])
          k-w-t (transpose k-w [1 0])
@@ -73,11 +101,11 @@
          head-dim (quot q-dim num-heads)
          q-4d (transpose (reshape q [batch seq-len num-heads head-dim]) [0 2 1 3])
          k-4d (transpose (reshape k [batch seq-len num-kv-heads head-dim]) [0 2 1 3])
-         ;; Apply QK Norm if weights provided (Gemma 3)
+         ;; Apply QK Norm if weights provided (Gemma 3 / 4)
          q-normed (if (some? q-norm-w) (gemma-rms-norm q-4d q-norm-w 1e-6) q-4d)
          k-normed (if (some? k-norm-w) (gemma-rms-norm k-4d k-norm-w 1e-6) k-4d)
          ;; Apply RoPE
-         [q-rope k-rope] (apply-rope q-normed k-normed pos-ids head-dim theta-base)
+         [q-rope k-rope] (apply-rope q-normed k-normed pos-ids head-dim theta-base rotary-dim)
          q-rope-3d (reshape (transpose q-rope [0 2 1 3]) [batch seq-len q-dim])
          k-rope-3d (reshape (transpose k-rope [0 2 1 3]) [batch seq-len kv-dim])]
      (if (some? past-kv)
@@ -85,20 +113,23 @@
        (gqa-causal-attention q-rope-3d k-rope-3d v o-w num-heads num-kv-heads attn-softcap)))))
 
 (defn gemma-block
-  "Single Gemma 1/2/3 Transformer block with RMSNorms, optional QK Norm, and dual residual connections."
+  "Single Gemma 1/2/3/4 Transformer block with RMSNorms, optional QK Norm, and dual residual connections."
   ([x weights num-heads num-kv-heads pos-ids]
    (gemma-block x weights num-heads num-kv-heads pos-ids nil nil))
   ([x weights num-heads num-kv-heads pos-ids past-kv pos]
    (let [{:keys [input-ln-w q-w k-w v-w o-w q-norm-w k-norm-w
                  post-attn-ln-w pre-mlp-ln-w post-mlp-ln-w
-                 gate-w up-w down-w theta-base attn-softcap]
+                 gate-w up-w down-w theta-base attn-softcap rotary-dim
+                 per-layer-gate-w per-layer-proj-w post-per-layer-norm-w
+                 per-layer-input]
           :or {theta-base 10000.0 attn-softcap 50.0}} weights
          ;; Attention Sub-block
          x-norm1 (gemma-rms-norm x input-ln-w 1e-6)
          attn-opts {:q-norm-w q-norm-w
                     :k-norm-w k-norm-w
                     :theta-base theta-base
-                    :attn-softcap attn-softcap}
+                    :attn-softcap attn-softcap
+                    :rotary-dim rotary-dim}
          attn-res (if (some? past-kv)
                     (gemma-attention x-norm1 q-w k-w v-w o-w num-heads num-kv-heads pos-ids past-kv pos attn-opts)
                     (gemma-attention x-norm1 q-w k-w v-w o-w num-heads num-kv-heads pos-ids nil nil attn-opts))
@@ -113,7 +144,19 @@
                    :else x-res1)
          mlp-raw (gemma-mlp x-norm2 gate-w up-w down-w)
          mlp-normed (if post-mlp-ln-w (gemma-rms-norm mlp-raw post-mlp-ln-w 1e-6) mlp-raw)
-         x-out (+ x-res1 mlp-normed)]
+         x-res2 (+ x-res1 mlp-normed)
+
+         ;; Gemma 4 Per-Layer Input (PLE) Gating Sub-block
+         x-out (if (and (some? per-layer-gate-w) (some? per-layer-proj-w) (some? per-layer-input))
+                 (let [pl-gate (transpose per-layer-gate-w [1 0])
+                       pl-proj (transpose per-layer-proj-w [1 0])
+                       gate-raw (linear x-res2 pl-gate nil)
+                       act-gate (clj-xla.nn.activations/gelu gate-raw)
+                       gated (* act-gate per-layer-input)
+                       proj-raw (linear gated pl-proj nil)
+                       normed (if post-per-layer-norm-w (gemma-rms-norm proj-raw post-per-layer-norm-w 1e-6) proj-raw)]
+                   (+ x-res2 normed))
+                 x-res2)]
      (if (some? past-kv)
        [x-out updated-kv]
        x-out))))
@@ -164,6 +207,73 @@
        [capped-logits new-kv-caches]
        capped-logits))))
 
+(defn full-gemma4-forward
+  "Full Gemma 4 Transformer forward pass including Per-Layer Embeddings (PLE) and Shared KV Caches."
+  ([x embed-tokens embed-per-layer per-layer-model-proj-w per-layer-proj-norm-w layers-weights final-norm-w pos-ids]
+   (full-gemma4-forward x embed-tokens embed-per-layer per-layer-model-proj-w per-layer-proj-norm-w layers-weights final-norm-w pos-ids 8 1 nil nil {}))
+  ([x embed-tokens embed-per-layer per-layer-model-proj-w per-layer-proj-norm-w layers-weights final-norm-w pos-ids num-heads num-kv-heads]
+   (full-gemma4-forward x embed-tokens embed-per-layer per-layer-model-proj-w per-layer-proj-norm-w layers-weights final-norm-w pos-ids num-heads num-kv-heads nil nil {}))
+  ([x embed-tokens embed-per-layer per-layer-model-proj-w per-layer-proj-norm-w layers-weights final-norm-w pos-ids num-heads num-kv-heads kv-caches pos]
+   (full-gemma4-forward x embed-tokens embed-per-layer per-layer-model-proj-w per-layer-proj-norm-w layers-weights final-norm-w pos-ids num-heads num-kv-heads kv-caches pos {}))
+  ([x embed-tokens embed-per-layer per-layer-model-proj-w per-layer-proj-norm-w layers-weights final-norm-w pos-ids num-heads num-kv-heads kv-caches pos opts]
+   (let [[_ [batch seq-len] _] (:type x)
+         [_ [_vocab-size hidden-dim] _] (:type embed-tokens)
+         num-layers (count layers-weights)
+         tok-embed (embed-lookup x embed-tokens hidden-dim)
+         ;; Compute PLE (Per-Layer Embedding) representation
+         raw-pl-tok (gather embed-per-layer x)
+         [_ [_pl_v total-pl-dim] _] (:type embed-per-layer)
+         pl-dim (quot total-pl-dim num-layers)
+         pl-tok-scaled (* raw-pl-tok (Math/sqrt (double pl-dim)))
+         pl-proj-t (transpose per-layer-model-proj-w [1 0])
+         pl-context-raw (linear tok-embed pl-proj-t nil)
+         pl-context-scaled (* pl-context-raw (/ 1.0 (Math/sqrt (double hidden-dim))))
+         pl-tok-4d (reshape pl-tok-scaled [batch seq-len num-layers pl-dim])
+         pl-context-4d (reshape pl-context-scaled [batch seq-len num-layers pl-dim])
+         pl-context-norm (gemma-rms-norm pl-context-4d per-layer-proj-norm-w 1e-6)
+         ple-all (* (+ pl-context-norm pl-tok-4d) (/ 1.0 (Math/sqrt 2.0)))
+
+         ;; Resolve shared KV weights across layers
+         resolved-layers (vec (map-indexed
+                               (fn [idx lw]
+                                 (if (some? (:k-w lw))
+                                   lw
+                                   (let [prev-lw (first (filter #(some? (:k-w %)) (subvec (mapv #(nth layers-weights %) (range idx)) 0)))]
+                                     (merge lw {:k-w (:k-w prev-lw)
+                                                :v-w (:v-w prev-lw)
+                                                :k-norm-w (:k-norm-w prev-lw)}))))
+                               layers-weights))
+
+         layers-with-ple (mapv (fn [i lw]
+                                 (let [pl-slice (clj-xla.tensor/slice ple-all [0 0 i 0] [batch seq-len (inc i) pl-dim] [1 1 1 1])
+                                       pl-input (reshape pl-slice [batch seq-len pl-dim])]
+                                   (assoc lw :per-layer-input pl-input)))
+                               (range num-layers)
+                               resolved-layers)
+         use-kv? (some? kv-caches)
+         [x-out new-kv-caches]
+         (if use-kv?
+           (reduce (fn [[h updated-acc] [layer-w layer-kv]]
+                     (let [[h-next new-kv] (gemma-block h layer-w num-heads num-kv-heads pos-ids layer-kv pos)]
+                       [h-next (conj updated-acc new-kv)]))
+                   [tok-embed []]
+                   (map vector layers-with-ple kv-caches))
+           [(reduce (fn [h layer-w]
+                      (gemma-block h layer-w num-heads num-kv-heads pos-ids))
+                    tok-embed
+                    layers-with-ple)
+            nil])
+         normed (gemma-rms-norm x-out final-norm-w 1e-6)
+         embed-t (transpose embed-tokens [1 0])
+         raw-logits (linear normed embed-t nil)
+         final-softcap (get opts :final-logit-softcap 30.0)
+         capped-logits (if (and (number? final-softcap) (pos? final-softcap))
+                         (* final-softcap (tanh (/ raw-logits final-softcap)))
+                         raw-logits)]
+     (if use-kv?
+       [capped-logits new-kv-caches]
+       capped-logits))))
+
 (defn weight-key-map
   "Returns Gemma 1 / Gemma 2 safetensors weight key mapping for layer `layer-idx`."
   [layer-idx]
@@ -197,3 +307,27 @@
      :gate-w         (str prefix "mlp.gate_proj.weight")
      :up-w           (str prefix "mlp.up_proj.weight")
      :down-w         (str prefix "mlp.down_proj.weight")}))
+
+(defn gemma4-weight-key-map
+  "Returns Gemma 4 safetensors weight key mapping for layer `layer-idx` including per-layer input keys."
+  ([layer-idx] (gemma4-weight-key-map layer-idx "model.layers."))
+  ([layer-idx prefix-base]
+   (let [prefix (if (.endsWith ^String prefix-base ".")
+                  (str prefix-base layer-idx ".")
+                  (str prefix-base "." layer-idx "."))]
+     {:input-ln-w             (str prefix "input_layernorm.weight")
+      :q-w                    (str prefix "self_attn.q_proj.weight")
+      :k-w                    (str prefix "self_attn.k_proj.weight")
+      :v-w                    (str prefix "self_attn.v_proj.weight")
+      :o-w                    (str prefix "self_attn.o_proj.weight")
+      :q-norm-w               (str prefix "self_attn.q_norm.weight")
+      :k-norm-w               (str prefix "self_attn.k_norm.weight")
+      :post-attn-ln-w         (str prefix "post_attention_layernorm.weight")
+      :pre-mlp-ln-w           (str prefix "pre_feedforward_layernorm.weight")
+      :post-mlp-ln-w          (str prefix "post_feedforward_layernorm.weight")
+      :gate-w                 (str prefix "mlp.gate_proj.weight")
+      :up-w                   (str prefix "mlp.up_proj.weight")
+      :down-w                 (str prefix "mlp.down_proj.weight")
+      :per-layer-gate-w       (str prefix "per_layer_input_gate.weight")
+      :per-layer-proj-w       (str prefix "per_layer_projection.weight")
+      :post-per-layer-norm-w  (str prefix "post_per_layer_input_norm.weight")})))

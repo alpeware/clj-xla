@@ -42,15 +42,21 @@
     :else
     (throw (ex-info "Cannot emit constant for unsupported value" {:value val}))))
 
-(defn- rank-of [[_kw shape _dtype]]
-  (clojure.core/count shape))
+(defn- broadcast-shapes [shape-a shape-b]
+  (let [rank-a (clojure.core/count shape-a)
+        rank-b (clojure.core/count shape-b)
+        max-rank (clojure.core/max rank-a rank-b)
+        pad-a (vec (clojure.core/concat (repeat (clojure.core/- max-rank rank-a) 1) shape-a))
+        pad-b (vec (clojure.core/concat (repeat (clojure.core/- max-rank rank-b) 1) shape-b))]
+    (mapv clojure.core/max pad-a pad-b)))
 
 (defn- binary-elementwise-op [op-kw prefix a b]
   (let [ta (emit-constant! a nil)
         tb (emit-constant! b (:type ta))
-        out-type (if (>= (rank-of (:type ta)) (rank-of (:type tb)))
-                   (:type ta)
-                   (:type tb))
+        [t-kw shape-a dtype-a] (:type ta)
+        [_ shape-b _] (:type tb)
+        out-shape (broadcast-shapes shape-a shape-b)
+        out-type [t-kw out-shape dtype-a]
         out-id (gen-var-id! prefix)
         eqn {:op op-kw :invars [(:id ta) (:id tb)] :outvars [out-id]}]
     (when *trace-ctx*
