@@ -3,7 +3,7 @@
   (:refer-clojure :exclude [+ * /])
   (:require [clj-xla.nn.activations :refer [geglu]]
             [clj-xla.nn.attention :refer [apply-rope gqa-causal-attention linear]]
-            [clj-xla.nn.norm :refer [gemma-rms-norm rms-norm]]
+            [clj-xla.nn.norm :refer [gemma-rms-norm]]
             [clj-xla.tensor :refer [* + / gather reshape tanh transpose]]))
 
 (def DEFAULT_GEMMA_CONFIG
@@ -123,10 +123,7 @@
                  per-layer-gate-w per-layer-proj-w post-per-layer-norm-w
                  per-layer-input]
           :or {theta-base 10000.0 attn-softcap 50.0}} weights
-         norm-fn (or (:norm-fn weights)
-                     (if (or (some? per-layer-input) (some? per-layer-gate-w) (some? q-norm-w))
-                       rms-norm
-                       gemma-rms-norm))
+         norm-fn (or (:norm-fn weights) gemma-rms-norm)
          ;; Attention Sub-block
          x-norm1 (norm-fn x input-ln-w 1e-6)
          attn-opts {:q-norm-w q-norm-w
@@ -232,7 +229,7 @@
          pl-context-scaled (* pl-context-raw (/ 1.0 (Math/sqrt (double hidden-dim))))
          pl-tok-4d (reshape pl-tok-scaled [batch seq-len num-layers pl-dim])
          pl-context-4d (reshape pl-context-scaled [batch seq-len num-layers pl-dim])
-         pl-context-norm (rms-norm pl-context-4d per-layer-proj-norm-w 1e-6)
+         pl-context-norm (gemma-rms-norm pl-context-4d per-layer-proj-norm-w 1e-6)
          ple-all (* (+ pl-context-norm pl-tok-4d) (/ 1.0 (Math/sqrt 2.0)))
 
          ;; Resolve shared KV weights across layers
@@ -265,7 +262,7 @@
                     tok-embed
                     layers-with-ple)
             nil])
-         normed (rms-norm x-out final-norm-w 1e-6)
+         normed (gemma-rms-norm x-out final-norm-w 1e-6)
          embed-t (transpose embed-tokens [1 0])
          raw-logits (linear normed embed-t nil)
          final-softcap (get opts :final-logit-softcap nil)

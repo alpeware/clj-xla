@@ -62,7 +62,8 @@
           (recur (subvec remaining 1) (assoc opts :verbose true))
 
           (= flag "--quiet")
-          (recur (subvec remaining 1) (assoc opts :quiet true))
+          (do (System/setProperty "clj-xla.quiet" "true")
+              (recur (subvec remaining 1) (assoc opts :quiet true)))
 
           :else
           (recur (subvec remaining 1) opts))))))
@@ -243,7 +244,7 @@
                              0 [:x [:tensor [1 1] :i32]]
                              1 [:pos [:tensor [1] :i32]])
 
-        prefill-trace-fn (fn [x _pos-tracer emb emb-pl pl-model-proj pl-proj-norm fn-norm & rest-args]
+        prefill-trace-fn (fn [x pos-tracer emb emb-pl pl-model-proj pl-proj-norm fn-norm & rest-args]
                            (let [weight-args (take (* 16 num-layers) rest-args)
                                  kv-cache-args (drop (* 16 num-layers) rest-args)
                                  lw-seq (mapv (fn [i [in-ln qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw plg plp pln]]
@@ -258,7 +259,7 @@
                                               (range num-layers)
                                               (mapv vec (partition 16 weight-args)))
                                  kv-seq (mapv vec (partition 2 kv-cache-args))
-                                 [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm (vec (range prompt-len)) num-heads num-kv-heads kv-seq 0 {:final-logit-softcap nil})
+                                 [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads kv-seq 0 {:final-logit-softcap nil})
                                  f32-logits (t/convert logits :f32)]
                              (into [f32-logits] (apply concat updated-kv-caches))))
 

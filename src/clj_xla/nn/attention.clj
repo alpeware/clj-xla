@@ -69,7 +69,7 @@
              h-dim (or head-dim 64)
              n-heads (quot q-dim h-dim)
              x-4d (transpose (reshape x [batch seq-len n-heads h-dim]) [0 2 1 3])
-             res-4d (apply-rope-single x-4d pos-ids h-dim t-base rotary-dim h-dim)]
+             res-4d (apply-rope-single x-4d pos-ids h-dim t-base rotary-dim (or full-dim h-dim))]
          (reshape (transpose res-4d [0 2 1 3]) [batch seq-len q-dim]))
        (let [[batch num-heads seq-len h-dim] shape
              r-dim (or rotary-dim h-dim)
@@ -92,23 +92,25 @@
 (defn apply-rope
   "Applies Rotary Position Embeddings (RoPE) to query or key tensor `x` (or `[q k]`) based on sequence position indices `pos-ids`."
   ([x pos-ids]
-   (apply-rope x nil pos-ids nil 10000.0 nil))
+   (apply-rope x nil pos-ids nil 10000.0 nil nil))
   ([x y z]
    (if (number? z)
-     (apply-rope x nil y z 10000.0 nil)
-     (apply-rope x y z nil 10000.0 nil)))
+     (apply-rope x nil y z 10000.0 nil nil)
+     (apply-rope x y z nil 10000.0 nil nil)))
   ([x y z head-dim]
-   (apply-rope x y z head-dim 10000.0 nil))
+   (apply-rope x y z head-dim 10000.0 nil nil))
   ([x y z head-dim theta-base]
-   (apply-rope x y z head-dim theta-base nil))
+   (apply-rope x y z head-dim theta-base nil nil))
   ([x y z head-dim theta-base rotary-dim]
+   (apply-rope x y z head-dim theta-base rotary-dim nil))
+  ([x y z head-dim theta-base rotary-dim full-dim]
    (if (some? y)
-     [(apply-rope x nil z head-dim theta-base rotary-dim)
-      (apply-rope y nil z head-dim theta-base rotary-dim)]
+     [(apply-rope x nil z head-dim theta-base rotary-dim full-dim)
+      (apply-rope y nil z head-dim theta-base rotary-dim full-dim)]
      (let [h-dim (or head-dim
                      (let [shape (second (:type x))]
                        (if (= (count shape) 4) (nth shape 3) 64)))]
-       (apply-rope-single x z h-dim theta-base rotary-dim h-dim)))))
+       (apply-rope-single x z h-dim theta-base rotary-dim (or full-dim h-dim))))))
 
 (defn- update-single-cache [cache new-val pos]
   (if (nil? cache)

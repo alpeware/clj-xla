@@ -85,6 +85,9 @@
         (.asSlice ^MemorySegment segment (long start) (long len)))
       (throw (ex-info "Tensor key not found in Safetensors header" {:tensor tensor-name})))))
 
+(def ^:private UNALIGNED-SHORT (.. ValueLayout/JAVA_SHORT (withByteAlignment 1)))
+(def ^:private UNALIGNED-FLOAT (.. ValueLayout/JAVA_FLOAT (withByteAlignment 1)))
+
 (defn get-tensor-floats
   "Reads Float32 or BF16 tensor values from `mapped-weights` into a Java float array using Little-Endian byte order."
   [mapped-weights tensor-name]
@@ -110,7 +113,7 @@
                       sa (short-array cur-len)
                       byte-offset (* (long offset) 2)
                       seg-slice (.asSlice slice byte-offset (* (long cur-len) 2))]
-                  (MemorySegment/copy seg-slice ValueLayout/JAVA_SHORT (long 0) sa (long 0) (long cur-len))
+                  (MemorySegment/copy seg-slice UNALIGNED-SHORT (long 0) sa (long 0) (long cur-len))
                   (dotimes [i cur-len]
                     (let [s (int (aget sa i))
                           bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))]
@@ -121,7 +124,7 @@
           :else
           (let [num-floats (quot len 4)
                 arr (float-array (min num-floats Integer/MAX_VALUE))]
-            (MemorySegment/copy slice ValueLayout/JAVA_FLOAT (long 0) arr (long 0) (long (count arr)))
+            (MemorySegment/copy slice UNALIGNED-FLOAT (long 0) arr (long 0) (long (count arr)))
             arr))))))
 
 (defn get-tensor-bf16-shorts
@@ -141,13 +144,13 @@
           (or (= dtype "BF16") (= dtype "BFLOAT16"))
           (let [num-shorts (quot len 2)
                 arr (short-array num-shorts)]
-            (MemorySegment/copy slice ValueLayout/JAVA_SHORT (long 0) arr (long 0) (long num-shorts))
+            (MemorySegment/copy slice UNALIGNED-SHORT (long 0) arr (long 0) (long num-shorts))
             arr)
 
           :else
           (let [num-floats (quot len 4)
                 fa (float-array num-floats)
-                _ (MemorySegment/copy slice ValueLayout/JAVA_FLOAT (long 0) fa (long 0) (long num-floats))
+                _ (MemorySegment/copy slice UNALIGNED-FLOAT (long 0) fa (long 0) (long num-floats))
                 arr (short-array num-floats)]
             (dotimes [i num-floats]
               (let [f (aget fa i)

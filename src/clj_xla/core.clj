@@ -28,7 +28,8 @@
          pname (pjrt/platform-name api-ctx client)
          ctx (assoc api-ctx :client client :platform pname :target target)]
      (alter-var-root #'*default-context* (constantly ctx))
-     (println (format "clj-xla initialized PJRT Backend: [%s] via plugin [%s]" pname lib-path))
+     (when-not (Boolean/getBoolean "clj-xla.quiet")
+       (println (format "clj-xla initialized PJRT Backend: [%s] via plugin [%s]" pname lib-path)))
      ctx)))
 
 (defn init-cpu! [] (init-backend! :cpu))
