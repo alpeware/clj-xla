@@ -9,7 +9,8 @@
             [clj-xla.tokenizer.protocol :refer [bos-id decode encode eos-id]]
             [clj-xla.trace :refer [trace-graph]]
             [clojure.java.io :as io]
-            [clojure.pprint :as pprint])
+            [clojure.pprint :as pprint]
+            [clojure.string :as str])
   (:import [java.lang.foreign Arena]))
 
 (def DEFAULT_CLI_OPTS
@@ -151,15 +152,19 @@
         pl-model-proj-buf (load-fn (str prefix-base "per_layer_model_projection.weight") [total-pl-dim hidden-dim])
         pl-proj-norm-buf (load-fn (str prefix-base "per_layer_projection_norm.weight") [pl-dim])
         final-norm-buf (load-fn (str prefix-base "norm.weight") [hidden-dim])
+        l19-kmap (gemma/gemma4-weight-key-map 19 (str prefix-base "layers."))
+        l19-k-buf (load-fn (:k-w l19-kmap) [kv-dim hidden-dim])
+        l19-v-buf (load-fn (:v-w l19-kmap) [kv-dim hidden-dim])
+        l19-kn-buf (load-fn (:k-norm-w l19-kmap) [head-dim])
         layer-bufs (mapv (fn [i]
                            (let [kmap (gemma/gemma4-weight-key-map i (str prefix-base "layers."))]
                              [(load-fn (:input-ln-w kmap) [hidden-dim])
                               (load-fn (:q-w kmap) [q-dim hidden-dim])
-                              (load-fn (:k-w kmap) [kv-dim hidden-dim])
-                              (load-fn (:v-w kmap) [kv-dim hidden-dim])
+                              (if-let [kw (:k-w kmap)] (load-fn kw [kv-dim hidden-dim]) l19-k-buf)
+                              (if-let [vw (:v-w kmap)] (load-fn vw [kv-dim hidden-dim]) l19-v-buf)
                               (load-fn (:o-w kmap) [hidden-dim q-dim])
                               (load-fn (:q-norm-w kmap) [head-dim])
-                              (load-fn (:k-norm-w kmap) [head-dim])
+                              (if-let [kn (:k-norm-w kmap)] (load-fn kn [head-dim]) l19-kn-buf)
                               (load-fn (:post-attn-ln-w kmap) [hidden-dim])
                               (load-fn (:pre-mlp-ln-w kmap) [hidden-dim])
                               (load-fn (:post-mlp-ln-w kmap) [hidden-dim])
@@ -350,9 +355,10 @@
   ([session prompt-text]
    (let [{:keys [tokenizer opts]} session
          {:keys [max-new-tokens temperature top-k]} opts
-         prompt-ids (into [(bos-id tokenizer)] (encode tokenizer prompt-text))
+         clean-prompt (str/replace prompt-text #"\\n" "\n")
+         prompt-ids (into [(bos-id tokenizer)] (encode tokenizer clean-prompt))
          prompt-len (count prompt-ids)]
-     (println (format "Prompt: \"%s\"" prompt-text))
+     (println (format "Prompt: \"%s\"" clean-prompt))
      (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d, precision=%s"
                       max-new-tokens temperature top-k (name (get-in session [:config :weight-dtype]))))
      (println (format "Encoded Token IDs (%d tokens): %s" prompt-len prompt-ids))
@@ -362,7 +368,7 @@
            initial-kv-bufs (allocate-kv-caches session)
            executables (compile-inference-executables session prompt-len)]
        (println "\nGenerating tokens autoregressively with Gemma 4 Single-Pass Prefill...")
-       (print prompt-text)
+       (print clean-prompt)
        (flush)
        (let [prefill-res (run-prompt-prefill session executables device-weights initial-kv-bufs prompt-ids)
              final-context (run-autoregressive-decode session executables device-weights prefill-res)]

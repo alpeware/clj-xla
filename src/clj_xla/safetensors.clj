@@ -101,19 +101,27 @@
         (cond
           (or (= dtype "BF16") (= dtype "BFLOAT16"))
           (let [num-elements (quot len 2)
-                sa (short-array num-elements)
-                _ (MemorySegment/copy slice ValueLayout/JAVA_SHORT (long 0) sa (long 0) (long num-elements))
-                arr (float-array num-elements)]
-            (dotimes [i num-elements]
-              (let [s (int (aget sa i))
-                    bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))]
-                (aset arr i (Float/intBitsToFloat bits))))
+                chunk-size 50000000
+                target-len (min num-elements Integer/MAX_VALUE)
+                arr (float-array target-len)]
+            (loop [offset 0]
+              (when (< offset target-len)
+                (let [cur-len (min chunk-size (- target-len offset))
+                      sa (short-array cur-len)
+                      byte-offset (* (long offset) 2)
+                      seg-slice (.asSlice slice byte-offset (* (long cur-len) 2))]
+                  (MemorySegment/copy seg-slice ValueLayout/JAVA_SHORT (long 0) sa (long 0) (long cur-len))
+                  (dotimes [i cur-len]
+                    (let [s (int (aget sa i))
+                          bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))]
+                      (aset arr (+ offset i) (Float/intBitsToFloat bits))))
+                  (recur (+ offset cur-len)))))
             arr)
 
           :else
           (let [num-floats (quot len 4)
-                arr (float-array num-floats)]
-            (MemorySegment/copy slice ValueLayout/JAVA_FLOAT (long 0) arr (long 0) (long num-floats))
+                arr (float-array (min num-floats Integer/MAX_VALUE))]
+            (MemorySegment/copy slice ValueLayout/JAVA_FLOAT (long 0) arr (long 0) (long (count arr)))
             arr))))))
 
 (defn get-tensor-bf16-shorts

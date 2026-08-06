@@ -3,7 +3,7 @@
   (:refer-clojure :exclude [+ * /])
   (:require [clj-xla.nn.activations :refer [geglu]]
             [clj-xla.nn.attention :refer [apply-rope gqa-causal-attention linear]]
-            [clj-xla.nn.norm :refer [gemma-rms-norm]]
+            [clj-xla.nn.norm :refer [gemma-rms-norm rms-norm]]
             [clj-xla.tensor :refer [* + / gather reshape tanh transpose]]))
 
 (def DEFAULT_GEMMA_CONFIG
@@ -71,7 +71,7 @@
   ([] DEFAULT_GEMMA4_E2B_CONFIG)
   ([overrides] (merge DEFAULT_GEMMA4_E2B_CONFIG overrides)))
 
-(defn- embed-lookup [x embed-tokens hidden-dim]
+(defn embed-lookup [x embed-tokens hidden-dim]
   (let [raw-embed (gather embed-tokens x)
         scale (Math/sqrt (double hidden-dim))]
     (* raw-embed scale)))
@@ -88,8 +88,8 @@
   ([x q-w k-w v-w o-w num-heads num-kv-heads pos-ids past-kv pos]
    (gemma-attention x q-w k-w v-w o-w num-heads num-kv-heads pos-ids past-kv pos {}))
   ([x q-w k-w v-w o-w num-heads num-kv-heads pos-ids past-kv pos opts]
-   (let [{:keys [q-norm-w k-norm-w theta-base attn-softcap rotary-dim]
-          :or {theta-base 10000.0 attn-softcap 50.0}} opts
+   (let [{:keys [q-norm-w k-norm-w theta-base attn-softcap rotary-dim norm-fn]
+          :or {theta-base 10000.0 attn-softcap 50.0 norm-fn gemma-rms-norm}} opts
          q-w-t (transpose q-w [1 0])
          k-w-t (transpose k-w [1 0])
          v-w-t (transpose v-w [1 0])
@@ -102,8 +102,8 @@
          q-4d (transpose (reshape q [batch seq-len num-heads head-dim]) [0 2 1 3])
          k-4d (transpose (reshape k [batch seq-len num-kv-heads head-dim]) [0 2 1 3])
          ;; Apply QK Norm if weights provided (Gemma 3 / 4)
-         q-normed (if (some? q-norm-w) (gemma-rms-norm q-4d q-norm-w 1e-6) q-4d)
-         k-normed (if (some? k-norm-w) (gemma-rms-norm k-4d k-norm-w 1e-6) k-4d)
+         q-normed (if (some? q-norm-w) (norm-fn q-4d q-norm-w 1e-6) q-4d)
+         k-normed (if (some? k-norm-w) (norm-fn k-4d k-norm-w 1e-6) k-4d)
          ;; Apply RoPE
          [q-rope k-rope] (apply-rope q-normed k-normed pos-ids head-dim theta-base rotary-dim)
          q-rope-3d (reshape (transpose q-rope [0 2 1 3]) [batch seq-len q-dim])
@@ -123,27 +123,29 @@
                  per-layer-gate-w per-layer-proj-w post-per-layer-norm-w
                  per-layer-input]
           :or {theta-base 10000.0 attn-softcap 50.0}} weights
+         norm-fn (if (some? per-layer-input) rms-norm gemma-rms-norm)
          ;; Attention Sub-block
-         x-norm1 (gemma-rms-norm x input-ln-w 1e-6)
+         x-norm1 (norm-fn x input-ln-w 1e-6)
          attn-opts {:q-norm-w q-norm-w
                     :k-norm-w k-norm-w
                     :theta-base theta-base
                     :attn-softcap attn-softcap
-                    :rotary-dim rotary-dim}
+                    :rotary-dim rotary-dim
+                    :norm-fn norm-fn}
          attn-res (if (some? past-kv)
                     (gemma-attention x-norm1 q-w k-w v-w o-w num-heads num-kv-heads pos-ids past-kv pos attn-opts)
                     (gemma-attention x-norm1 q-w k-w v-w o-w num-heads num-kv-heads pos-ids nil nil attn-opts))
          [attn-raw updated-kv] (if (vector? attn-res) attn-res [attn-res nil])
-         attn-normed (if post-attn-ln-w (gemma-rms-norm attn-raw post-attn-ln-w 1e-6) attn-raw)
+         attn-normed (if post-attn-ln-w (norm-fn attn-raw post-attn-ln-w 1e-6) attn-raw)
          x-res1 (+ x attn-normed)
 
          ;; MLP Sub-block
          x-norm2 (cond
-                   pre-mlp-ln-w (gemma-rms-norm x-res1 pre-mlp-ln-w 1e-6)
-                   post-attn-ln-w (gemma-rms-norm x-res1 post-attn-ln-w 1e-6)
+                   pre-mlp-ln-w (norm-fn x-res1 pre-mlp-ln-w 1e-6)
+                   post-attn-ln-w (norm-fn x-res1 post-attn-ln-w 1e-6)
                    :else x-res1)
          mlp-raw (gemma-mlp x-norm2 gate-w up-w down-w)
-         mlp-normed (if post-mlp-ln-w (gemma-rms-norm mlp-raw post-mlp-ln-w 1e-6) mlp-raw)
+         mlp-normed (if post-mlp-ln-w (norm-fn mlp-raw post-mlp-ln-w 1e-6) mlp-raw)
          x-res2 (+ x-res1 mlp-normed)
 
          ;; Gemma 4 Per-Layer Input (PLE) Gating Sub-block
@@ -154,7 +156,7 @@
                        act-gate (clj-xla.nn.activations/gelu gate-raw)
                        gated (* act-gate per-layer-input)
                        proj-raw (linear gated pl-proj nil)
-                       normed (if post-per-layer-norm-w (gemma-rms-norm proj-raw post-per-layer-norm-w 1e-6) proj-raw)]
+                       normed (if post-per-layer-norm-w (norm-fn proj-raw post-per-layer-norm-w 1e-6) proj-raw)]
                    (+ x-res2 normed))
                  x-res2)]
      (if (some? past-kv)
@@ -230,7 +232,7 @@
          pl-context-scaled (* pl-context-raw (/ 1.0 (Math/sqrt (double hidden-dim))))
          pl-tok-4d (reshape pl-tok-scaled [batch seq-len num-layers pl-dim])
          pl-context-4d (reshape pl-context-scaled [batch seq-len num-layers pl-dim])
-         pl-context-norm (gemma-rms-norm pl-context-4d per-layer-proj-norm-w 1e-6)
+         pl-context-norm (rms-norm pl-context-4d per-layer-proj-norm-w 1e-6)
          ple-all (* (+ pl-context-norm pl-tok-4d) (/ 1.0 (Math/sqrt 2.0)))
 
          ;; Resolve shared KV weights across layers
@@ -238,7 +240,7 @@
                                (fn [idx lw]
                                  (if (some? (:k-w lw))
                                    lw
-                                   (let [prev-lw (first (filter #(some? (:k-w %)) (subvec (mapv #(nth layers-weights %) (range idx)) 0)))]
+                                   (let [prev-lw (first (filter #(some? (:k-w %)) (subvec (vec layers-weights) 0 idx)))]
                                      (merge lw {:k-w (:k-w prev-lw)
                                                 :v-w (:v-w prev-lw)
                                                 :k-norm-w (:k-norm-w prev-lw)}))))
@@ -263,7 +265,7 @@
                     tok-embed
                     layers-with-ple)
             nil])
-         normed (gemma-rms-norm x-out final-norm-w 1e-6)
+         normed (rms-norm x-out final-norm-w 1e-6)
          embed-t (transpose embed-tokens [1 0])
          raw-logits (linear normed embed-t nil)
          final-softcap (get opts :final-logit-softcap 30.0)
