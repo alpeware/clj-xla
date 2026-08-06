@@ -337,20 +337,28 @@
   "Gathers slices from operand at specified start-indices."
   [operand start-indices]
   (let [t-op (emit-constant! operand nil)
-        t-idx (emit-constant! start-indices nil)
-        [t-kw op-shape dtype] (:type t-op)
-        [_ idx-shape _] (:type t-idx)
+        raw-idx (emit-constant! start-indices nil)
+        [op-kw op-shape dtype] (:type t-op)
+        [_ idx-shape _] (:type raw-idx)
+        idx-rank (clojure.core/count idx-shape)
+        ;; Ensure start_indices is expanded so its last dimension is index_vector_dim (size 1)
+        t-idx (cond
+                (= idx-rank 2) (reshape raw-idx [(nth idx-shape 0) (nth idx-shape 1) 1])
+                (= idx-rank 1) (reshape raw-idx [(nth idx-shape 0) 1])
+                :else raw-idx)
+        [_ final-idx-shape _] (:type t-idx)
+        final-idx-rank (clojure.core/count final-idx-shape)
         hidden-dim (last op-shape)
         out-shape (conj idx-shape hidden-dim)
-        out-type [t-kw out-shape dtype]
+        out-type [op-kw out-shape dtype]
         out-id (gen-var-id! "t_gather")
         eqn {:op :stablehlo/gather
              :invars [(:id t-op) (:id t-idx)]
              :outvars [out-id]
-             :attrs {:offset_dims [2]
+             :attrs {:offset_dims [(clojure.core/dec final-idx-rank)]
                      :collapsed_slice_dims [0]
                      :start_index_map [0]
-                     :index_vector_dim 2
+                     :index_vector_dim (clojure.core/dec final-idx-rank)
                      :slice_sizes [1 hidden-dim]}}]
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))

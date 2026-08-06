@@ -21,7 +21,9 @@
   ([x weight eps]
    (let [ms (reduce-mean (pow x 2.0) :axes [-1] :keep-dims true)
          x-hat (/ x (sqrt (+ ms eps)))]
-     (* x-hat weight))))
+     (if (some? weight)
+       (* x-hat weight)
+       x-hat))))
 
 (defn gemma-rms-norm
   "Gemma RMSNorm: x / sqrt(mean(x^2) + eps) * (1.0 + weight)."

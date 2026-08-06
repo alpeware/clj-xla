@@ -2,6 +2,7 @@ pom.xml
 pom.xml.asc
 *.jar
 *.class
+
 /lib/
 /classes/
 /target/
@@ -11,6 +12,10 @@ backtests/
 logs/
 bin/
 .models/
+.venv/
+__pycache__
+
+.python-version
 *.safetensors
 .lein-deps-sum
 .lein-repl-history

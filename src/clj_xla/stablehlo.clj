@@ -90,7 +90,10 @@
                         [op-dims op-dtype] (or (parse-tensor-dims operand-t) [[50257 768] "f32"])
                         [idx-dims _] (or (parse-tensor-dims indices-t) [[1 128] "i32"])
                         hidden-dim (last op-dims)
-                        out-dims (conj idx-dims hidden-dim)
+                        base-idx-dims (if (and (> (count idx-dims) 1) (= (last idx-dims) 1))
+                                        (pop idx-dims)
+                                        idx-dims)
+                        out-dims (conj base-idx-dims hidden-dim)
                         out-t (str "tensor<" (str/join "x" out-dims) "x" op-dtype ">")]
                     (assoc acc (first outvars) out-t))
 

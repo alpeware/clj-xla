@@ -157,27 +157,28 @@
 (defn allocate-device-weights
   "Transfers all model layer, embedding, and per-layer input weights to PJRT device memory."
   [{:keys [ctx weights-mmap config]}]
-  (let [{:keys [prefix-base vocab-size hidden-dim total-pl-dim pl-dim q-dim kv-dim intermediate-dim head-dim num-layers weight-dtype weight-enum]} config
+  (let [{:keys [prefix-base vocab-size hidden-dim total-pl-dim pl-dim intermediate-dim num-layers weight-dtype weight-enum]} config
         load-fn (fn [name shape] (load-weight-buffer ctx weights-mmap name shape weight-dtype weight-enum))
         embed-buf (load-fn (str prefix-base "embed_tokens.weight") [vocab-size hidden-dim])
         embed-pl-buf (load-fn (str prefix-base "embed_tokens_per_layer.weight") [vocab-size total-pl-dim])
         pl-model-proj-buf (load-fn (str prefix-base "per_layer_model_projection.weight") [total-pl-dim hidden-dim])
         pl-proj-norm-buf (load-fn (str prefix-base "per_layer_projection_norm.weight") [pl-dim])
         final-norm-buf (load-fn (str prefix-base "norm.weight") [hidden-dim])
-        l19-kmap (gemma/gemma4-weight-key-map 19 (str prefix-base "layers."))
-        l19-k-buf (load-fn (:k-w l19-kmap) [kv-dim hidden-dim])
-        l19-v-buf (load-fn (:v-w l19-kmap) [kv-dim hidden-dim])
-        l19-kn-buf (load-fn (:k-norm-w l19-kmap) [head-dim])
         layer-bufs (mapv (fn [i]
                            (let [kmap (gemma/gemma4-weight-key-map i (str prefix-base "layers."))
+                                 is-global? (zero? (mod (inc i) 5))
+                                 l-q-dim (if is-global? 4096 2048)
+                                 l-kv-dim (if is-global? 512 256)
+                                 l-head-dim (if is-global? 512 256)
                                  mlp-dim (if (>= i 15) (* 2 intermediate-dim) intermediate-dim)]
                              [(load-fn (:input-ln-w kmap) [hidden-dim])
-                              (load-fn (:q-w kmap) [q-dim hidden-dim])
-                              (if-let [kw (:k-w kmap)] (load-fn kw [kv-dim hidden-dim]) l19-k-buf)
-                              (if-let [vw (:v-w kmap)] (load-fn vw [kv-dim hidden-dim]) l19-v-buf)
-                              (load-fn (:o-w kmap) [hidden-dim q-dim])
-                              (load-fn (:q-norm-w kmap) [head-dim])
-                              (if-let [kn (:k-norm-w kmap)] (load-fn kn [head-dim]) l19-kn-buf)
+                              (load-fn (:layer-scalar-w kmap) [1])
+                              (load-fn (:q-w kmap) [l-q-dim hidden-dim])
+                              (load-fn (:k-w kmap) [l-kv-dim hidden-dim])
+                              (load-fn (:v-w kmap) [l-kv-dim hidden-dim])
+                              (load-fn (:o-w kmap) [hidden-dim l-q-dim])
+                              (load-fn (:q-norm-w kmap) [l-head-dim])
+                              (load-fn (:k-norm-w kmap) [l-head-dim])
                               (load-fn (:post-attn-ln-w kmap) [hidden-dim])
                               (load-fn (:pre-mlp-ln-w kmap) [hidden-dim])
                               (load-fn (:post-mlp-ln-w kmap) [hidden-dim])
@@ -194,18 +195,21 @@
 (defn allocate-kv-caches
   "Allocates initial zero-filled PJRT device memory buffers for layer K/V caches."
   [{:keys [ctx config]}]
-  (let [{:keys [num-layers kv-cache-shape weight-enum]} config
-        num-elements (reduce * 1 kv-cache-shape)
-        zero-data (if (= weight-enum 11) (float-array num-elements) (short-array num-elements))]
-    (mapv (fn [_i]
-            [(xla/buffer-from-host-buffer ctx (:client ctx) zero-data kv-cache-shape weight-enum)
-             (xla/buffer-from-host-buffer ctx (:client ctx) zero-data kv-cache-shape weight-enum)])
+  (let [{:keys [num-layers max-seq-len weight-enum]} config]
+    (mapv (fn [i]
+            (let [is-global? (zero? (mod (inc i) 5))
+                  l-head-dim (if is-global? 512 256)
+                  c-shape [1 1 max-seq-len l-head-dim]
+                  num-elements (reduce * 1 c-shape)
+                  zero-data (if (= weight-enum 11) (float-array num-elements) (short-array num-elements))]
+              [(xla/buffer-from-host-buffer ctx (:client ctx) zero-data c-shape weight-enum)
+               (xla/buffer-from-host-buffer ctx (:client ctx) zero-data c-shape weight-enum)]))
           (range num-layers))))
 
 (defn compile-inference-executables
   "Traces and JIT-compiles Gemma 4 Single-Pass Prefill and Single-Token Decode StableHLO graphs into PJRT Executables."
   [{:keys [ctx config opts]} prompt-len]
-  (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim q-dim kv-dim intermediate-dim head-dim num-layers num-heads num-kv-heads kv-cache-shape weight-dtype]} config
+  (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim intermediate-dim max-seq-len num-layers weight-dtype]} config
         {:keys [verbose quiet]} opts
 
         prefill-invars (vec (concat
@@ -217,14 +221,19 @@
                               [:per_layer_projection_norm [:tensor [pl-dim] weight-dtype]]
                               [:final_norm_w [:tensor [hidden-dim] weight-dtype]]]
                              (mapcat (fn [i]
-                                       (let [mlp-dim (if (>= i 15) (* 2 intermediate-dim) intermediate-dim)]
+                                       (let [is-global? (zero? (mod (inc i) 5))
+                                             l-q-dim (if is-global? 4096 2048)
+                                             l-kv-dim (if is-global? 512 256)
+                                             l-head-dim (if is-global? 512 256)
+                                             mlp-dim (if (>= i 15) (* 2 intermediate-dim) intermediate-dim)]
                                          [[(keyword (str "input_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                          [(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] weight-dtype]]
-                                          [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
-                                          [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
-                                          [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] weight-dtype]]
-                                          [(keyword (str "q_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
-                                          [(keyword (str "k_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
+                                          [(keyword (str "layer_scalar_w_" i)) [:tensor [1] weight-dtype]]
+                                          [(keyword (str "q_w_" i)) [:tensor [l-q-dim hidden-dim] weight-dtype]]
+                                          [(keyword (str "k_w_" i)) [:tensor [l-kv-dim hidden-dim] weight-dtype]]
+                                          [(keyword (str "v_w_" i)) [:tensor [l-kv-dim hidden-dim] weight-dtype]]
+                                          [(keyword (str "o_w_" i)) [:tensor [hidden-dim l-q-dim] weight-dtype]]
+                                          [(keyword (str "q_norm_w_" i)) [:tensor [l-head-dim] weight-dtype]]
+                                          [(keyword (str "k_norm_w_" i)) [:tensor [l-head-dim] weight-dtype]]
                                           [(keyword (str "post_attn_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
                                           [(keyword (str "pre_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
                                           [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
@@ -236,8 +245,10 @@
                                           [(keyword (str "post_per_layer_norm_w_" i)) [:tensor [hidden-dim] weight-dtype]]]))
                                      (range num-layers))
                              (mapcat (fn [i]
-                                       [[(keyword (str "k_cache_" i)) [:tensor kv-cache-shape weight-dtype]]
-                                        [(keyword (str "v_cache_" i)) [:tensor kv-cache-shape weight-dtype]]])
+                                       (let [is-global? (zero? (mod (inc i) 5))
+                                             l-head-dim (if is-global? 512 256)]
+                                         [[(keyword (str "k_cache_" i)) [:tensor [1 1 max-seq-len l-head-dim] weight-dtype]]
+                                          [(keyword (str "v_cache_" i)) [:tensor [1 1 max-seq-len l-head-dim] weight-dtype]]]))
                                      (range num-layers))))
 
         decode-invars (assoc prefill-invars
@@ -245,40 +256,44 @@
                              1 [:pos [:tensor [1] :i32]])
 
         prefill-trace-fn (fn [x pos-tracer emb emb-pl pl-model-proj pl-proj-norm fn-norm & rest-args]
-                           (let [weight-args (take (* 16 num-layers) rest-args)
-                                 kv-cache-args (drop (* 16 num-layers) rest-args)
-                                 lw-seq (mapv (fn [i [in-ln qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw plg plp pln]]
-                                                {:input-ln-w in-ln :q-w qw :k-w kw :v-w vw :o-w ow
+                           (let [weight-args (take (* 17 num-layers) rest-args)
+                                 kv-cache-args (drop (* 17 num-layers) rest-args)
+                                 lw-seq (mapv (fn [i [in-ln ls qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw plg plp pln]]
+                                                {:input-ln-w in-ln :layer-scalar-w ls
+                                                 :q-w qw :k-w kw :v-w vw :o-w ow
                                                  :q-norm-w qn :k-norm-w kn
                                                  :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
                                                  :gate-w gw :up-w uw :down-w dw
                                                  :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
+                                                 :num-heads 8 :num-kv-heads 1
                                                  :theta-base (if (zero? (mod (inc i) 5)) 1000000.0 10000.0)
-                                                 :rotary-dim (if (zero? (mod (inc i) 5)) 64 256)
+                                                 :rope-proportion (if (zero? (mod (inc i) 5)) 0.25 1.0)
                                                  :attn-softcap nil})
                                               (range num-layers)
-                                              (mapv vec (partition 16 weight-args)))
+                                              (mapv vec (partition 17 weight-args)))
                                  kv-seq (mapv vec (partition 2 kv-cache-args))
-                                 [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads kv-seq 0 {:final-logit-softcap nil})
+                                 [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer 8 1 kv-seq 0 {:final-logit-softcap 30.0})
                                  f32-logits (t/convert logits :f32)]
                              (into [f32-logits] (apply concat updated-kv-caches))))
 
         decode-trace-fn (fn [x pos-tracer emb emb-pl pl-model-proj pl-proj-norm fn-norm & rest-args]
-                          (let [weight-args (take (* 16 num-layers) rest-args)
-                                kv-cache-args (drop (* 16 num-layers) rest-args)
-                                lw-seq (mapv (fn [i [in-ln qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw plg plp pln]]
-                                               {:input-ln-w in-ln :q-w qw :k-w kw :v-w vw :o-w ow
+                          (let [weight-args (take (* 17 num-layers) rest-args)
+                                kv-cache-args (drop (* 17 num-layers) rest-args)
+                                lw-seq (mapv (fn [i [in-ln ls qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw plg plp pln]]
+                                               {:input-ln-w in-ln :layer-scalar-w ls
+                                                :q-w qw :k-w kw :v-w vw :o-w ow
                                                 :q-norm-w qn :k-norm-w kn
                                                 :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
                                                 :gate-w gw :up-w uw :down-w dw
                                                 :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
+                                                :num-heads 8 :num-kv-heads 1
                                                 :theta-base (if (zero? (mod (inc i) 5)) 1000000.0 10000.0)
-                                                :rotary-dim (if (zero? (mod (inc i) 5)) 64 256)
+                                                :rope-proportion (if (zero? (mod (inc i) 5)) 0.25 1.0)
                                                 :attn-softcap nil})
                                              (range num-layers)
-                                             (mapv vec (partition 16 weight-args)))
+                                             (mapv vec (partition 17 weight-args)))
                                 kv-seq (mapv vec (partition 2 kv-cache-args))
-                                [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads kv-seq pos-tracer {:final-logit-softcap nil})
+                                [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer 8 1 kv-seq pos-tracer {:final-logit-softcap 30.0})
                                 f32-logits (t/convert logits :f32)]
                             (into [f32-logits] (apply concat updated-kv-caches))))
 
@@ -392,12 +407,16 @@
 
                       is-it-model?
                       ;; Wrap plain question/prompt into Gemma 4 IT Turn Template
-                      (into [(bos-id tokenizer) 105 2364 107]
-                            (concat (encode tokenizer clean-prompt) [106 107 105 4368 107]))
+                      (let [raw-ids (encode tokenizer clean-prompt)
+                            clean-ids (if (= (first raw-ids) (bos-id tokenizer)) (rest raw-ids) raw-ids)]
+                        (vec (concat [(bos-id tokenizer) 105 2364 107] clean-ids [106 107 105 4368 107])))
 
                       :else
                       ;; Base Pretrained model (e.g. google/gemma-4-E2B): direct prompt completion
-                      (into [(bos-id tokenizer)] (encode tokenizer clean-prompt)))
+                      (let [raw-ids (encode tokenizer clean-prompt)]
+                        (if (= (first raw-ids) (bos-id tokenizer))
+                          (vec raw-ids)
+                          (vec (cons (bos-id tokenizer) raw-ids)))))
          prompt-len (count prompt-ids)]
      (when-not quiet
        (println (format "Prompt: \"%s\"" clean-prompt))

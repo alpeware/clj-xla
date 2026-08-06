@@ -17,15 +17,20 @@
     :else 0))
 
 (defn- generate-rope-freq-tensors
-  ([seq-len head-dim theta-base] (generate-rope-freq-tensors seq-len head-dim theta-base 0 head-dim))
-  ([seq-len head-dim theta-base pos-offset] (generate-rope-freq-tensors seq-len head-dim theta-base pos-offset head-dim))
-  ([seq-len head-dim theta-base pos-offset full-dim]
+  ([seq-len head-dim theta-base] (generate-rope-freq-tensors seq-len head-dim theta-base 0 head-dim 1.0))
+  ([seq-len head-dim theta-base pos-offset] (generate-rope-freq-tensors seq-len head-dim theta-base pos-offset head-dim 1.0))
+  ([seq-len head-dim theta-base pos-offset full-dim] (generate-rope-freq-tensors seq-len head-dim theta-base pos-offset full-dim 1.0))
+  ([seq-len head-dim theta-base pos-offset full-dim rope-proportion]
    (let [f-dim (or full-dim head-dim)
-         t-base (or theta-base 10000.0)]
+         t-base (or theta-base 10000.0)
+         rope-prop (double (or rope-proportion 1.0))
+         half-dim (quot head-dim 2)
+         rope-angles (long (clojure.core/* rope-prop half-dim))]
      (if (clj-xla.tensor/tracer? pos-offset)
-       (let [half-dim (quot head-dim 2)
-             freqs-vec (vec (for [i (range half-dim)]
-                              (Math/pow t-base (clojure.core// (clojure.core/* -2.0 i) (double f-dim)))))
+       (let [freqs-vec (vec (for [i (range half-dim)]
+                              (if (clojure.core/< i rope-angles)
+                                (Math/pow t-base (clojure.core// (clojure.core/* -2.0 i) (double f-dim)))
+                                0.0)))
              freqs-const (clj-xla.tensor/emit-constant! [[[[freqs-vec]]]] [:tensor [1 1 1 half-dim] :f32])
              pos-f32 (convert pos-offset :f32)
              pos-shape (second (:type pos-f32))
@@ -38,9 +43,10 @@
              sin-t (concatenate [sin-half sin-half] -1)]
          [cos-t sin-t])
        (let [p-off (extract-pos-int pos-offset)
-             half-dim (quot head-dim 2)
              freqs (vec (for [i (range half-dim)]
-                          (Math/pow t-base (clojure.core// (clojure.core/* -2.0 i) (double f-dim)))))
+                          (if (clojure.core/< i rope-angles)
+                            (Math/pow t-base (clojure.core// (clojure.core/* -2.0 i) (double f-dim)))
+                            0.0)))
              cos-rows (vec (for [idx (range seq-len)]
                              (let [pos (clojure.core/+ p-off idx)
                                    half (vec (for [i (range half-dim)]
@@ -56,10 +62,12 @@
 
 (defn- apply-rope-single
   ([x pos-ids head-dim theta-base]
-   (apply-rope-single x pos-ids head-dim (or theta-base 10000.0) nil head-dim))
+   (apply-rope-single x pos-ids head-dim (or theta-base 10000.0) nil head-dim 1.0))
   ([x pos-ids head-dim theta-base rotary-dim]
-   (apply-rope-single x pos-ids head-dim (or theta-base 10000.0) rotary-dim head-dim))
+   (apply-rope-single x pos-ids head-dim (or theta-base 10000.0) rotary-dim head-dim 1.0))
   ([x pos-ids head-dim theta-base rotary-dim full-dim]
+   (apply-rope-single x pos-ids head-dim theta-base rotary-dim full-dim 1.0))
+  ([x pos-ids head-dim theta-base rotary-dim full-dim rope-proportion]
    (let [x-type (:type x)
          [_ shape dtype] x-type
          is-3d (= (count shape) 3)
@@ -69,48 +77,45 @@
              h-dim (or head-dim 64)
              n-heads (quot q-dim h-dim)
              x-4d (transpose (reshape x [batch seq-len n-heads h-dim]) [0 2 1 3])
-             res-4d (apply-rope-single x-4d pos-ids h-dim t-base rotary-dim (or full-dim h-dim))]
+             res-4d (apply-rope-single x-4d pos-ids h-dim t-base rotary-dim (or full-dim h-dim) rope-proportion)]
          (reshape (transpose res-4d [0 2 1 3]) [batch seq-len q-dim]))
        (let [[batch num-heads seq-len h-dim] shape
              r-dim (or rotary-dim h-dim)
-             f-dim (or full-dim h-dim)]
-         (if (< r-dim h-dim)
-           (let [x-rot (slice x [0 0 0 0] [batch num-heads seq-len r-dim] [1 1 1 1])
-                 x-pass (slice x [0 0 0 r-dim] [batch num-heads seq-len h-dim] [1 1 1 1])
-                 rot-applied (apply-rope-single x-rot pos-ids r-dim t-base r-dim f-dim)
-                 res (concatenate [rot-applied x-pass] -1)]
-             (if (= dtype :f32) res (convert res dtype)))
-           (let [half-dim (quot r-dim 2)
-                 x1 (slice x [0 0 0 0] [batch num-heads seq-len half-dim] [1 1 1 1])
-                 x2 (slice x [0 0 0 half-dim] [batch num-heads seq-len r-dim] [1 1 1 1])
-                 neg-x2 (- x2)
-                 x-rot (concatenate [neg-x2 x1] -1)
-                 [cos-t sin-t] (generate-rope-freq-tensors seq-len r-dim t-base pos-ids f-dim)
-                 res (+ (* x cos-t) (* x-rot sin-t))]
-             (if (= dtype :f32) res (convert res dtype)))))))))
+             f-dim (or full-dim h-dim)
+             rope-prop (or rope-proportion (if (< r-dim h-dim) (/ (double r-dim) (double h-dim)) 1.0))
+             half-dim (quot f-dim 2)
+             x1 (slice x [0 0 0 0] [batch num-heads seq-len half-dim] [1 1 1 1])
+             x2 (slice x [0 0 0 half-dim] [batch num-heads seq-len f-dim] [1 1 1 1])
+             neg-x2 (- x2)
+             x-rot (concatenate [neg-x2 x1] -1)
+             [cos-t sin-t] (generate-rope-freq-tensors seq-len f-dim t-base pos-ids f-dim rope-prop)
+             res (+ (* x cos-t) (* x-rot sin-t))]
+         (if (= dtype :f32) res (convert res dtype)))))))
 
 (defn apply-rope
   "Applies Rotary Position Embeddings (RoPE) to query or key tensor `x` (or `[q k]`) based on sequence position indices `pos-ids`."
   ([x pos-ids]
-   (apply-rope x nil pos-ids nil 10000.0 nil nil))
+   (apply-rope x nil pos-ids nil 10000.0 nil nil 1.0))
   ([x y z]
    (if (number? z)
-     (apply-rope x nil y z 10000.0 nil nil)
-     (apply-rope x y z nil 10000.0 nil nil)))
+     (apply-rope x nil y z 10000.0 nil nil 1.0)
+     (apply-rope x y z nil 10000.0 nil nil 1.0)))
   ([x y z head-dim]
-   (apply-rope x y z head-dim 10000.0 nil nil))
+   (apply-rope x y z head-dim 10000.0 nil nil 1.0))
   ([x y z head-dim theta-base]
-   (apply-rope x y z head-dim theta-base nil nil))
+   (apply-rope x y z head-dim theta-base nil nil 1.0))
   ([x y z head-dim theta-base rotary-dim]
-   (apply-rope x y z head-dim theta-base rotary-dim nil))
+   (apply-rope x y z head-dim theta-base rotary-dim nil 1.0))
   ([x y z head-dim theta-base rotary-dim full-dim]
+   (apply-rope x y z head-dim theta-base rotary-dim full-dim 1.0))
+  ([x y z head-dim theta-base rotary-dim full-dim rope-proportion]
    (if (some? y)
-     [(apply-rope x nil z head-dim theta-base rotary-dim full-dim)
-      (apply-rope y nil z head-dim theta-base rotary-dim full-dim)]
+     [(apply-rope x nil z head-dim theta-base rotary-dim full-dim rope-proportion)
+      (apply-rope y nil z head-dim theta-base rotary-dim full-dim rope-proportion)]
      (let [h-dim (or head-dim
                      (let [shape (second (:type x))]
                        (if (= (count shape) 4) (nth shape 3) 64)))]
-       (apply-rope-single x z h-dim theta-base rotary-dim (or full-dim h-dim))))))
+       (apply-rope-single x z h-dim theta-base rotary-dim (or full-dim h-dim) rope-proportion)))))
 
 (defn- update-single-cache [cache new-val pos]
   (if (nil? cache)
@@ -238,10 +243,12 @@
 (defn gqa-causal-attention
   "Grouped-Query Causal Self-Attention with causal mask, Softmax, and optional attention logit soft-capping."
   ([q k v o-w num-heads num-kv-heads]
-   (gqa-causal-attention q k v o-w num-heads num-kv-heads 50.0 nil nil))
+   (gqa-causal-attention q k v o-w num-heads num-kv-heads nil nil nil {}))
   ([q k v o-w num-heads num-kv-heads attn-softcap]
-   (gqa-causal-attention q k v o-w num-heads num-kv-heads attn-softcap nil nil))
+   (gqa-causal-attention q k v o-w num-heads num-kv-heads attn-softcap nil nil {}))
   ([q k v o-w num-heads num-kv-heads attn-softcap past-kv pos]
+   (gqa-causal-attention q k v o-w num-heads num-kv-heads attn-softcap past-kv pos {}))
+  ([q k v o-w num-heads num-kv-heads attn-softcap past-kv pos opts]
    (let [q-type (:type q)
          k-type (:type k)
          is-q-4d (= (count (second q-type)) 4)
@@ -264,7 +271,7 @@
          k-act-type (:type k-act)
          kv-len (nth (second k-act-type) 2)
          group-size (quot num-heads num-kv-heads)
-         scale (/ 1.0 (Math/sqrt (double head-dim)))
+         scale (get opts :scale (/ 1.0 (Math/sqrt (double head-dim))))
 
          ;; 1. Reshape & Transpose Q
          q-heads (if is-q-4d
