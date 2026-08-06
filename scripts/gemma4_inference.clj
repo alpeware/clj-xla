@@ -157,7 +157,8 @@
         l19-v-buf (load-fn (:v-w l19-kmap) [kv-dim hidden-dim])
         l19-kn-buf (load-fn (:k-norm-w l19-kmap) [head-dim])
         layer-bufs (mapv (fn [i]
-                           (let [kmap (gemma/gemma4-weight-key-map i (str prefix-base "layers."))]
+                           (let [kmap (gemma/gemma4-weight-key-map i (str prefix-base "layers."))
+                                 mlp-dim (if (>= i 15) (* 2 intermediate-dim) intermediate-dim)]
                              [(load-fn (:input-ln-w kmap) [hidden-dim])
                               (load-fn (:q-w kmap) [q-dim hidden-dim])
                               (if-let [kw (:k-w kmap)] (load-fn kw [kv-dim hidden-dim]) l19-k-buf)
@@ -168,9 +169,9 @@
                               (load-fn (:post-attn-ln-w kmap) [hidden-dim])
                               (load-fn (:pre-mlp-ln-w kmap) [hidden-dim])
                               (load-fn (:post-mlp-ln-w kmap) [hidden-dim])
-                              (load-fn (:gate-w kmap) [intermediate-dim hidden-dim])
-                              (load-fn (:up-w kmap) [intermediate-dim hidden-dim])
-                              (load-fn (:down-w kmap) [hidden-dim intermediate-dim])
+                              (load-fn (:gate-w kmap) [mlp-dim hidden-dim])
+                              (load-fn (:up-w kmap) [mlp-dim hidden-dim])
+                              (load-fn (:down-w kmap) [hidden-dim mlp-dim])
                               (load-fn (:per-layer-gate-w kmap) [pl-dim hidden-dim])
                               (load-fn (:per-layer-proj-w kmap) [hidden-dim pl-dim])
                               (load-fn (:post-per-layer-norm-w kmap) [hidden-dim])]))
@@ -204,22 +205,23 @@
                               [:per_layer_projection_norm [:tensor [pl-dim] weight-dtype]]
                               [:final_norm_w [:tensor [hidden-dim] weight-dtype]]]
                              (mapcat (fn [i]
-                                       [[(keyword (str "input_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                        [(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] weight-dtype]]
-                                        [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
-                                        [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
-                                        [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] weight-dtype]]
-                                        [(keyword (str "q_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
-                                        [(keyword (str "k_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
-                                        [(keyword (str "post_attn_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                        [(keyword (str "pre_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                        [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                        [(keyword (str "gate_w_" i)) [:tensor [intermediate-dim hidden-dim] weight-dtype]]
-                                        [(keyword (str "up_w_" i)) [:tensor [intermediate-dim hidden-dim] weight-dtype]]
-                                        [(keyword (str "down_w_" i)) [:tensor [hidden-dim intermediate-dim] weight-dtype]]
-                                        [(keyword (str "per_layer_gate_w_" i)) [:tensor [pl-dim hidden-dim] weight-dtype]]
-                                        [(keyword (str "per_layer_proj_w_" i)) [:tensor [hidden-dim pl-dim] weight-dtype]]
-                                        [(keyword (str "post_per_layer_norm_w_" i)) [:tensor [hidden-dim] weight-dtype]]])
+                                       (let [mlp-dim (if (>= i 15) (* 2 intermediate-dim) intermediate-dim)]
+                                         [[(keyword (str "input_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                          [(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] weight-dtype]]
+                                          [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
+                                          [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
+                                          [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] weight-dtype]]
+                                          [(keyword (str "q_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
+                                          [(keyword (str "k_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
+                                          [(keyword (str "post_attn_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                          [(keyword (str "pre_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                          [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                          [(keyword (str "gate_w_" i)) [:tensor [mlp-dim hidden-dim] weight-dtype]]
+                                          [(keyword (str "up_w_" i)) [:tensor [mlp-dim hidden-dim] weight-dtype]]
+                                          [(keyword (str "down_w_" i)) [:tensor [hidden-dim mlp-dim] weight-dtype]]
+                                          [(keyword (str "per_layer_gate_w_" i)) [:tensor [pl-dim hidden-dim] weight-dtype]]
+                                          [(keyword (str "per_layer_proj_w_" i)) [:tensor [hidden-dim pl-dim] weight-dtype]]
+                                          [(keyword (str "post_per_layer_norm_w_" i)) [:tensor [hidden-dim] weight-dtype]]]))
                                      (range num-layers))
                              (mapcat (fn [i]
                                        [[(keyword (str "k_cache_" i)) [:tensor kv-cache-shape weight-dtype]]
@@ -243,7 +245,7 @@
                                                  :rotary-dim (if (zero? (mod (inc i) 5)) 64 256)
                                                  :attn-softcap nil})
                                               (range num-layers)
-                                              (partition 16 weight-args))
+                                              (mapv vec (partition 16 weight-args)))
                                  kv-seq (mapv vec (partition 2 kv-cache-args))
                                  [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm (vec (range prompt-len)) num-heads num-kv-heads kv-seq 0 {:final-logit-softcap 30.0})
                                  f32-logits (t/convert logits :f32)]
@@ -262,7 +264,7 @@
                                                 :rotary-dim (if (zero? (mod (inc i) 5)) 64 256)
                                                 :attn-softcap nil})
                                              (range num-layers)
-                                             (partition 16 weight-args))
+                                             (mapv vec (partition 16 weight-args)))
                                 kv-seq (mapv vec (partition 2 kv-cache-args))
                                 [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads kv-seq pos-tracer {:final-logit-softcap 30.0})
                                 f32-logits (t/convert logits :f32)]
@@ -292,7 +294,7 @@
 
 (defn run-prompt-prefill
   "Runs Single-Pass Prompt Prefill phase on PJRT device runtime."
-  [{:keys [ctx config opts]} executables device-weights initial-kv-bufs prompt-ids]
+  [{:keys [ctx tokenizer config opts]} executables device-weights initial-kv-bufs prompt-ids]
   (let [prompt-len (count prompt-ids)
         {:keys [vocab-size]} config
         {:keys [temperature top-k]} opts
@@ -306,6 +308,11 @@
         prefill-kv-flat (if (vector? prefill-res) (rest prefill-res) [])
         prefill-kv-bufs (mapv vec (partition 2 prefill-kv-flat))
         last-logits (xla/to-host-slice prefill-logits-buf (dec prompt-len) vocab-size (* prompt-len vocab-size))
+        indexed (map-indexed vector (vec last-logits))
+        top-10 (take 10 (sort-by second > indexed))
+        _ (do (println "\n=== Top 10 Prefill Predicted Tokens ===")
+              (doseq [[id logit] top-10]
+                (println (format "  token %6d | logit: %8.4f | text: %s" id logit (pr-str (decode tokenizer [id]))))))
         first-gen-tok (sampling/sample-logits last-logits {:temperature temperature :top-k top-k})]
     {:first-gen-tok first-gen-tok
      :prefill-kv-bufs prefill-kv-bufs
@@ -356,7 +363,19 @@
    (let [{:keys [tokenizer opts]} session
          {:keys [max-new-tokens temperature top-k]} opts
          clean-prompt (str/replace prompt-text #"\\n" "\n")
-         prompt-ids (into [(bos-id tokenizer)] (encode tokenizer clean-prompt))
+         prompt-ids (if (clojure.string/includes? clean-prompt "<|turn>")
+                      ;; Parse raw control string into special token IDs
+                      (let [parts (clojure.string/split clean-prompt #"(?=<\|turn>)|(?<=<\|turn>)|(?=<turn\|>)|(?<=<turn\|>)")
+                            toks (mapcat (fn [p]
+                                           (cond
+                                             (= p "<|turn>") [105]
+                                             (= p "<turn|>") [106]
+                                             :else (encode tokenizer p)))
+                                         parts)]
+                        (into [(bos-id tokenizer)] toks))
+                      ;; Wrap plain question/prompt into Gemma 4 Turn Template
+                      (into [(bos-id tokenizer) 105 2364 107]
+                            (concat (encode tokenizer clean-prompt) [106 107 105 4368 107])))
          prompt-len (count prompt-ids)]
      (println (format "Prompt: \"%s\"" clean-prompt))
      (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d, precision=%s"

@@ -17,60 +17,67 @@
     :else 0))
 
 (defn- generate-rope-freq-tensors
-  ([seq-len head-dim theta-base] (generate-rope-freq-tensors seq-len head-dim theta-base 0))
-  ([seq-len head-dim theta-base pos-offset]
-   (if (clj-xla.tensor/tracer? pos-offset)
-     (let [half-dim (quot head-dim 2)
-           freqs-vec (vec (for [i (range half-dim)]
-                            (Math/pow theta-base (clojure.core// (clojure.core/* -2.0 i) (double head-dim)))))
-           freqs-const (clj-xla.tensor/emit-constant! [[[[freqs-vec]]]] [:tensor [1 1 1 half-dim] :f32])
-           pos-f32 (convert pos-offset :f32)
-           pos-shape (second (:type pos-f32))
-           s-len (or (first pos-shape) 1)
-           pos-4d (reshape pos-f32 [1 1 s-len 1])
-           angles (* pos-4d freqs-const)
-           cos-half (cos angles)
-           sin-half (sin angles)
-           cos-t (concatenate [cos-half cos-half] -1)
-           sin-t (concatenate [sin-half sin-half] -1)]
-       [cos-t sin-t])
-     (let [p-off (extract-pos-int pos-offset)
-           half-dim (quot head-dim 2)
-           freqs (vec (for [i (range half-dim)]
-                        (Math/pow theta-base (clojure.core// (clojure.core/* -2.0 i) (double head-dim)))))
-           cos-rows (vec (for [idx (range seq-len)]
-                           (let [pos (clojure.core/+ p-off idx)
-                                 half (vec (for [i (range half-dim)]
-                                             (Math/cos (clojure.core/* (double pos) (nth freqs i)))))]
-                             (vec (clojure.core/concat half half)))))
-           sin-rows (vec (for [idx (range seq-len)]
-                           (let [pos (clojure.core/+ p-off idx)
-                                 half (vec (for [i (range half-dim)]
-                                             (Math/sin (clojure.core/* (double pos) (nth freqs i)))))]
-                             (vec (clojure.core/concat half half)))))]
-       [(clj-xla.tensor/emit-constant! [[cos-rows]] [:tensor [1 1 seq-len head-dim] :f32])
-        (clj-xla.tensor/emit-constant! [[sin-rows]] [:tensor [1 1 seq-len head-dim] :f32])]))))
+  ([seq-len head-dim theta-base] (generate-rope-freq-tensors seq-len head-dim theta-base 0 head-dim))
+  ([seq-len head-dim theta-base pos-offset] (generate-rope-freq-tensors seq-len head-dim theta-base pos-offset head-dim))
+  ([seq-len head-dim theta-base pos-offset full-dim]
+   (let [f-dim (or full-dim head-dim)
+         t-base (or theta-base 10000.0)]
+     (if (clj-xla.tensor/tracer? pos-offset)
+       (let [half-dim (quot head-dim 2)
+             freqs-vec (vec (for [i (range half-dim)]
+                              (Math/pow t-base (clojure.core// (clojure.core/* -2.0 i) (double f-dim)))))
+             freqs-const (clj-xla.tensor/emit-constant! [[[[freqs-vec]]]] [:tensor [1 1 1 half-dim] :f32])
+             pos-f32 (convert pos-offset :f32)
+             pos-shape (second (:type pos-f32))
+             s-len (or (first pos-shape) 1)
+             pos-4d (reshape pos-f32 [1 1 s-len 1])
+             angles (* pos-4d freqs-const)
+             cos-half (cos angles)
+             sin-half (sin angles)
+             cos-t (concatenate [cos-half cos-half] -1)
+             sin-t (concatenate [sin-half sin-half] -1)]
+         [cos-t sin-t])
+       (let [p-off (extract-pos-int pos-offset)
+             half-dim (quot head-dim 2)
+             freqs (vec (for [i (range half-dim)]
+                          (Math/pow t-base (clojure.core// (clojure.core/* -2.0 i) (double f-dim)))))
+             cos-rows (vec (for [idx (range seq-len)]
+                             (let [pos (clojure.core/+ p-off idx)
+                                   half (vec (for [i (range half-dim)]
+                                               (Math/cos (clojure.core/* (double pos) (nth freqs i)))))]
+                               (vec (clojure.core/concat half half)))))
+             sin-rows (vec (for [idx (range seq-len)]
+                             (let [pos (clojure.core/+ p-off idx)
+                                   half (vec (for [i (range half-dim)]
+                                               (Math/sin (clojure.core/* (double pos) (nth freqs i)))))]
+                               (vec (clojure.core/concat half half)))))]
+         [(clj-xla.tensor/emit-constant! [[cos-rows]] [:tensor [1 1 seq-len head-dim] :f32])
+          (clj-xla.tensor/emit-constant! [[sin-rows]] [:tensor [1 1 seq-len head-dim] :f32])])))))
 
 (defn- apply-rope-single
   ([x pos-ids head-dim theta-base]
-   (apply-rope-single x pos-ids head-dim theta-base nil))
+   (apply-rope-single x pos-ids head-dim (or theta-base 10000.0) nil head-dim))
   ([x pos-ids head-dim theta-base rotary-dim]
+   (apply-rope-single x pos-ids head-dim (or theta-base 10000.0) rotary-dim head-dim))
+  ([x pos-ids head-dim theta-base rotary-dim full-dim]
    (let [x-type (:type x)
          [_ shape dtype] x-type
-         is-3d (= (count shape) 3)]
+         is-3d (= (count shape) 3)
+         t-base (or theta-base 10000.0)]
      (if is-3d
        (let [[batch seq-len q-dim] shape
              h-dim (or head-dim 64)
              n-heads (quot q-dim h-dim)
              x-4d (transpose (reshape x [batch seq-len n-heads h-dim]) [0 2 1 3])
-             res-4d (apply-rope-single x-4d pos-ids h-dim theta-base rotary-dim)]
+             res-4d (apply-rope-single x-4d pos-ids h-dim t-base rotary-dim h-dim)]
          (reshape (transpose res-4d [0 2 1 3]) [batch seq-len q-dim]))
        (let [[batch num-heads seq-len h-dim] shape
-             r-dim (or rotary-dim h-dim)]
+             r-dim (or rotary-dim h-dim)
+             f-dim (or full-dim h-dim)]
          (if (< r-dim h-dim)
            (let [x-rot (slice x [0 0 0 0] [batch num-heads seq-len r-dim] [1 1 1 1])
                  x-pass (slice x [0 0 0 r-dim] [batch num-heads seq-len h-dim] [1 1 1 1])
-                 rot-applied (apply-rope-single x-rot pos-ids r-dim theta-base r-dim)
+                 rot-applied (apply-rope-single x-rot pos-ids r-dim t-base r-dim f-dim)
                  res (concatenate [rot-applied x-pass] -1)]
              (if (= dtype :f32) res (convert res dtype)))
            (let [half-dim (quot r-dim 2)
@@ -78,7 +85,7 @@
                  x2 (slice x [0 0 0 half-dim] [batch num-heads seq-len r-dim] [1 1 1 1])
                  neg-x2 (- x2)
                  x-rot (concatenate [neg-x2 x1] -1)
-                 [cos-t sin-t] (generate-rope-freq-tensors seq-len r-dim theta-base pos-ids)
+                 [cos-t sin-t] (generate-rope-freq-tensors seq-len r-dim t-base pos-ids f-dim)
                  res (+ (* x cos-t) (* x-rot sin-t))]
              (if (= dtype :f32) res (convert res dtype)))))))))
 
@@ -101,7 +108,7 @@
      (let [h-dim (or head-dim
                      (let [shape (second (:type x))]
                        (if (= (count shape) 4) (nth shape 3) 64)))]
-       (apply-rope-single x z h-dim theta-base rotary-dim)))))
+       (apply-rope-single x z h-dim theta-base rotary-dim h-dim)))))
 
 (defn- update-single-cache [cache new-val pos]
   (if (nil? cache)

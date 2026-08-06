@@ -229,7 +229,7 @@
          pl-tok-scaled (* raw-pl-tok (Math/sqrt (double pl-dim)))
          pl-proj-t (transpose per-layer-model-proj-w [1 0])
          pl-context-raw (linear tok-embed pl-proj-t nil)
-         pl-context-scaled (* pl-context-raw (/ 1.0 (Math/sqrt (double hidden-dim))))
+         pl-context-scaled (* pl-context-raw (/ 1.0 (double hidden-dim)))
          pl-tok-4d (reshape pl-tok-scaled [batch seq-len num-layers pl-dim])
          pl-context-4d (reshape pl-context-scaled [batch seq-len num-layers pl-dim])
          pl-context-norm (rms-norm pl-context-4d per-layer-proj-norm-w 1e-6)
@@ -240,7 +240,7 @@
                                (fn [idx lw]
                                  (if (some? (:k-w lw))
                                    lw
-                                   (let [prev-lw (first (filter #(some? (:k-w %)) (subvec (vec layers-weights) 0 idx)))]
+                                   (let [prev-lw (last (filter #(some? (:k-w %)) (subvec (vec layers-weights) 0 idx)))]
                                      (merge lw {:k-w (:k-w prev-lw)
                                                 :v-w (:v-w prev-lw)
                                                 :k-norm-w (:k-norm-w prev-lw)}))))
