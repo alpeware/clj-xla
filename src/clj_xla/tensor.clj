@@ -42,6 +42,8 @@
     :else
     (throw (ex-info "Cannot emit constant for unsupported value" {:value val}))))
 
+(declare broadcast-in-dim)
+
 (defn- broadcast-shapes [shape-a shape-b]
   (let [rank-a (clojure.core/count shape-a)
         rank-b (clojure.core/count shape-b)
@@ -56,9 +58,20 @@
         [t-kw shape-a dtype-a] (:type ta)
         [_ shape-b _] (:type tb)
         out-shape (broadcast-shapes shape-a shape-b)
+        rank-out (count out-shape)
+        ta-bcast (if (= shape-a out-shape)
+                   ta
+                   (let [rank-a (count shape-a)
+                         bcast-dims (vec (map int (range (clojure.core/- rank-out rank-a) rank-out)))]
+                     (broadcast-in-dim ta out-shape bcast-dims)))
+        tb-bcast (if (= shape-b out-shape)
+                   tb
+                   (let [rank-b (count shape-b)
+                         bcast-dims (vec (map int (range (clojure.core/- rank-out rank-b) rank-out)))]
+                     (broadcast-in-dim tb out-shape bcast-dims)))
         out-type [t-kw out-shape dtype-a]
         out-id (gen-var-id! prefix)
-        eqn {:op op-kw :invars [(:id ta) (:id tb)] :outvars [out-id]}]
+        eqn {:op op-kw :invars [(:id ta-bcast) (:id tb-bcast)] :outvars [out-id]}]
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))
     (->Tracer out-id out-type)))

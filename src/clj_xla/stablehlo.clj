@@ -266,8 +266,8 @@
             in-type (get var-types in-var "tensor<1x3x1x128x64xf32>")
             out-type (get var-types out-var "tensor<1x3x3x128x64xf32>")
             bcast-dims (get attrs :broadcast_dimensions [0 1 2 3 4])
-            bcast-str (str/join ", " bcast-dims)]
-        (str "    %" (name out-var) " = \"stablehlo.broadcast_in_dim\"(%" (name in-var) ") {broadcast_dimensions = array<i64: " bcast-str ">} : (" in-type ") -> " out-type))
+            bcast-attr (if (seq bcast-dims) (str "array<i64: " (str/join ", " bcast-dims) ">") "array<i64>")]
+        (str "    %" (name out-var) " = \"stablehlo.broadcast_in_dim\"(%" (name in-var) ") {broadcast_dimensions = " bcast-attr "} : (" in-type ") -> " out-type))
 
       (= op :stablehlo/slice)
       (let [in-var (first invars)

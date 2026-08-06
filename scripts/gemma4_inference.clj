@@ -20,13 +20,14 @@
    :top-k 10
    :backend :cpu
    :precision :bf16
-   :verbose false})
+   :verbose false
+   :quiet false})
 
 (def DEFAULT_MODEL_DIRS
   [".models/gemma-4-E2B-it" ".models/gemma-4-E2B" ".models/gemma-4-E4B-it" ".models/gemma-4-31B-it" ".models/gemma-4"])
 
 (defn parse-cli-args
-  "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k, --backend, --precision, --verbose)."
+  "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k, --backend, --precision, --verbose, --quiet)."
   [args]
   (loop [remaining (vec args)
          opts DEFAULT_CLI_OPTS]
@@ -37,6 +38,10 @@
         (cond
           (and (= flag "--prompt") val)
           (recur (subvec remaining 2) (assoc opts :prompt val))
+
+          (and (or (= flag "--model-dir") (= flag "--model")) val)
+          (let [dir (if (str/starts-with? val ".models/") val (str ".models/" (last (str/split val #"/"))))]
+            (recur (subvec remaining 2) (assoc opts :model-dir dir)))
 
           (and (= flag "--max-new-tokens") val)
           (recur (subvec remaining 2) (assoc opts :max-new-tokens (Long/parseLong val)))
@@ -55,6 +60,9 @@
 
           (= flag "--verbose")
           (recur (subvec remaining 1) (assoc opts :verbose true))
+
+          (= flag "--quiet")
+          (recur (subvec remaining 1) (assoc opts :quiet true))
 
           :else
           (recur (subvec remaining 1) opts))))))
@@ -84,12 +92,13 @@
   "Initializes PJRT runtime, loads safetensors weights, and prepares model configuration for Gemma 4 REPL/CLI sessions."
   ([opts]
    (let [opts (merge DEFAULT_CLI_OPTS opts)
-         {:keys [backend precision]} opts
+         {:keys [backend precision model-dir]} opts
          ctx (xla/init-backend! (or backend :cpu))
-         model-dir (find-model-dir DEFAULT_MODEL_DIRS)
+         dirs (if model-dir (cons model-dir DEFAULT_MODEL_DIRS) DEFAULT_MODEL_DIRS)
+         resolved-model-dir (find-model-dir dirs)
          arena (Arena/ofConfined)
-         weights-mmap (st/map-safetensors-weights model-dir arena)
-         tokenizer (tok/from-file model-dir)
+         weights-mmap (st/map-safetensors-weights resolved-model-dir arena)
+         tokenizer (tok/from-file resolved-model-dir)
          header (or (:header weights-mmap) {})
          prefix-base (if (contains? header "model.language_model.embed_tokens.weight")
                        "model.language_model."
@@ -117,15 +126,17 @@
          weight-dtype (or precision :bf16)
          weight-enum (if (= weight-dtype :f32) 11 13)]
 
-     (println (str "Loaded Gemma 4 model weights from [" model-dir "] in [" (name weight-dtype) "] precision (" num-layers " layers)."))
+     (when-not (:quiet opts)
+       (println (str "Loaded Gemma 4 model weights from [" resolved-model-dir "] in [" (name weight-dtype) "] precision (" num-layers " layers).")))
 
      {:ctx ctx
       :opts opts
-      :model-dir model-dir
+      :model-dir resolved-model-dir
       :tokenizer tokenizer
       :weights-mmap weights-mmap
       :arena arena
-      :config {:prefix-base prefix-base
+      :config {:model-dir resolved-model-dir
+               :prefix-base prefix-base
                :vocab-size vocab-size
                :hidden-dim hidden-dim
                :total-pl-dim total-pl-dim
@@ -194,7 +205,7 @@
   "Traces and JIT-compiles Gemma 4 Single-Pass Prefill and Single-Token Decode StableHLO graphs into PJRT Executables."
   [{:keys [ctx config opts]} prompt-len]
   (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim q-dim kv-dim intermediate-dim head-dim num-layers num-heads num-kv-heads kv-cache-shape weight-dtype]} config
-        {:keys [verbose]} opts
+        {:keys [verbose quiet]} opts
 
         prefill-invars (vec (concat
                              [[:x [:tensor [1 prompt-len] :i32]]
@@ -247,7 +258,7 @@
                                               (range num-layers)
                                               (mapv vec (partition 16 weight-args)))
                                  kv-seq (mapv vec (partition 2 kv-cache-args))
-                                 [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm (vec (range prompt-len)) num-heads num-kv-heads kv-seq 0 {:final-logit-softcap 30.0})
+                                 [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm (vec (range prompt-len)) num-heads num-kv-heads kv-seq 0 {:final-logit-softcap nil})
                                  f32-logits (t/convert logits :f32)]
                              (into [f32-logits] (apply concat updated-kv-caches))))
 
@@ -266,18 +277,18 @@
                                              (range num-layers)
                                              (mapv vec (partition 16 weight-args)))
                                 kv-seq (mapv vec (partition 2 kv-cache-args))
-                                [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads kv-seq pos-tracer {:final-logit-softcap 30.0})
+                                [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads kv-seq pos-tracer {:final-logit-softcap nil})
                                 f32-logits (t/convert logits :f32)]
                             (into [f32-logits] (apply concat updated-kv-caches))))
 
-        _ (println "Tracing & JIT Compiling Gemma 4 Single-Pass Prefill Graph...")
+        _ (when-not quiet (println "Tracing & JIT Compiling Gemma 4 Single-Pass Prefill Graph..."))
         prefill-graph (trace-graph "gemma4_prefill" prefill-invars prefill-trace-fn)
         prefill-exec (xla/compile-graph ctx prefill-graph)
 
-        _ (println "Tracing & JIT Compiling Gemma 4 Single-Token Decoding Graph...")
+        _ (when-not quiet (println "Tracing & JIT Compiling Gemma 4 Single-Token Decoding Graph..."))
         decode-graph (trace-graph "gemma4_decode" decode-invars decode-trace-fn)
         decode-exec (xla/compile-graph ctx decode-graph)
-        _ (println "Successfully compiled StableHLO prefill and decode graphs to native XLA PjRtLoadedExecutable handles.")]
+        _ (when-not quiet (println "Successfully compiled StableHLO prefill and decode graphs to native XLA PjRtLoadedExecutable handles."))]
 
     (when verbose
       (println "\n==================================================================")
@@ -297,7 +308,7 @@
   [{:keys [ctx tokenizer config opts]} executables device-weights initial-kv-bufs prompt-ids]
   (let [prompt-len (count prompt-ids)
         {:keys [vocab-size]} config
-        {:keys [temperature top-k]} opts
+        {:keys [temperature top-k quiet]} opts
         {:keys [prefill-exec]} executables
         prompt-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array prompt-ids) [1 prompt-len] 4)
         pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array (range prompt-len)) [prompt-len] 4)
@@ -310,9 +321,10 @@
         last-logits (xla/to-host-slice prefill-logits-buf (dec prompt-len) vocab-size (* prompt-len vocab-size))
         indexed (map-indexed vector (vec last-logits))
         top-10 (take 10 (sort-by second > indexed))
-        _ (do (println "\n=== Top 10 Prefill Predicted Tokens ===")
-              (doseq [[id logit] top-10]
-                (println (format "  token %6d | logit: %8.4f | text: %s" id logit (pr-str (decode tokenizer [id]))))))
+        _ (when-not quiet
+            (println "\n=== Top 10 Prefill Predicted Tokens ===")
+            (doseq [[id logit] top-10]
+              (println (format "  token %6d | logit: %8.4f | text: %s" id logit (pr-str (decode tokenizer [id]))))))
         first-gen-tok (sampling/sample-logits last-logits {:temperature temperature :top-k top-k})]
     {:first-gen-tok first-gen-tok
      :prefill-kv-bufs prefill-kv-bufs
@@ -321,7 +333,7 @@
 (defn run-autoregressive-decode
   "Runs the single-token autoregressive decoding loop."
   [{:keys [ctx tokenizer config opts]} executables device-weights prefill-result]
-  (let [{:keys [max-new-tokens temperature top-k]} opts
+  (let [{:keys [max-new-tokens temperature top-k quiet]} opts
         {:keys [vocab-size]} config
         {:keys [decode-exec]} executables
         {:keys [first-gen-tok prefill-kv-bufs prompt-ids]} prefill-result
@@ -330,7 +342,7 @@
     (print (decode tokenizer [first-gen-tok]))
     (flush)
     (if (= first-gen-tok eos)
-      (do (println "\nReached EOS token.")
+      (do (when-not quiet (println "\nReached EOS token."))
           (vec prompt-ids))
       (loop [context (conj (vec prompt-ids) first-gen-tok)
              current-kv-bufs prefill-kv-bufs
@@ -352,7 +364,7 @@
                 next-context (conj context next-tok)]
             (print (decode tokenizer [next-tok]))
             (flush)
-            (if (= next-tok eos)
+            (if (or (= next-tok eos) (= next-tok 106))
               next-context
               (recur next-context updated-kv-bufs (inc pos) (inc step)))))))))
 
@@ -361,9 +373,12 @@
   ([session] (generate-text session (or (:prompt (:opts session)) "The capital of France is")))
   ([session prompt-text]
    (let [{:keys [tokenizer opts]} session
-         {:keys [max-new-tokens temperature top-k]} opts
+         {:keys [max-new-tokens temperature top-k quiet]} opts
          clean-prompt (str/replace prompt-text #"\\n" "\n")
-         prompt-ids (if (clojure.string/includes? clean-prompt "<|turn>")
+         model-dir (get-in session [:config :model-dir] "")
+         is-it-model? (or (str/includes? model-dir "-it") (str/includes? clean-prompt "<|turn>"))
+         prompt-ids (cond
+                      (str/includes? clean-prompt "<|turn>")
                       ;; Parse raw control string into special token IDs
                       (let [parts (clojure.string/split clean-prompt #"(?=<\|turn>)|(?<=<\|turn>)|(?=<turn\|>)|(?<=<turn\|>)")
                             toks (mapcat (fn [p]
@@ -373,36 +388,48 @@
                                              :else (encode tokenizer p)))
                                          parts)]
                         (into [(bos-id tokenizer)] toks))
-                      ;; Wrap plain question/prompt into Gemma 4 Turn Template
-                      (into [(bos-id tokenizer) 105 2364 107]
-                            (concat (encode tokenizer clean-prompt) [106 107 105 4368 107])))
-         prompt-len (count prompt-ids)]
-     (println (format "Prompt: \"%s\"" clean-prompt))
-     (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d, precision=%s"
-                      max-new-tokens temperature top-k (name (get-in session [:config :weight-dtype]))))
-     (println (format "Encoded Token IDs (%d tokens): %s" prompt-len prompt-ids))
 
-     (println "Transferring Gemma 4 model weights to PJRT Device Memory...")
+                      is-it-model?
+                      ;; Wrap plain question/prompt into Gemma 4 IT Turn Template
+                      (into [(bos-id tokenizer) 105 2364 107]
+                            (concat (encode tokenizer clean-prompt) [106 107 105 4368 107]))
+
+                      :else
+                      ;; Base Pretrained model (e.g. google/gemma-4-E2B): direct prompt completion
+                      (into [(bos-id tokenizer)] (encode tokenizer clean-prompt)))
+         prompt-len (count prompt-ids)]
+     (when-not quiet
+       (println (format "Prompt: \"%s\"" clean-prompt))
+       (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d, precision=%s"
+                        max-new-tokens temperature top-k (name (get-in session [:config :weight-dtype]))))
+       (println (format "Encoded Token IDs (%d tokens): %s" prompt-len prompt-ids)))
+
+     (when-not quiet (println "Transferring Gemma 4 model weights to PJRT Device Memory..."))
      (let [device-weights (allocate-device-weights session)
            initial-kv-bufs (allocate-kv-caches session)
            executables (compile-inference-executables session prompt-len)]
-       (println "\nGenerating tokens autoregressively with Gemma 4 Single-Pass Prefill...")
-       (print clean-prompt)
-       (flush)
+       (when-not quiet
+         (println "\nGenerating tokens autoregressively with Gemma 4 Single-Pass Prefill...")
+         (print clean-prompt)
+         (flush))
        (let [prefill-res (run-prompt-prefill session executables device-weights initial-kv-bufs prompt-ids)
              final-context (run-autoregressive-decode session executables device-weights prefill-res)]
-         (println "\n\n==================================================================")
-         (println "=== End-to-End Gemma 4 Single-Pass Prefill Verification Passed! ===")
-         (println "==================================================================")
+         (if quiet
+           (println)
+           (do
+             (println "\n\n==================================================================")
+             (println "=== End-to-End Gemma 4 Single-Pass Prefill Verification Passed! ===")
+             (println "==================================================================")))
          final-context)))))
 
 (defn -main
   "CLI entrypoint for Gemma 4 text generation."
   [& args]
   (let [opts (parse-cli-args args)]
-    (println "==================================================================")
-    (println "  clj-xla Gemma 4 E2B Single-Pass Prefill & BF16 Generation ")
-    (println "==================================================================")
+    (when-not (:quiet opts)
+      (println "==================================================================")
+      (println "  clj-xla Gemma 4 E2B Single-Pass Prefill & BF16 Generation ")
+      (println "=================================================================="))
     (let [session (init-inference-session opts)]
       (generate-text session (:prompt opts)))))
 

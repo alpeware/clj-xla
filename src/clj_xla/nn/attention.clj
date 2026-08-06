@@ -29,7 +29,7 @@
              freqs-const (clj-xla.tensor/emit-constant! [[[[freqs-vec]]]] [:tensor [1 1 1 half-dim] :f32])
              pos-f32 (convert pos-offset :f32)
              pos-shape (second (:type pos-f32))
-             s-len (or (first pos-shape) 1)
+             s-len (if (= (count pos-shape) 2) (second pos-shape) (first pos-shape))
              pos-4d (reshape pos-f32 [1 1 s-len 1])
              angles (* pos-4d freqs-const)
              cos-half (cos angles)

@@ -123,7 +123,10 @@
                  per-layer-gate-w per-layer-proj-w post-per-layer-norm-w
                  per-layer-input]
           :or {theta-base 10000.0 attn-softcap 50.0}} weights
-         norm-fn (if (some? per-layer-input) rms-norm gemma-rms-norm)
+         norm-fn (or (:norm-fn weights)
+                     (if (or (some? per-layer-input) (some? per-layer-gate-w) (some? q-norm-w))
+                       rms-norm
+                       gemma-rms-norm))
          ;; Attention Sub-block
          x-norm1 (norm-fn x input-ln-w 1e-6)
          attn-opts {:q-norm-w q-norm-w
@@ -140,10 +143,7 @@
          x-res1 (+ x attn-normed)
 
          ;; MLP Sub-block
-         x-norm2 (cond
-                   pre-mlp-ln-w (norm-fn x-res1 pre-mlp-ln-w 1e-6)
-                   post-attn-ln-w (norm-fn x-res1 post-attn-ln-w 1e-6)
-                   :else x-res1)
+         x-norm2 (if (some? pre-mlp-ln-w) (norm-fn x-res1 pre-mlp-ln-w 1e-6) x-res1)
          mlp-raw (gemma-mlp x-norm2 gate-w up-w down-w)
          mlp-normed (if post-mlp-ln-w (norm-fn mlp-raw post-mlp-ln-w 1e-6) mlp-raw)
          x-res2 (+ x-res1 mlp-normed)
@@ -229,7 +229,7 @@
          pl-tok-scaled (* raw-pl-tok (Math/sqrt (double pl-dim)))
          pl-proj-t (transpose per-layer-model-proj-w [1 0])
          pl-context-raw (linear tok-embed pl-proj-t nil)
-         pl-context-scaled (* pl-context-raw (/ 1.0 (double hidden-dim)))
+         pl-context-scaled (* pl-context-raw (/ 1.0 (Math/sqrt (double hidden-dim))))
          pl-tok-4d (reshape pl-tok-scaled [batch seq-len num-layers pl-dim])
          pl-context-4d (reshape pl-context-scaled [batch seq-len num-layers pl-dim])
          pl-context-norm (rms-norm pl-context-4d per-layer-proj-norm-w 1e-6)
@@ -268,7 +268,7 @@
          normed (rms-norm x-out final-norm-w 1e-6)
          embed-t (transpose embed-tokens [1 0])
          raw-logits (linear normed embed-t nil)
-         final-softcap (get opts :final-logit-softcap 30.0)
+         final-softcap (get opts :final-logit-softcap nil)
          capped-logits (if (and (number? final-softcap) (pos? final-softcap))
                          (* final-softcap (tanh (/ raw-logits final-softcap)))
                          raw-logits)]
