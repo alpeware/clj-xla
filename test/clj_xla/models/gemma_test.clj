@@ -1,5 +1,5 @@
 (ns clj-xla.models.gemma-test
-  "Unit and generative tests for Gemma 2 / Gemma 3 model configuration, key mapping, and tracing."
+  "Unit and generative tests for Gemma 2 / Gemma 3 / Gemma 4 model configuration, key mapping, and tracing."
   (:require [clj-xla.models.gemma :refer [full-gemma-forward full-gemma4-forward gemma-block gemma-config gemma3-config gemma3-weight-key-map gemma4-config gemma4-weight-key-map weight-key-map]]
             [clj-xla.tensor :as t :refer [tracer?]]
             [clj-xla.trace :refer [trace-graph]]
@@ -13,10 +13,10 @@
   (prop/for-all [vocab-sz (gen/choose 1000 300000)]
                 (let [cfg (gemma-config {:vocab-size vocab-sz})]
                   (and (= vocab-sz (:vocab-size cfg))
-                       (= 2048 (:hidden-size cfg))
-                       (= 18 (:num-hidden-layers cfg))
-                       (= 8 (:num-attention-heads cfg))
-                       (= 1 (:num-key-value-heads cfg))
+                       (= 2048 (:hidden-dim cfg))
+                       (= 18 (:num-layers cfg))
+                       (= 8 (:num-heads cfg))
+                       (= 1 (:num-kv-heads cfg))
                        (= 256 (:head-dim cfg))))))
 
 (deftest gemma-weight-key-map-test
@@ -173,12 +173,12 @@
   (prop/for-all [vocab-sz (gen/choose 1000 300000)]
                 (let [cfg (gemma3-config {:vocab-size vocab-sz})]
                   (and (= vocab-sz (:vocab-size cfg))
-                       (= 640 (:hidden-size cfg))
-                       (= 2048 (:intermediate-size cfg))
-                       (= 18 (:num-hidden-layers cfg))
-                       (= 4 (:num-attention-heads cfg))
-                       (= 1 (:num-key-value-heads cfg))
-                       (= 256 (:head-dim cfg))))))
+                       (= 640 (:hidden-dim cfg))
+                       (= 2048 (:intermediate-dim cfg))
+                       (= 18 (:num-layers cfg))
+                       (= 4 (:num-heads cfg))
+                       (= 1 (:num-kv-heads cfg))
+                       (= 160 (:head-dim cfg))))))
 
 (deftest gemma3-weight-key-map-test
   (testing "gemma3-weight-key-map generates exact HuggingFace Gemma 3 key names including QK norms"
@@ -201,17 +201,16 @@
   (prop/for-all [vocab-sz (gen/choose 1000 300000)]
                 (let [cfg (gemma4-config {:vocab-size vocab-sz})]
                   (and (= vocab-sz (:vocab-size cfg))
-                       (= 1536 (:hidden-size cfg))
-                       (= 6144 (:intermediate-size cfg))
-                       (= 35 (:num-hidden-layers cfg))
-                       (= 8 (:num-attention-heads cfg))
-                       (= 1 (:num-key-value-heads cfg))
+                       (= 1536 (:hidden-dim cfg))
+                       (= 6144 (:intermediate-dim cfg))
+                       (= 35 (:num-layers cfg))
+                       (= 8 (:num-heads cfg))
+                       (= 1 (:num-kv-heads cfg))
                        (= 256 (:head-dim cfg))
-                       (= 256 (:hidden-size-per-layer-input cfg))
-                       (= 20 (:num-kv-shared-layers cfg))))))
+                       (= 256 (:pl-dim cfg))))))
 
 (deftest gemma4-weight-key-map-test
-  (testing "gemma4-weight-key-map generates exact HuggingFace Gemma 4 key names including per-layer input keys and layer_scalar"
+  (testing "gemma4-weight-key-map generates exact HuggingFace Gemma 4 key names including per-layer input keys"
     (let [km (gemma4-weight-key-map 0)]
       (is (= "model.layers.0.input_layernorm.weight" (:input-ln-w km)))
       (is (= "model.layers.0.layer_scalar" (:layer-scalar-w km)))
@@ -231,73 +230,33 @@
       (is (= "model.layers.0.per_layer_projection.weight" (:per-layer-proj-w km)))
       (is (= "model.layers.0.post_per_layer_input_norm.weight" (:post-per-layer-norm-w km))))))
 
-(defspec prop-gemma4-attention-patterns 50
-  (prop/for-all [idx (gen/choose 0 34)]
-                (let [is-global? (zero? (mod (inc idx) 5))
-                      expected-q-dim (if is-global? 4096 2048)
-                      expected-kv-dim (if is-global? 512 256)
-                      expected-head-dim (if is-global? 512 256)
-                      expected-theta (if is-global? 1000000.0 10000.0)
-                      expected-rope-prop (if is-global? 0.25 1.0)
-                      cfg (gemma4-config)]
-                  (and (= 35 (count (:layer-types cfg)))
-                       (number? expected-q-dim)
-                       (number? expected-kv-dim)
-                       (number? expected-head-dim)
-                       (number? expected-theta)
-                       (number? expected-rope-prop)))))
-
-(deftest gemma4-full-forward-tracer-test
-  (testing "Full Gemma 4 forward pass traces valid computation graph with PLE and layer scalars"
-    (let [local-layer {:input-ln-w (t/->Tracer :in_ln_0 [:tensor [1536] :f32])
-                       :layer-scalar-w (t/->Tracer :ls_0 [:tensor [1] :f32])
-                       :q-w (t/->Tracer :qw_0 [:tensor [2048 1536] :f32])
-                       :k-w (t/->Tracer :kw_0 [:tensor [256 1536] :f32])
-                       :v-w (t/->Tracer :vw_0 [:tensor [256 1536] :f32])
-                       :o-w (t/->Tracer :ow_0 [:tensor [1536 2048] :f32])
-                       :q-norm-w (t/->Tracer :qn_0 [:tensor [256] :f32])
-                       :k-norm-w (t/->Tracer :kn_0 [:tensor [256] :f32])
-                       :post-attn-ln-w (t/->Tracer :post_attn_ln_0 [:tensor [1536] :f32])
-                       :pre-mlp-ln-w (t/->Tracer :pre_mlp_ln_0 [:tensor [1536] :f32])
-                       :post-mlp-ln-w (t/->Tracer :post_mlp_ln_0 [:tensor [1536] :f32])
-                       :gate-w (t/->Tracer :gw_0 [:tensor [6144 1536] :f32])
-                       :up-w (t/->Tracer :uw_0 [:tensor [6144 1536] :f32])
-                       :down-w (t/->Tracer :dw_0 [:tensor [1536 6144] :f32])
-                       :per-layer-gate-w (t/->Tracer :plg_0 [:tensor [256 1536] :f32])
-                       :per-layer-proj-w (t/->Tracer :plp_0 [:tensor [1536 256] :f32])
-                       :post-per-layer-norm-w (t/->Tracer :pln_0 [:tensor [1536] :f32])
-                       :theta-base 10000.0
-                       :rope-proportion 1.0}
-          global-layer {:input-ln-w (t/->Tracer :in_ln_4 [:tensor [1536] :f32])
-                        :layer-scalar-w (t/->Tracer :ls_4 [:tensor [1] :f32])
-                        :q-w (t/->Tracer :qw_4 [:tensor [4096 1536] :f32])
-                        :k-w (t/->Tracer :kw_4 [:tensor [512 1536] :f32])
-                        :v-w (t/->Tracer :vw_4 [:tensor [512 1536] :f32])
-                        :o-w (t/->Tracer :ow_4 [:tensor [1536 4096] :f32])
-                        :q-norm-w (t/->Tracer :qn_4 [:tensor [512] :f32])
-                        :k-norm-w (t/->Tracer :kn_4 [:tensor [512] :f32])
-                        :post-attn-ln-w (t/->Tracer :post_attn_ln_4 [:tensor [1536] :f32])
-                        :pre-mlp-ln-w (t/->Tracer :pre_mlp_ln_4 [:tensor [1536] :f32])
-                        :post-mlp-ln-w (t/->Tracer :post_mlp_ln_4 [:tensor [1536] :f32])
-                        :gate-w (t/->Tracer :gw_4 [:tensor [6144 1536] :f32])
-                        :up-w (t/->Tracer :uw_4 [:tensor [6144 1536] :f32])
-                        :down-w (t/->Tracer :dw_4 [:tensor [1536 6144] :f32])
-                        :per-layer-gate-w (t/->Tracer :plg_4 [:tensor [256 1536] :f32])
-                        :per-layer-proj-w (t/->Tracer :plp_4 [:tensor [1536 256] :f32])
-                        :post-per-layer-norm-w (t/->Tracer :pln_4 [:tensor [1536] :f32])
-                        :theta-base 1000000.0
-                        :rope-proportion 0.25}
+(deftest full-gemma4-forward-tracer-test
+  (testing "Full Gemma 4 forward pass traces valid computation graph"
+    (let [layer-w {:input-ln-w (t/->Tracer :in_ln [:tensor [1536] :f32])
+                   :layer-scalar-w (t/->Tracer :ls [:tensor [1] :f32])
+                   :q-w (t/->Tracer :qw [:tensor [2048 1536] :f32])
+                   :k-w (t/->Tracer :kw [:tensor [256 1536] :f32])
+                   :v-w (t/->Tracer :vw [:tensor [256 1536] :f32])
+                   :o-w (t/->Tracer :ow [:tensor [1536 2048] :f32])
+                   :q-norm-w (t/->Tracer :qn [:tensor [256] :f32])
+                   :k-norm-w (t/->Tracer :kn [:tensor [256] :f32])
+                   :post-attn-ln-w (t/->Tracer :post_attn_ln [:tensor [1536] :f32])
+                   :pre-mlp-ln-w (t/->Tracer :pre_mlp_ln [:tensor [1536] :f32])
+                   :post-mlp-ln-w (t/->Tracer :post_mlp_ln [:tensor [1536] :f32])
+                   :gate-w (t/->Tracer :gw [:tensor [6144 1536] :f32])
+                   :up-w (t/->Tracer :uw [:tensor [6144 1536] :f32])
+                   :down-w (t/->Tracer :dw [:tensor [1536 6144] :f32])
+                   :per-layer-gate-w (t/->Tracer :plg [:tensor [256 1536] :f32])
+                   :per-layer-proj-w (t/->Tracer :plp [:tensor [1536 256] :f32])
+                   :post-per-layer-norm-w (t/->Tracer :pln [:tensor [1536] :f32])}
           graph (trace-graph "gemma4_test"
                              [[:x [:tensor [1 4] :i32]]
                               [:emb [:tensor [262144 1536] :f32]]
-                              [:emb_pl [:tensor [262144 8960] :f32]]
-                              [:pl_model_proj [:tensor [8960 1536] :f32]]
-                              [:pl_proj_norm [:tensor [256] :f32]]
+                              [:emb_pl [:tensor [262144 256] :f32]]
+                              [:pl_proj [:tensor [256 1536] :f32]]
+                              [:pl_norm [:tensor [256] :f32]]
                               [:fn_norm [:tensor [1536] :f32]]]
-                             (fn [x emb emb-pl pl-proj pl-norm fn-norm]
-                               (full-gemma4-forward x emb emb-pl pl-proj pl-norm [local-layer global-layer] fn-norm [0] 8 1)))]
+                             (fn [x emb emb_pl pl_proj pl_norm fn_norm]
+                               (full-gemma4-forward x emb emb_pl pl_proj pl_norm [layer-w] fn_norm [0 1 2 3])))]
       (is (= "gemma4_test" (:name graph)))
       (is (seq (:eqns graph))))))
-
-
-

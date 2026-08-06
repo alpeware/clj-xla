@@ -2,6 +2,7 @@
   "Top-level runnable integration script and REPL API for end-to-end Gemma 4 text generation via pure XLA execution."
   (:require [clj-xla.core :as xla]
             [clj-xla.models.gemma :as gemma]
+            [clj-xla.nn.norm :as norm]
             [clj-xla.safetensors :as st]
             [clj-xla.sampling :as sampling]
             [clj-xla.tensor :as t]
@@ -268,6 +269,7 @@
                                                  :num-heads 8 :num-kv-heads 1
                                                  :theta-base (if (zero? (mod (inc i) 5)) 1000000.0 10000.0)
                                                  :rope-proportion (if (zero? (mod (inc i) 5)) 0.25 1.0)
+                                                 :norm-fn norm/rms-norm
                                                  :attn-softcap nil})
                                               (range num-layers)
                                               (mapv vec (partition 17 weight-args)))
@@ -289,6 +291,7 @@
                                                 :num-heads 8 :num-kv-heads 1
                                                 :theta-base (if (zero? (mod (inc i) 5)) 1000000.0 10000.0)
                                                 :rope-proportion (if (zero? (mod (inc i) 5)) 0.25 1.0)
+                                                :norm-fn clj-xla.nn.norm/rms-norm
                                                 :attn-softcap nil})
                                              (range num-layers)
                                              (mapv vec (partition 17 weight-args)))
