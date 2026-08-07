@@ -9,6 +9,9 @@
   (if (str/blank? text)
     []
     (let [sp-text (str/replace text " " "\u2581")
+          sp-text (if (str/starts-with? sp-text "\u2581")
+                    sp-text
+                    (str "\u2581" sp-text))
           len (count sp-text)]
       (loop [idx 0
              acc []]

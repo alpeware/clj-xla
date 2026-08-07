@@ -106,15 +106,25 @@
 
 (defn load-weight-buffer
   "Loads a single weight tensor from `weights-mmap` into PJRT device memory in specified precision."
-  [ctx weights-mmap tensor-name shape _weight-dtype weight-enum]
-  (if (or (zero? (reduce * 1 shape))
-          (not (or (contains? (:header weights-mmap) tensor-name)
-                   (contains? (:tensors weights-mmap) tensor-name))))
-    (let [num-elements (reduce * 1 shape)
-          zero-data (if (= weight-enum 11) (float-array num-elements) (short-array num-elements))]
-      (xla/buffer-from-host-buffer ctx (:client ctx) zero-data shape weight-enum))
-    (let [slice (st/get-tensor-slice weights-mmap tensor-name)]
-      (xla/buffer-from-host-buffer ctx (:client ctx) slice shape weight-enum))))
+  ([ctx weights-mmap tensor-name shape weight-dtype weight-enum]
+   (load-weight-buffer ctx weights-mmap tensor-name shape weight-dtype weight-enum 0.0))
+  ([ctx weights-mmap tensor-name shape _weight-dtype weight-enum default-val]
+   (if (or (zero? (reduce * 1 shape))
+           (not (or (contains? (:header weights-mmap) tensor-name)
+                    (contains? (:tensors weights-mmap) tensor-name))))
+     (let [num-elements (reduce * 1 shape)
+           default-f (float default-val)
+           data (if (= weight-enum 11)
+                  (let [arr (float-array num-elements)]
+                    (java.util.Arrays/fill arr default-f)
+                    arr)
+                  (let [arr (short-array num-elements)
+                        bf-bits (short (bit-shift-right (Float/floatToRawIntBits default-f) 16))]
+                    (java.util.Arrays/fill arr bf-bits)
+                    arr))]
+       (xla/buffer-from-host-buffer ctx (:client ctx) data shape weight-enum))
+     (let [slice (st/get-tensor-slice weights-mmap tensor-name)]
+       (xla/buffer-from-host-buffer ctx (:client ctx) slice shape weight-enum)))))
 
 (defn init-inference-session
   "Initializes PJRT runtime, loads safetensors weights, and prepares model configuration for Gemma 4 REPL/CLI sessions."
@@ -134,7 +144,7 @@
          model-cfg (load-model-config resolved-model-dir)
          text-cfg (or (:text_config model-cfg) model-cfg)
          layer-types-cfg (:layer_types text-cfg)
-         num-kv-shared-layers (or (:num_kv_shared_layers text-cfg) 20)
+         num-kv-shared-layers (or (:num_kv_shared_layers text-cfg) 0)
 
          emb-shape (get-in header [(str prefix-base "embed_tokens.weight") "shape"] [262144 1536])
          emb-pl-shape (get-in header [(str prefix-base "embed_tokens_per_layer.weight") "shape"] [262144 0])
@@ -211,7 +221,9 @@
   "Transfers all model layer, embedding, and per-layer input weights to PJRT device memory."
   [{:keys [ctx weights-mmap config]}]
   (let [{:keys [prefix-base vocab-size hidden-dim total-pl-dim pl-dim num-layers weight-dtype weight-enum layer-configs]} config
-        load-fn (fn [name shape] (load-weight-buffer ctx weights-mmap name shape weight-dtype weight-enum))
+        load-fn (fn
+                  ([name shape] (load-weight-buffer ctx weights-mmap name shape weight-dtype weight-enum 0.0))
+                  ([name shape default-val] (load-weight-buffer ctx weights-mmap name shape weight-dtype weight-enum default-val)))
         embed-buf (load-fn (str prefix-base "embed_tokens.weight") [vocab-size hidden-dim])
         embed-pl-buf (load-fn (str prefix-base "embed_tokens_per_layer.weight") [vocab-size total-pl-dim])
         pl-model-proj-buf (load-fn (str prefix-base "per_layer_model_projection.weight") [total-pl-dim hidden-dim])
@@ -220,12 +232,16 @@
         layer-bufs (mapv (fn [i]
                            (let [kmap (gemma/gemma4-weight-key-map i (str prefix-base "layers."))
                                  cfg (nth layer-configs i)
-                                 {:keys [q-dim kv-dim head-dim mlp-dim]} cfg]
+                                 {:keys [q-dim kv-dim head-dim mlp-dim]} cfg
+                                 v-key (if (or (contains? (:header weights-mmap) (:v-w kmap))
+                                               (contains? (:tensors weights-mmap) (:v-w kmap)))
+                                         (:v-w kmap)
+                                         (:k-w kmap))]
                              [(load-fn (:input-ln-w kmap) [hidden-dim])
-                              (load-fn (:layer-scalar-w kmap) [1])
+                              (load-fn (:layer-scalar-w kmap) [1] 1.0)
                               (load-fn (:q-w kmap) [q-dim hidden-dim])
                               (load-fn (:k-w kmap) [kv-dim hidden-dim])
-                              (load-fn (:v-w kmap) [kv-dim hidden-dim])
+                              (load-fn v-key [kv-dim hidden-dim])
                               (load-fn (:o-w kmap) [hidden-dim q-dim])
                               (load-fn (:q-norm-w kmap) [head-dim])
                               (load-fn (:k-norm-w kmap) [head-dim])
@@ -316,7 +332,7 @@
                                                    :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
                                                    :gate-w gw :up-w uw :down-w dw
                                                    :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
-                                                   :num-heads num-heads :num-kv-heads num-kv-heads
+                                                   :num-heads num-heads :num-kv-heads (:num-kv-heads cfg)
                                                    :theta-base (:theta-base cfg)
                                                    :rope-proportion (:rope-proportion cfg)
                                                    :norm-fn norm/rms-norm

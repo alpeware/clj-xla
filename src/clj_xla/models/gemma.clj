@@ -109,9 +109,10 @@
                 DEFAULT_GEMMA4_E2B_CONFIG)]
      (merge base overrides))))
 
-(defn embed-lookup [x embed-tokens _hidden-dim]
+(defn embed-lookup [x embed-tokens hidden-dim]
   (let [raw-embed (gather embed-tokens x)
-        scale (Math/sqrt 1536.0)]
+        h-dim (or hidden-dim (second (:type embed-tokens)) 1536)
+        scale (Math/sqrt (double h-dim))]
     (* raw-embed scale)))
 
 (defn gemma-mlp
@@ -273,7 +274,7 @@
    (let [[_ [batch seq-len] _] (:type x)
          [_ [_vocab-size hidden-dim] _] (:type embed-tokens)
          num-layers (count layers-weights)
-         num-kv-shared (or (:num-kv-shared-layers opts) 20)
+         num-kv-shared (or (:num-kv-shared-layers opts) 0)
          num-unshared (- num-layers num-kv-shared)
          tok-embed (embed-lookup x embed-tokens hidden-dim)
          ;; Compute PLE (Per-Layer Embedding) representation if pl-dim > 0
