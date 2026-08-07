@@ -44,6 +44,7 @@
    :vocab-size 262144
    :norm-eps 1e-6
    :final-logit-softcap 30.0
+   :num-kv-shared-layers 20
    :layer-types ["sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"
                  "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"
                  "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"
@@ -51,6 +52,21 @@
                  "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"
                  "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"
                  "sliding_attention" "sliding_attention" "sliding_attention" "sliding_attention" "full_attention"]})
+
+(def DEFAULT_GEMMA4_E4B_CONFIG
+  {:hidden-dim 2560
+   :intermediate-dim 10240
+   :pl-dim 256
+   :total-pl-dim 10752 ;; 42 * 256
+   :num-layers 42
+   :num-heads 8
+   :num-kv-heads 2
+   :head-dim 256
+   :global-head-dim 512
+   :vocab-size 262144
+   :norm-eps 1e-6
+   :final-logit-softcap 30.0
+   :num-kv-shared-layers 18})
 
 (defn gemma-config
   "Returns Gemma 1/2 configuration map with optional custom overrides."
@@ -63,9 +79,18 @@
   ([overrides] (merge DEFAULT_GEMMA3_270M_CONFIG overrides)))
 
 (defn gemma4-config
-  "Returns Gemma 4 configuration map with optional custom overrides."
-  ([] DEFAULT_GEMMA4_E2B_CONFIG)
-  ([overrides] (merge DEFAULT_GEMMA4_E2B_CONFIG overrides)))
+  "Returns Gemma 4 configuration map for the specified variant (e.g. :e2b, :e4b) with optional custom overrides."
+  ([] (gemma4-config :e2b {}))
+  ([variant-or-overrides]
+   (if (keyword? variant-or-overrides)
+     (gemma4-config variant-or-overrides {})
+     (gemma4-config :e2b variant-or-overrides)))
+  ([variant overrides]
+   (let [base (case variant
+                :e4b DEFAULT_GEMMA4_E4B_CONFIG
+                :e2b DEFAULT_GEMMA4_E2B_CONFIG
+                DEFAULT_GEMMA4_E2B_CONFIG)]
+     (merge base overrides))))
 
 (defn embed-lookup [x embed-tokens _hidden-dim]
   (let [raw-embed (gather embed-tokens x)
@@ -228,6 +253,8 @@
    (let [[_ [batch seq-len] _] (:type x)
          [_ [_vocab-size hidden-dim] _] (:type embed-tokens)
          num-layers (count layers-weights)
+         num-kv-shared (or (:num-kv-shared-layers opts) 20)
+         num-unshared (- num-layers num-kv-shared)
          tok-embed (embed-lookup x embed-tokens hidden-dim)
          ;; Compute PLE (Per-Layer Embedding) representation
          raw-pl-tok (gather embed-per-layer x)
@@ -243,8 +270,9 @@
          layers-with-ple (mapv (fn [i lw]
                                  (let [pl-slice (slice ple-all [0 0 i 0] [batch seq-len (inc i) pl-dim] [1 1 1 1])
                                        pl-input (reshape pl-slice [batch seq-len pl-dim])
-                                       is-global? (zero? (mod (inc i) 5))
-                                       l-type (if is-global? :full_attention :sliding_attention)]
+                                       l-type (or (:layer-type lw)
+                                                  (if (:is-global? lw) :full_attention nil)
+                                                  (if (zero? (mod (inc i) 5)) :full_attention :sliding_attention))]
                                    (assoc lw :per-layer-input pl-input :norm-fn rms-norm :layer-type l-type :layer-idx i)))
                                (range num-layers)
                                layers-weights)
@@ -256,7 +284,9 @@
                    (let [l-nh (or (:num-heads layer-w) num-heads)
                          l-nkv (or (:num-kv-heads layer-w) num-kv-heads)
                          l-type (:layer-type layer-w)
-                         is-shared? (>= i 15)
+                         is-shared? (if (contains? layer-w :is-shared?)
+                                      (:is-shared? layer-w)
+                                      (>= i num-unshared))
                          kv-to-pass (if is-shared? (get shared-kv-store l-type) nil)
                          w-with-kv (assoc layer-w :shared-kv kv-to-pass :return-shared-kv? true)
                          [h-next new-kv computed-kv] (if use-kv?

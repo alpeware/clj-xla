@@ -9,6 +9,7 @@
             [clj-xla.tokenizer.core :as tok]
             [clj-xla.tokenizer.protocol :refer [bos-id decode encode eos-id]]
             [clj-xla.trace :refer [trace-graph]]
+            [clojure.data.json :as json]
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [clojure.string :as str])
@@ -25,10 +26,20 @@
    :quiet false})
 
 (def DEFAULT_MODEL_DIRS
-  [".models/gemma-4-E2B-it" ".models/gemma-4-E2B" ".models/gemma-4-E4B-it" ".models/gemma-4-31B-it" ".models/gemma-4"])
+  [".models/gemma-4-E4B-it"
+   ".models/gemma-4-E4B"
+   ".models/gemma-4-E2B-it"
+   ".models/gemma-4-E2B"
+   ".models/gemma-4-12B-it"
+   ".models/gemma-4-12B"
+   ".models/gemma-4-26B-A4B-it"
+   ".models/gemma-4-26B-A4B"
+   ".models/gemma-4-31B-it"
+   ".models/gemma-4-31B"
+   ".models/gemma-4"])
 
 (defn parse-cli-args
-  "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k, --backend, --precision, --verbose, --quiet)."
+  "Parses command-line flags (--prompt, --model/--model-dir, --max-new-tokens, --temperature, --top-k, --backend, --precision, --verbose, --quiet)."
   [args]
   (loop [remaining (vec args)
          opts DEFAULT_CLI_OPTS]
@@ -40,7 +51,7 @@
           (and (= flag "--prompt") val)
           (recur (subvec remaining 2) (assoc opts :prompt val))
 
-          (and (or (= flag "--model-dir") (= flag "--model")) val)
+          (and (or (= flag "--model-dir") (= flag "--model") (= flag "--model-name") (= flag "-m")) val)
           (let [dir (if (str/starts-with? val ".models/") val (str ".models/" (last (str/split val #"/"))))]
             (recur (subvec remaining 2) (assoc opts :model-dir dir)))
 
@@ -84,6 +95,15 @@
        (throw (ex-info (str "Model directory with safetensors not found in candidates: " (vec model-dirs))
                        {:searched-dirs model-dirs}))))))
 
+(defn load-model-config
+  "Loads model configuration map from `config.json` if available."
+  [model-dir]
+  (let [cfg-file (io/file model-dir "config.json")]
+    (when (.exists cfg-file)
+      (try
+        (json/read-str (slurp cfg-file) :key-fn keyword)
+        (catch Exception _ nil)))))
+
 (defn load-weight-buffer
   "Loads a single weight tensor from `weights-mmap` into PJRT device memory in specified precision."
   [ctx weights-mmap tensor-name shape _weight-dtype weight-enum]
@@ -105,31 +125,57 @@
          prefix-base (if (contains? header "model.language_model.embed_tokens.weight")
                        "model.language_model."
                        "model.")
+         model-cfg (load-model-config resolved-model-dir)
+         text-cfg (or (:text_config model-cfg) model-cfg)
+         layer-types-cfg (:layer_types text-cfg)
+         num-kv-shared-layers (or (:num_kv_shared_layers text-cfg) 20)
+
          emb-shape (get-in header [(str prefix-base "embed_tokens.weight") "shape"] [262144 1536])
          emb-pl-shape (get-in header [(str prefix-base "embed_tokens_per_layer.weight") "shape"] [262144 8960])
-         q-shape (get-in header [(str prefix-base "layers.0.self_attn.q_proj.weight") "shape"] [2048 1536])
-         k-shape (get-in header [(str prefix-base "layers.0.self_attn.k_proj.weight") "shape"] [256 1536])
-         gate-shape (get-in header [(str prefix-base "layers.0.mlp.gate_proj.weight") "shape"] [6144 1536])
+         q0-shape (get-in header [(str prefix-base "layers.0.self_attn.q_proj.weight") "shape"] [2048 1536])
+         k0-shape (get-in header [(str prefix-base "layers.0.self_attn.k_proj.weight") "shape"] [256 1536])
 
          vocab-size (nth emb-shape 0 262144)
          hidden-dim (nth emb-shape 1 1536)
          total-pl-dim (nth emb-pl-shape 1 8960)
-         q-dim (nth q-shape 0 2048)
-         kv-dim (nth k-shape 0 256)
-         intermediate-dim (nth gate-shape 0 6144)
-         num-layers (count (filter #(re-find (re-pattern (str "^" (java.util.regex.Pattern/quote prefix-base) "layers\\.\\d+\\.input_layernorm\\.weight$")) %) (keys header)))
-         num-layers (if (pos? num-layers) num-layers 35)
+
+         layer-pattern (re-pattern (str "^" (java.util.regex.Pattern/quote prefix-base) "layers\\.\\d+\\.input_layernorm\\.weight$"))
+         num-layers (count (filter #(re-find layer-pattern %) (keys header)))
+         num-layers (if (pos? num-layers) num-layers (or (:num_hidden_layers text-cfg) 35))
          pl-dim (quot total-pl-dim num-layers)
-         num-heads (quot q-dim 256)
-         num-kv-heads (quot kv-dim 256)
-         head-dim 256
+
+         num-heads (or (:num_attention_heads text-cfg) (quot (nth q0-shape 0 2048) 256))
+         num-kv-heads (or (:num_key_value_heads text-cfg) (quot (nth k0-shape 0 256) 256))
+         head-dim (or (:head_dim text-cfg) 256)
          max-seq-len 128
-         kv-cache-shape [1 num-kv-heads max-seq-len head-dim]
+
+         layer-configs (mapv (fn [i]
+                               (let [kmap (gemma/gemma4-weight-key-map i (str prefix-base "layers."))
+                                     l-q-dim (first (get-in header [(:q-w kmap) "shape"] [2048 hidden-dim]))
+                                     l-kv-dim (first (get-in header [(:k-w kmap) "shape"] [256 hidden-dim]))
+                                     l-head-dim (first (get-in header [(:q-norm-w kmap) "shape"] [head-dim]))
+                                     mlp-dim (first (get-in header [(:gate-w kmap) "shape"] [(* 4 hidden-dim) hidden-dim]))
+                                     l-type-str (or (get layer-types-cfg i)
+                                                    (if (= l-head-dim 512) "full_attention" "sliding_attention"))
+                                     is-global? (= l-type-str "full_attention")
+                                     rope-prop (if is-global? 0.25 1.0)
+                                     theta-base (if is-global? 1000000.0 10000.0)]
+                                 {:idx i
+                                  :q-dim l-q-dim
+                                  :kv-dim l-kv-dim
+                                  :head-dim l-head-dim
+                                  :mlp-dim mlp-dim
+                                  :is-global? is-global?
+                                  :layer-type (if is-global? :full_attention :sliding_attention)
+                                  :rope-proportion rope-prop
+                                  :theta-base theta-base}))
+                             (range num-layers))
+
          weight-dtype (or precision :bf16)
          weight-enum (if (= weight-dtype :f32) 11 13)]
 
      (when-not (:quiet opts)
-       (println (str "Loaded Gemma 4 model weights from [" resolved-model-dir "] in [" (name weight-dtype) "] precision (" num-layers " layers).")))
+       (println (str "Loaded Gemma 4 model weights from [" resolved-model-dir "] in [" (name weight-dtype) "] precision (" num-layers " layers, " num-heads " heads, " num-kv-heads " kv-heads).")))
 
      {:ctx ctx
       :opts opts
@@ -143,22 +189,20 @@
                :hidden-dim hidden-dim
                :total-pl-dim total-pl-dim
                :pl-dim pl-dim
-               :q-dim q-dim
-               :kv-dim kv-dim
-               :intermediate-dim intermediate-dim
                :num-layers num-layers
                :num-heads num-heads
                :num-kv-heads num-kv-heads
                :head-dim head-dim
                :max-seq-len max-seq-len
-               :kv-cache-shape kv-cache-shape
+               :layer-configs layer-configs
+               :num-kv-shared-layers num-kv-shared-layers
                :weight-dtype weight-dtype
                :weight-enum weight-enum}})))
 
 (defn allocate-device-weights
   "Transfers all model layer, embedding, and per-layer input weights to PJRT device memory."
   [{:keys [ctx weights-mmap config]}]
-  (let [{:keys [prefix-base vocab-size hidden-dim total-pl-dim pl-dim intermediate-dim num-layers weight-dtype weight-enum]} config
+  (let [{:keys [prefix-base vocab-size hidden-dim total-pl-dim pl-dim num-layers weight-dtype weight-enum layer-configs]} config
         load-fn (fn [name shape] (load-weight-buffer ctx weights-mmap name shape weight-dtype weight-enum))
         embed-buf (load-fn (str prefix-base "embed_tokens.weight") [vocab-size hidden-dim])
         embed-pl-buf (load-fn (str prefix-base "embed_tokens_per_layer.weight") [vocab-size total-pl-dim])
@@ -167,19 +211,16 @@
         final-norm-buf (load-fn (str prefix-base "norm.weight") [hidden-dim])
         layer-bufs (mapv (fn [i]
                            (let [kmap (gemma/gemma4-weight-key-map i (str prefix-base "layers."))
-                                 is-global? (zero? (mod (inc i) 5))
-                                 l-q-dim (if is-global? 4096 2048)
-                                 l-kv-dim (if is-global? 512 256)
-                                 l-head-dim (if is-global? 512 256)
-                                 mlp-dim (if (>= i 15) (* 2 intermediate-dim) intermediate-dim)]
+                                 cfg (nth layer-configs i)
+                                 {:keys [q-dim kv-dim head-dim mlp-dim]} cfg]
                              [(load-fn (:input-ln-w kmap) [hidden-dim])
                               (load-fn (:layer-scalar-w kmap) [1])
-                              (load-fn (:q-w kmap) [l-q-dim hidden-dim])
-                              (load-fn (:k-w kmap) [l-kv-dim hidden-dim])
-                              (load-fn (:v-w kmap) [l-kv-dim hidden-dim])
-                              (load-fn (:o-w kmap) [hidden-dim l-q-dim])
-                              (load-fn (:q-norm-w kmap) [l-head-dim])
-                              (load-fn (:k-norm-w kmap) [l-head-dim])
+                              (load-fn (:q-w kmap) [q-dim hidden-dim])
+                              (load-fn (:k-w kmap) [kv-dim hidden-dim])
+                              (load-fn (:v-w kmap) [kv-dim hidden-dim])
+                              (load-fn (:o-w kmap) [hidden-dim q-dim])
+                              (load-fn (:q-norm-w kmap) [head-dim])
+                              (load-fn (:k-norm-w kmap) [head-dim])
                               (load-fn (:post-attn-ln-w kmap) [hidden-dim])
                               (load-fn (:pre-mlp-ln-w kmap) [hidden-dim])
                               (load-fn (:post-mlp-ln-w kmap) [hidden-dim])
@@ -196,11 +237,11 @@
 (defn allocate-kv-caches
   "Allocates initial zero-filled PJRT device memory buffers for layer K/V caches."
   [{:keys [ctx config]}]
-  (let [{:keys [num-layers max-seq-len weight-enum]} config]
+  (let [{:keys [num-layers num-kv-heads max-seq-len weight-enum layer-configs]} config]
     (mapv (fn [i]
-            (let [is-global? (zero? (mod (inc i) 5))
-                  l-head-dim (if is-global? 512 256)
-                  c-shape [1 1 max-seq-len l-head-dim]
+            (let [cfg (nth layer-configs i)
+                  head-dim (:head-dim cfg)
+                  c-shape [1 num-kv-heads max-seq-len head-dim]
                   num-elements (reduce * 1 c-shape)
                   zero-data (if (= weight-enum 11) (float-array num-elements) (short-array num-elements))]
               [(xla/buffer-from-host-buffer ctx (:client ctx) zero-data c-shape weight-enum)
@@ -210,8 +251,9 @@
 (defn compile-inference-executables
   "Traces and JIT-compiles Gemma 4 Single-Pass Prefill and Single-Token Decode StableHLO graphs into PJRT Executables."
   [{:keys [ctx config opts]} prompt-len]
-  (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim intermediate-dim max-seq-len num-layers weight-dtype]} config
+  (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim max-seq-len num-layers weight-dtype layer-configs num-heads num-kv-heads num-kv-shared-layers]} config
         {:keys [verbose quiet]} opts
+        num-unshared (- num-layers num-kv-shared-layers)
 
         prefill-invars (vec (concat
                              [[:x [:tensor [1 prompt-len] :i32]]
@@ -222,19 +264,16 @@
                               [:per_layer_projection_norm [:tensor [pl-dim] weight-dtype]]
                               [:final_norm_w [:tensor [hidden-dim] weight-dtype]]]
                              (mapcat (fn [i]
-                                       (let [is-global? (zero? (mod (inc i) 5))
-                                             l-q-dim (if is-global? 4096 2048)
-                                             l-kv-dim (if is-global? 512 256)
-                                             l-head-dim (if is-global? 512 256)
-                                             mlp-dim (if (>= i 15) (* 2 intermediate-dim) intermediate-dim)]
+                                       (let [cfg (nth layer-configs i)
+                                             {:keys [q-dim kv-dim head-dim mlp-dim]} cfg]
                                          [[(keyword (str "input_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
                                           [(keyword (str "layer_scalar_w_" i)) [:tensor [1] weight-dtype]]
-                                          [(keyword (str "q_w_" i)) [:tensor [l-q-dim hidden-dim] weight-dtype]]
-                                          [(keyword (str "k_w_" i)) [:tensor [l-kv-dim hidden-dim] weight-dtype]]
-                                          [(keyword (str "v_w_" i)) [:tensor [l-kv-dim hidden-dim] weight-dtype]]
-                                          [(keyword (str "o_w_" i)) [:tensor [hidden-dim l-q-dim] weight-dtype]]
-                                          [(keyword (str "q_norm_w_" i)) [:tensor [l-head-dim] weight-dtype]]
-                                          [(keyword (str "k_norm_w_" i)) [:tensor [l-head-dim] weight-dtype]]
+                                          [(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] weight-dtype]]
+                                          [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
+                                          [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
+                                          [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] weight-dtype]]
+                                          [(keyword (str "q_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
+                                          [(keyword (str "k_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
                                           [(keyword (str "post_attn_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
                                           [(keyword (str "pre_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
                                           [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
@@ -246,10 +285,10 @@
                                           [(keyword (str "post_per_layer_norm_w_" i)) [:tensor [hidden-dim] weight-dtype]]]))
                                      (range num-layers))
                              (mapcat (fn [i]
-                                       (let [is-global? (zero? (mod (inc i) 5))
-                                             l-head-dim (if is-global? 512 256)]
-                                         [[(keyword (str "k_cache_" i)) [:tensor [1 1 max-seq-len l-head-dim] weight-dtype]]
-                                          [(keyword (str "v_cache_" i)) [:tensor [1 1 max-seq-len l-head-dim] weight-dtype]]]))
+                                       (let [cfg (nth layer-configs i)
+                                             head-dim (:head-dim cfg)]
+                                         [[(keyword (str "k_cache_" i)) [:tensor [1 num-kv-heads max-seq-len head-dim] weight-dtype]]
+                                          [(keyword (str "v_cache_" i)) [:tensor [1 num-kv-heads max-seq-len head-dim] weight-dtype]]]))
                                      (range num-layers))))
 
         decode-invars (assoc prefill-invars
@@ -260,21 +299,24 @@
                            (let [weight-args (take (* 17 num-layers) rest-args)
                                  kv-cache-args (drop (* 17 num-layers) rest-args)
                                  lw-seq (mapv (fn [i [in-ln ls qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw plg plp pln]]
-                                                {:input-ln-w in-ln :layer-scalar-w ls
-                                                 :q-w qw :k-w kw :v-w vw :o-w ow
-                                                 :q-norm-w qn :k-norm-w kn
-                                                 :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
-                                                 :gate-w gw :up-w uw :down-w dw
-                                                 :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
-                                                 :num-heads 8 :num-kv-heads 1
-                                                 :theta-base (if (zero? (mod (inc i) 5)) 1000000.0 10000.0)
-                                                 :rope-proportion (if (zero? (mod (inc i) 5)) 0.25 1.0)
-                                                 :norm-fn norm/rms-norm
-                                                 :attn-softcap nil})
+                                                (let [cfg (nth layer-configs i)]
+                                                  {:input-ln-w in-ln :layer-scalar-w ls
+                                                   :q-w qw :k-w kw :v-w vw :o-w ow
+                                                   :q-norm-w qn :k-norm-w kn
+                                                   :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
+                                                   :gate-w gw :up-w uw :down-w dw
+                                                   :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
+                                                   :num-heads num-heads :num-kv-heads num-kv-heads
+                                                   :theta-base (:theta-base cfg)
+                                                   :rope-proportion (:rope-proportion cfg)
+                                                   :norm-fn norm/rms-norm
+                                                   :attn-softcap nil
+                                                   :layer-type (:layer-type cfg)
+                                                   :is-shared? (>= i num-unshared)}))
                                               (range num-layers)
                                               (mapv vec (partition 17 weight-args)))
                                  kv-seq (mapv vec (partition 2 kv-cache-args))
-                                 [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer 8 1 kv-seq 0 {:final-logit-softcap 30.0})
+                                 [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads kv-seq 0 {:final-logit-softcap 30.0 :num-kv-shared-layers num-kv-shared-layers})
                                  f32-logits (t/convert logits :f32)]
                              (into [f32-logits] (apply concat updated-kv-caches))))
 
@@ -282,21 +324,24 @@
                           (let [weight-args (take (* 17 num-layers) rest-args)
                                 kv-cache-args (drop (* 17 num-layers) rest-args)
                                 lw-seq (mapv (fn [i [in-ln ls qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw plg plp pln]]
-                                               {:input-ln-w in-ln :layer-scalar-w ls
-                                                :q-w qw :k-w kw :v-w vw :o-w ow
-                                                :q-norm-w qn :k-norm-w kn
-                                                :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
-                                                :gate-w gw :up-w uw :down-w dw
-                                                :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
-                                                :num-heads 8 :num-kv-heads 1
-                                                :theta-base (if (zero? (mod (inc i) 5)) 1000000.0 10000.0)
-                                                :rope-proportion (if (zero? (mod (inc i) 5)) 0.25 1.0)
-                                                :norm-fn clj-xla.nn.norm/rms-norm
-                                                :attn-softcap nil})
+                                               (let [cfg (nth layer-configs i)]
+                                                 {:input-ln-w in-ln :layer-scalar-w ls
+                                                  :q-w qw :k-w kw :v-w vw :o-w ow
+                                                  :q-norm-w qn :k-norm-w kn
+                                                  :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
+                                                  :gate-w gw :up-w uw :down-w dw
+                                                  :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
+                                                  :num-heads num-heads :num-kv-heads num-kv-heads
+                                                  :theta-base (:theta-base cfg)
+                                                  :rope-proportion (:rope-proportion cfg)
+                                                  :norm-fn norm/rms-norm
+                                                  :attn-softcap nil
+                                                  :layer-type (:layer-type cfg)
+                                                  :is-shared? (>= i num-unshared)}))
                                              (range num-layers)
                                              (mapv vec (partition 17 weight-args)))
                                 kv-seq (mapv vec (partition 2 kv-cache-args))
-                                [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer 8 1 kv-seq pos-tracer {:final-logit-softcap 30.0})
+                                [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads kv-seq pos-tracer {:final-logit-softcap 30.0 :num-kv-shared-layers num-kv-shared-layers})
                                 f32-logits (t/convert logits :f32)]
                             (into [f32-logits] (apply concat updated-kv-caches))))
 
@@ -451,7 +496,7 @@
   (let [opts (parse-cli-args args)]
     (when-not (:quiet opts)
       (println "==================================================================")
-      (println "  clj-xla Gemma 4 E2B Single-Pass Prefill & BF16 Generation ")
+      (println "  clj-xla Gemma 4 Single-Pass Prefill & BF16 Generation ")
       (println "=================================================================="))
     (let [session (init-inference-session opts)]
       (generate-text session (:prompt opts)))))

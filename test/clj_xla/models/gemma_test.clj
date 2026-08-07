@@ -209,6 +209,22 @@
                        (= 256 (:head-dim cfg))
                        (= 256 (:pl-dim cfg))))))
 
+(defspec prop-gemma4-variant-configs 50
+  (prop/for-all [variant (gen/elements [:e2b :e4b])]
+                (let [cfg (gemma4-config variant)
+                      [exp-hidden exp-inter exp-layers exp-kv-heads exp-shared]
+                      (case variant
+                        :e2b [1536 6144 35 1 20]
+                        :e4b [2560 10240 42 2 18])]
+                  (and (= exp-hidden (:hidden-dim cfg))
+                       (= exp-inter (:intermediate-dim cfg))
+                       (= exp-layers (:num-layers cfg))
+                       (= 8 (:num-heads cfg))
+                       (= exp-kv-heads (:num-kv-heads cfg))
+                       (= 256 (:head-dim cfg))
+                       (= 256 (:pl-dim cfg))
+                       (= exp-shared (:num-kv-shared-layers cfg))))))
+
 (deftest gemma4-weight-key-map-test
   (testing "gemma4-weight-key-map generates exact HuggingFace Gemma 4 key names including per-layer input keys"
     (let [km (gemma4-weight-key-map 0)]
@@ -260,3 +276,35 @@
                                (full-gemma4-forward x emb emb_pl pl_proj pl_norm [layer-w] fn_norm [0 1 2 3])))]
       (is (= "gemma4_test" (:name graph)))
       (is (seq (:eqns graph))))))
+
+(deftest full-gemma4-e4b-forward-tracer-test
+  (testing "Full Gemma 4 E4B forward pass (2 KV heads, 2560 hidden-dim) traces valid computation graph"
+    (let [layer-w {:input-ln-w (t/->Tracer :in_ln [:tensor [2560] :f32])
+                   :layer-scalar-w (t/->Tracer :ls [:tensor [1] :f32])
+                   :q-w (t/->Tracer :qw [:tensor [2048 2560] :f32])
+                   :k-w (t/->Tracer :kw [:tensor [512 2560] :f32])
+                   :v-w (t/->Tracer :vw [:tensor [512 2560] :f32])
+                   :o-w (t/->Tracer :ow [:tensor [2560 2048] :f32])
+                   :q-norm-w (t/->Tracer :qn [:tensor [256] :f32])
+                   :k-norm-w (t/->Tracer :kn [:tensor [256] :f32])
+                   :post-attn-ln-w (t/->Tracer :post_attn_ln [:tensor [2560] :f32])
+                   :pre-mlp-ln-w (t/->Tracer :pre_mlp_ln [:tensor [2560] :f32])
+                   :post-mlp-ln-w (t/->Tracer :post_mlp_ln [:tensor [2560] :f32])
+                   :gate-w (t/->Tracer :gw [:tensor [10240 2560] :f32])
+                   :up-w (t/->Tracer :uw [:tensor [10240 2560] :f32])
+                   :down-w (t/->Tracer :dw [:tensor [2560 10240] :f32])
+                   :per-layer-gate-w (t/->Tracer :plg [:tensor [256 2560] :f32])
+                   :per-layer-proj-w (t/->Tracer :plp [:tensor [2560 256] :f32])
+                   :post-per-layer-norm-w (t/->Tracer :pln [:tensor [2560] :f32])}
+          graph (trace-graph "gemma4_e4b_test"
+                             [[:x [:tensor [1 4] :i32]]
+                              [:emb [:tensor [262144 2560] :f32]]
+                              [:emb_pl [:tensor [262144 256] :f32]]
+                              [:pl_proj [:tensor [256 2560] :f32]]
+                              [:pl_norm [:tensor [256] :f32]]
+                              [:fn_norm [:tensor [2560] :f32]]]
+                             (fn [x emb emb_pl pl_proj pl_norm fn_norm]
+                               (full-gemma4-forward x emb emb_pl pl_proj pl_norm [layer-w] fn_norm [0 1 2 3] 8 2)))]
+      (is (= "gemma4_e4b_test" (:name graph)))
+      (is (seq (:eqns graph))))))
+
