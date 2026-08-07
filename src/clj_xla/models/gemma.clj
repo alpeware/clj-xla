@@ -68,6 +68,22 @@
    :final-logit-softcap 30.0
    :num-kv-shared-layers 18})
 
+(def DEFAULT_GEMMA4_12B_CONFIG
+  {:hidden-dim 3840
+   :intermediate-dim 15360
+   :pl-dim 0
+   :total-pl-dim 0
+   :num-layers 48
+   :num-heads 16
+   :num-kv-heads 8
+   :num-global-kv-heads 1
+   :head-dim 256
+   :global-head-dim 512
+   :vocab-size 262144
+   :norm-eps 1e-6
+   :final-logit-softcap 30.0
+   :num-kv-shared-layers 0})
+
 (defn gemma-config
   "Returns Gemma 1/2 configuration map with optional custom overrides."
   ([] DEFAULT_GEMMA_CONFIG)
@@ -79,7 +95,7 @@
   ([overrides] (merge DEFAULT_GEMMA3_270M_CONFIG overrides)))
 
 (defn gemma4-config
-  "Returns Gemma 4 configuration map for the specified variant (e.g. :e2b, :e4b) with optional custom overrides."
+  "Returns Gemma 4 configuration map for the specified variant (e.g. :e2b, :e4b, :12b) with optional custom overrides."
   ([] (gemma4-config :e2b {}))
   ([variant-or-overrides]
    (if (keyword? variant-or-overrides)
@@ -87,6 +103,7 @@
      (gemma4-config :e2b variant-or-overrides)))
   ([variant overrides]
    (let [base (case variant
+                :12b DEFAULT_GEMMA4_12B_CONFIG
                 :e4b DEFAULT_GEMMA4_E4B_CONFIG
                 :e2b DEFAULT_GEMMA4_E2B_CONFIG
                 DEFAULT_GEMMA4_E2B_CONFIG)]
@@ -109,20 +126,20 @@
     (linear hidden down-t nil)))
 
 (defn gemma-attention
-  "Multi-Head Attention sub-block for Gemma models (supports GQA, RoPE, QK Norm, KV-sharing)."
-  ([x q-w k-w v-w o-w num-heads num-kv-heads pos-ids]
-   (gemma-attention x q-w k-w v-w o-w num-heads num-kv-heads pos-ids nil nil {}))
-  ([x q-w k-w v-w o-w num-heads num-kv-heads pos-ids past-kv pos]
-   (gemma-attention x q-w k-w v-w o-w num-heads num-kv-heads pos-ids past-kv pos {}))
-  ([x q-w k-w v-w o-w num-heads num-kv-heads pos-ids past-kv pos opts]
-   (let [{:keys [q-norm-w k-norm-w theta-base attn-softcap rotary-dim norm-fn rope-proportion shared-kv]
-          :or {theta-base 10000.0 attn-softcap nil rope-proportion 1.0}} opts
-         norm-fn (or norm-fn (if (some? q-norm-w) rms-norm gemma-rms-norm))
-         q-w-t (transpose q-w [1 0])
-         q (linear x q-w-t nil)
-         [_ [batch seq-len q-dim] _] (:type q)
-         head-dim (quot q-dim num-heads)
-         q-4d (transpose (reshape q [batch seq-len num-heads head-dim]) [0 2 1 3])
+  "Multi-head / Grouped-Query Causal Self-Attention block for Gemma 1/2/3/4."
+  ([x q-w k-w v-w o-w num-heads _num-kv-heads pos-ids]
+   (gemma-attention x q-w k-w v-w o-w num-heads _num-kv-heads pos-ids nil nil {}))
+  ([x q-w k-w v-w o-w num-heads _num-kv-heads pos-ids past-kv pos]
+   (gemma-attention x q-w k-w v-w o-w num-heads _num-kv-heads pos-ids past-kv pos {}))
+  ([x q-w k-w v-w o-w num-heads _num-kv-heads pos-ids past-kv pos opts]
+   (let [{:keys [q-norm-w k-norm-w theta-base attn-softcap rotary-dim rope-proportion shared-kv]} opts
+         norm-fn (or (:norm-fn opts) (if (some? q-norm-w) rms-norm gemma-rms-norm))
+         theta-base (or theta-base 10000.0)
+         rope-proportion (or rope-proportion 1.0)
+         q (linear x (transpose q-w [1 0]) nil)
+         [_ [batch seq-len q-proj-dim] _] (:type q)
+         h-dim (or (:head-dim opts) (quot q-proj-dim num-heads))
+         q-4d (transpose (reshape q [batch seq-len num-heads h-dim]) [0 2 1 3])
          q-normed (if (some? q-norm-w) (norm-fn q-4d q-norm-w 1e-6) q-4d)
 
          ;; Compute or reuse Shared KV
@@ -135,19 +152,22 @@
                  v-raw (linear x v-w-t nil)
                  v (if (some? q-norm-w) (rms-norm v-raw nil 1e-6) v-raw)
                  [_ [_ _ kv-dim] _] (:type k)
-                 k-4d (transpose (reshape k [batch seq-len num-kv-heads head-dim]) [0 2 1 3])
+                 l-nkv (quot kv-dim h-dim)
+                 k-4d (transpose (reshape k [batch seq-len l-nkv h-dim]) [0 2 1 3])
                  k-normed (if (some? k-norm-w) (norm-fn k-4d k-norm-w 1e-6) k-4d)
-                 [_ k-rope] (apply-rope q-normed k-normed pos-ids head-dim theta-base rotary-dim nil rope-proportion)
+                 [_ k-rope] (apply-rope q-normed k-normed pos-ids h-dim theta-base rotary-dim nil rope-proportion)
                  k-3d (reshape (transpose k-rope [0 2 1 3]) [batch seq-len kv-dim])]
              [k-3d v [k-3d v]]))
 
-         [q-rope _] (apply-rope q-normed q-normed pos-ids head-dim theta-base rotary-dim nil rope-proportion)
-         q-rope-3d (reshape (transpose q-rope [0 2 1 3]) [batch seq-len q-dim])
-         attn-scale (get opts :scale (if (some? q-norm-w) 1.0 (/ 1.0 (Math/sqrt (double head-dim)))))
+         [q-rope _] (apply-rope q-normed q-normed pos-ids h-dim theta-base rotary-dim nil rope-proportion)
+         q-rope-3d (reshape (transpose q-rope [0 2 1 3]) [batch seq-len q-proj-dim])
+         attn-scale (get opts :scale (if (some? q-norm-w) 1.0 (/ 1.0 (Math/sqrt (double h-dim)))))
          attn-opts {:scale attn-scale}
+         [_ [_ _ kv-dim] _] (:type k-rope-3d)
+         l-nkv (quot kv-dim h-dim)
          attn-res (if (some? past-kv)
-                    (gqa-causal-attention q-rope-3d k-rope-3d v o-w num-heads num-kv-heads attn-softcap past-kv pos attn-opts)
-                    (gqa-causal-attention q-rope-3d k-rope-3d v o-w num-heads num-kv-heads attn-softcap nil nil attn-opts))]
+                    (gqa-causal-attention q-rope-3d k-rope-3d v o-w num-heads l-nkv attn-softcap past-kv pos attn-opts)
+                    (gqa-causal-attention q-rope-3d k-rope-3d v o-w num-heads l-nkv attn-softcap nil nil attn-opts))]
      (if (vector? attn-res)
        [(first attn-res) (second attn-res) computed-kv]
        [attn-res nil computed-kv]))))
@@ -256,20 +276,26 @@
          num-kv-shared (or (:num-kv-shared-layers opts) 20)
          num-unshared (- num-layers num-kv-shared)
          tok-embed (embed-lookup x embed-tokens hidden-dim)
-         ;; Compute PLE (Per-Layer Embedding) representation
-         raw-pl-tok (gather embed-per-layer x)
-         pl-dim 256
-         pl-tok-scaled (* raw-pl-tok 16.0)
-         pl-proj-t (transpose per-layer-model-proj-w [1 0])
-         pl-context-raw (linear tok-embed pl-proj-t nil)
-         pl-tok-4d (reshape pl-tok-scaled [batch seq-len num-layers pl-dim])
-         pl-context-4d (reshape pl-context-raw [batch seq-len num-layers pl-dim])
-         pl-context-norm (rms-norm pl-context-4d per-layer-proj-norm-w 1e-6)
-         ple-all (* (+ pl-context-norm pl-tok-4d) (/ 1.0 (Math/sqrt 2.0)))
+         ;; Compute PLE (Per-Layer Embedding) representation if pl-dim > 0
+         pl-shape (when (some? embed-per-layer) (second (:type embed-per-layer)))
+         total-pl-dim (if (seq pl-shape) (second pl-shape) 0)
+         pl-dim (if (and (pos? total-pl-dim) (pos? num-layers)) (quot total-pl-dim num-layers) 0)
+         has-ple? (pos? pl-dim)
+
+         ple-all (when has-ple?
+                   (let [raw-pl-tok (gather embed-per-layer x)
+                         pl-tok-scaled (* raw-pl-tok 16.0)
+                         pl-proj-t (transpose per-layer-model-proj-w [1 0])
+                         pl-context-raw (linear tok-embed pl-proj-t nil)
+                         pl-tok-4d (reshape pl-tok-scaled [batch seq-len num-layers pl-dim])
+                         pl-context-4d (reshape pl-context-raw [batch seq-len num-layers pl-dim])
+                         pl-context-norm (rms-norm pl-context-4d per-layer-proj-norm-w 1e-6)]
+                     (* (+ pl-context-norm pl-tok-4d) (/ 1.0 (Math/sqrt 2.0)))))
 
          layers-with-ple (mapv (fn [i lw]
-                                 (let [pl-slice (slice ple-all [0 0 i 0] [batch seq-len (inc i) pl-dim] [1 1 1 1])
-                                       pl-input (reshape pl-slice [batch seq-len pl-dim])
+                                 (let [pl-input (when has-ple?
+                                                  (let [pl-slice (slice ple-all [0 0 i 0] [batch seq-len (inc i) pl-dim] [1 1 1 1])]
+                                                    (reshape pl-slice [batch seq-len pl-dim])))
                                        l-type (or (:layer-type lw)
                                                   (if (:is-global? lw) :full_attention nil)
                                                   (if (zero? (mod (inc i) 5)) :full_attention :sliding_attention))]

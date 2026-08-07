@@ -107,8 +107,14 @@
 (defn load-weight-buffer
   "Loads a single weight tensor from `weights-mmap` into PJRT device memory in specified precision."
   [ctx weights-mmap tensor-name shape _weight-dtype weight-enum]
-  (let [slice (st/get-tensor-slice weights-mmap tensor-name)]
-    (xla/buffer-from-host-buffer ctx (:client ctx) slice shape weight-enum)))
+  (if (or (zero? (reduce * 1 shape))
+          (not (or (contains? (:header weights-mmap) tensor-name)
+                   (contains? (:tensors weights-mmap) tensor-name))))
+    (let [num-elements (reduce * 1 shape)
+          zero-data (if (= weight-enum 11) (float-array num-elements) (short-array num-elements))]
+      (xla/buffer-from-host-buffer ctx (:client ctx) zero-data shape weight-enum))
+    (let [slice (st/get-tensor-slice weights-mmap tensor-name)]
+      (xla/buffer-from-host-buffer ctx (:client ctx) slice shape weight-enum))))
 
 (defn init-inference-session
   "Initializes PJRT runtime, loads safetensors weights, and prepares model configuration for Gemma 4 REPL/CLI sessions."
@@ -131,18 +137,18 @@
          num-kv-shared-layers (or (:num_kv_shared_layers text-cfg) 20)
 
          emb-shape (get-in header [(str prefix-base "embed_tokens.weight") "shape"] [262144 1536])
-         emb-pl-shape (get-in header [(str prefix-base "embed_tokens_per_layer.weight") "shape"] [262144 8960])
+         emb-pl-shape (get-in header [(str prefix-base "embed_tokens_per_layer.weight") "shape"] [262144 0])
          q0-shape (get-in header [(str prefix-base "layers.0.self_attn.q_proj.weight") "shape"] [2048 1536])
          k0-shape (get-in header [(str prefix-base "layers.0.self_attn.k_proj.weight") "shape"] [256 1536])
 
          vocab-size (nth emb-shape 0 262144)
          hidden-dim (nth emb-shape 1 1536)
-         total-pl-dim (nth emb-pl-shape 1 8960)
+         total-pl-dim (nth emb-pl-shape 1 0)
 
          layer-pattern (re-pattern (str "^" (java.util.regex.Pattern/quote prefix-base) "layers\\.\\d+\\.input_layernorm\\.weight$"))
          num-layers (count (filter #(re-find layer-pattern %) (keys header)))
          num-layers (if (pos? num-layers) num-layers (or (:num_hidden_layers text-cfg) 35))
-         pl-dim (quot total-pl-dim num-layers)
+         pl-dim (if (pos? num-layers) (quot total-pl-dim num-layers) 0)
 
          num-heads (or (:num_attention_heads text-cfg) (quot (nth q0-shape 0 2048) 256))
          num-kv-heads (or (:num_key_value_heads text-cfg) (quot (nth k0-shape 0 256) 256))
@@ -159,11 +165,13 @@
                                                     (if (= l-head-dim 512) "full_attention" "sliding_attention"))
                                      is-global? (= l-type-str "full_attention")
                                      rope-prop (if is-global? 0.25 1.0)
-                                     theta-base (if is-global? 1000000.0 10000.0)]
+                                     theta-base (if is-global? 1000000.0 10000.0)
+                                     l-nkv (quot l-kv-dim l-head-dim)]
                                  {:idx i
                                   :q-dim l-q-dim
                                   :kv-dim l-kv-dim
                                   :head-dim l-head-dim
+                                  :num-kv-heads l-nkv
                                   :mlp-dim mlp-dim
                                   :is-global? is-global?
                                   :layer-type (if is-global? :full_attention :sliding_attention)
@@ -237,11 +245,12 @@
 (defn allocate-kv-caches
   "Allocates initial zero-filled PJRT device memory buffers for layer K/V caches."
   [{:keys [ctx config]}]
-  (let [{:keys [num-layers num-kv-heads max-seq-len weight-enum layer-configs]} config]
+  (let [{:keys [num-layers max-seq-len weight-enum layer-configs]} config]
     (mapv (fn [i]
             (let [cfg (nth layer-configs i)
+                  l-nkv (:num-kv-heads cfg)
                   head-dim (:head-dim cfg)
-                  c-shape [1 num-kv-heads max-seq-len head-dim]
+                  c-shape [1 l-nkv max-seq-len head-dim]
                   num-elements (reduce * 1 c-shape)
                   zero-data (if (= weight-enum 11) (float-array num-elements) (short-array num-elements))]
               [(xla/buffer-from-host-buffer ctx (:client ctx) zero-data c-shape weight-enum)
@@ -286,9 +295,10 @@
                                      (range num-layers))
                              (mapcat (fn [i]
                                        (let [cfg (nth layer-configs i)
+                                             l-nkv (:num-kv-heads cfg)
                                              head-dim (:head-dim cfg)]
-                                         [[(keyword (str "k_cache_" i)) [:tensor [1 num-kv-heads max-seq-len head-dim] weight-dtype]]
-                                          [(keyword (str "v_cache_" i)) [:tensor [1 num-kv-heads max-seq-len head-dim] weight-dtype]]]))
+                                         [[(keyword (str "k_cache_" i)) [:tensor [1 l-nkv max-seq-len head-dim] weight-dtype]]
+                                          [(keyword (str "v_cache_" i)) [:tensor [1 l-nkv max-seq-len head-dim] weight-dtype]]]))
                                      (range num-layers))))
 
         decode-invars (assoc prefill-invars
