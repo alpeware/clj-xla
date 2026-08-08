@@ -16,6 +16,13 @@
    Sets and returns the thread-root default context *default-context*."
   ([] (init-backend! :cpu))
   ([target]
+   (when (= target :rocm)
+     (when-not (System/getenv "HSA_OVERRIDE_GFX_VERSION")
+       (System/setProperty "HSA_OVERRIDE_GFX_VERSION" "11.0.0"))
+     (when-not (System/getenv "ROCR_VISIBLE_DEVICES")
+       (System/setProperty "ROCR_VISIBLE_DEVICES" "0"))
+     (when-not (System/getenv "HIP_VISIBLE_DEVICES")
+       (System/setProperty "HIP_VISIBLE_DEVICES" "0")))
    (let [lib-path (cond
                     (string? target) target
                     (keyword? target) (let [{:keys [default env]} (get BACKEND-LIBRARY-MAP target)]
@@ -100,3 +107,10 @@
          (System/arraycopy all-floats offset slice 0 vocab-size)
          slice)
        all-floats))))
+
+(defn destroy-buffer!
+  "Frees native device PJRT_Buffer `buffer-handle`."
+  ([buffer-handle]
+   (pjrt/destroy-buffer! (get-context) buffer-handle))
+  ([ctx buffer-handle]
+   (pjrt/destroy-buffer! ctx buffer-handle)))

@@ -39,8 +39,8 @@
              angles (* pos-4d freqs-const)
              cos-half (cos angles)
              sin-half (sin angles)
-             cos-t (concatenate [cos-half cos-half] -1)
-             sin-t (concatenate [sin-half sin-half] -1)]
+             cos-t (concatenate [cos-half cos-half] 3)
+             sin-t (concatenate [sin-half sin-half] 3)]
          [cos-t sin-t])
        (let [p-off (extract-pos-int pos-offset)
              freqs (vec (for [i (range half-dim)]

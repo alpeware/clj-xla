@@ -357,7 +357,7 @@
                                                   :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
                                                   :gate-w gw :up-w uw :down-w dw
                                                   :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
-                                                  :num-heads num-heads :num-kv-heads num-kv-heads
+                                                  :num-heads num-heads :num-kv-heads (:num-kv-heads cfg)
                                                   :theta-base (:theta-base cfg)
                                                   :rope-proportion (:rope-proportion cfg)
                                                   :norm-fn norm/rms-norm
@@ -405,6 +405,8 @@
         flat-kv-bufs (vec (apply concat initial-kv-bufs))
         prefill-args (into [prompt-buf pos-buf] (concat device-weights flat-kv-bufs))
         prefill-res (xla/execute prefill-exec prefill-args)
+        _ (do (xla/destroy-buffer! ctx prompt-buf)
+              (xla/destroy-buffer! ctx pos-buf))
         prefill-logits-buf (if (vector? prefill-res) (first prefill-res) prefill-res)
         prefill-kv-flat (if (vector? prefill-res) (rest prefill-res) [])
         prefill-kv-bufs (mapv vec (partition 2 prefill-kv-flat))
@@ -451,6 +453,9 @@
                 updated-kv-bufs (mapv vec (partition 2 new-kv-flat))
                 step-logits (xla/to-host-slice logits-buf 0 vocab-size vocab-size)
                 next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})
+                _ (do (xla/destroy-buffer! ctx tok-buf)
+                      (xla/destroy-buffer! ctx pos-buf)
+                      (xla/destroy-buffer! ctx logits-buf))
                 next-context (conj context next-tok)]
             (print (decode tokenizer [next-tok]))
             (flush)

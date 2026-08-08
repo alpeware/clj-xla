@@ -154,6 +154,12 @@
           (.waitFor proc))
         (catch Exception e
           (println (str "Warning: Failed to extract Arch package (" (.getMessage e) ")")))))
+    (when (= target :rocm)
+      (let [counter-dir (io/file (.getParent lib-dir) "libexec/rocprofiler/counters")
+            xml-file (io/file counter-dir "derived_counters.xml")]
+        (.mkdirs counter-dir)
+        (when-not (.exists xml-file)
+          (.createNewFile xml-file))))
     ;; Ensure libsycl.so.9 and libccl.so.1 symlinks exist for SYCL backend
     (when (= target :sycl)
       (let [sycl8 (io/file lib-dir "libsycl.so.8")

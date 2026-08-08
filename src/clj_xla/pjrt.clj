@@ -2,8 +2,7 @@
   "Project Panama FFM native bindings to OpenXLA PJRT C API (pjrt_c_api.h)."
   (:require [clojure.java.io :as io])
   (:import [java.lang.foreign Arena FunctionDescriptor Linker Linker$Option MemoryLayout MemorySegment SymbolLookup ValueLayout]
-           [java.lang.invoke MethodHandle]
-           [java.nio.file Path]))
+           [java.lang.invoke MethodHandle]))
 
 ;; PJRT_Api struct field offsets (64-bit architecture)
 (def OFFSET_STRUCT_SIZE "Offset of struct_size in PJRT_Api." 0)
@@ -105,7 +104,25 @@
   [lib-path]
   (preload-libpython!)
   (let [arena (Arena/global)
-        abs-path (.toAbsolutePath (Path/of lib-path (into-array String [])))
+        abs-file (io/file lib-path)
+        abs-path (.toAbsolutePath (.toPath abs-file))
+        ;; Pre-load companion libraries from bin/lib/ if present
+        bin-lib-dir (io/file (.getParent abs-file) "lib")
+        _ (when (.exists bin-lib-dir)
+            (let [linker (Linker/nativeLinker)
+                  stdlib (.defaultLookup linker)
+                  ^MemorySegment dlopen-seg (.get (.find stdlib "dlopen"))
+                  ^FunctionDescriptor desc (FunctionDescriptor/of ValueLayout/ADDRESS (into-array MemoryLayout [ValueLayout/ADDRESS ValueLayout/JAVA_INT]))
+                  dlopen-fn (.downcallHandle linker dlopen-seg desc (make-array Linker$Option 0))]
+              (dotimes [_ 5]
+                (doseq [f (file-seq bin-lib-dir)]
+                  (when (and (.isFile f)
+                             (re-find #"\.so(\.\d+)*$" (.getName f))
+                             (not (re-find #"rocprofiler" (.getName f))))
+                    (try
+                      (let [p-seg (.allocateFrom arena (.getAbsolutePath f))]
+                        (.invokeWithArguments dlopen-fn [p-seg (Integer/valueOf 258)]))
+                      (catch Exception _ nil)))))))
         lookup (SymbolLookup/libraryLookup abs-path arena)
         ^MemorySegment get-api (.orElseThrow (.find lookup "GetPjrtApi"))
         linker (Linker/nativeLinker)
@@ -253,7 +270,21 @@
           (let [handle (downcall-ptr linker api-ptr OFFSET_CLIENT_BUFFER_FROM_HOST_BUFFER ValueLayout/ADDRESS [ValueLayout/ADDRESS])
                 err (.invokeWithArguments ^MethodHandle handle [args])]
             (check-error! api-ctx err)
-            (.get ^MemorySegment args ValueLayout/ADDRESS (long 112))))))))
+            (let [done-event (.get ^MemorySegment args ValueLayout/ADDRESS (long 104))
+                  buf (.get ^MemorySegment args ValueLayout/ADDRESS (long 112))]
+              (when (and (some? done-event) (not= MemorySegment/NULL done-event))
+                (let [await-args (.allocate arena (long 24))]
+                  (.set ^MemorySegment await-args ValueLayout/JAVA_LONG (long 0) (long 24))
+                  (.set ^MemorySegment await-args ValueLayout/ADDRESS (long 16) done-event)
+                  (let [await-handle (downcall-ptr linker api-ptr OFFSET_EVENT_AWAIT ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                        await-err (.invokeWithArguments ^MethodHandle await-handle [await-args])]
+                    (check-error! api-ctx await-err)))
+                (let [destroy-args (.allocate arena (long 24))]
+                  (.set ^MemorySegment destroy-args ValueLayout/JAVA_LONG (long 0) (long 24))
+                  (.set ^MemorySegment destroy-args ValueLayout/ADDRESS (long 16) done-event)
+                  (let [destroy-handle (downcall-ptr linker api-ptr OFFSET_EVENT_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                        _ (.invokeWithArguments ^MethodHandle destroy-handle [destroy-args])])))
+              buf)))))))
 
 (defn destroy-buffer!
   "Frees native device PJRT_Buffer `buffer-handle`."
@@ -291,6 +322,7 @@
                opts (.allocate arena (long 112))
                _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 0) (long 112))
                args (.allocate arena (long 80))]
+           (.fill args (byte 0))
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 80))
            (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) exec-handle)
            (.set ^MemorySegment args ValueLayout/ADDRESS (long 24) opts)
