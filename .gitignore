@@ -36,6 +36,8 @@ verification/torch_detailed/
 verification/torch_dumps/
 *.npy
 
+core.*
+
 # emacs
 .env
 *~

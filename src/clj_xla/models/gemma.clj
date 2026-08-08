@@ -4,10 +4,19 @@
   (:require [clj-xla.nn.activations :refer [gelu]]
             [clj-xla.nn.attention :refer [apply-rope gqa-causal-attention]]
             [clj-xla.nn.norm :refer [gemma-rms-norm rms-norm]]
-            [clj-xla.tensor :refer [* + / gather matmul reshape slice tanh transpose]]))
-
+            [clj-xla.tensor :refer [* + / dot-general emit-constant! gather matmul reshape slice tanh transpose]]))
 (defn linear [x w b]
-  (let [out (matmul x w)]
+  (let [tx (emit-constant! x nil)
+        tw (emit-constant! w nil)
+        [_ x-shape _] (:type tx)
+        [_ w-shape _] (:type tw)
+        x-rank (count x-shape)
+        w-rank (count w-shape)
+        x-in-dim (last x-shape)
+        w-dim0 (first w-shape)
+        out (if (and (= w-rank 2) (= w-dim0 x-in-dim))
+              (matmul tx tw)
+              (dot-general tx tw {:contracting_dims {:lhs [(dec x-rank)] :rhs [(dec w-rank)]}}))]
     (if (some? b)
       (+ out b)
       out)))

@@ -305,9 +305,6 @@
    (execute-executable api-ctx exec-handle input-buffers 1))
   ([api-ctx exec-handle input-buffers num-outputs]
    (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)
-         cli (extract-client api-ctx nil)
-         devs (when cli (addressable-devices api-ctx cli))
-         dev (first devs)
          num-args (count input-buffers)
          num-outs (max 1 (long (or num-outputs 1)))]
      (with-open [arena (Arena/ofConfined)]
@@ -331,8 +328,6 @@
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long 1))
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-args))
            (.set ^MemorySegment args ValueLayout/ADDRESS (long 56) out-lists)
-           (when dev
-             (.set ^MemorySegment args ValueLayout/ADDRESS (long 72) dev))
            (let [handle (downcall-ptr linker api-ptr OFFSET_LOADED_EXECUTABLE_EXECUTE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
                  err (.invokeWithArguments ^MethodHandle handle [args])]
              (check-error! api-ctx err)
@@ -344,12 +339,15 @@
   "Copies device PJRT_Buffer `buffer-handle` to host float array, awaiting asynchronous completion."
   [api-ctx buffer-handle num-floats]
   (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)
+        num-floats (long num-floats)
         byte-size (* num-floats 4)]
     (with-open [arena (Arena/ofConfined)]
-      (let [dst-seg (.allocate arena ValueLayout/JAVA_FLOAT (long num-floats))
+      (let [dst-seg (.allocate arena ValueLayout/JAVA_FLOAT num-floats)
             args (.allocate arena (long 56))]
+        (.fill args (byte 0))
         (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 56))
         (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) buffer-handle)
+        (.set ^MemorySegment args ValueLayout/ADDRESS (long 24) MemorySegment/NULL)
         (.set ^MemorySegment args ValueLayout/ADDRESS (long 32) dst-seg)
         (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long byte-size))
         (let [handle (downcall-ptr linker api-ptr OFFSET_BUFFER_TO_HOST_BUFFER ValueLayout/ADDRESS [ValueLayout/ADDRESS])
@@ -358,12 +356,14 @@
           (let [event-ptr (.get ^MemorySegment args ValueLayout/ADDRESS (long 48))]
             (when (and (some? event-ptr) (not= MemorySegment/NULL event-ptr))
               (let [await-args (.allocate arena (long 24))]
+                (.fill await-args (byte 0))
                 (.set ^MemorySegment await-args ValueLayout/JAVA_LONG (long 0) (long 24))
                 (.set ^MemorySegment await-args ValueLayout/ADDRESS (long 16) event-ptr)
                 (let [await-handle (downcall-ptr linker api-ptr OFFSET_EVENT_AWAIT ValueLayout/ADDRESS [ValueLayout/ADDRESS])
                       await-err (.invokeWithArguments ^MethodHandle await-handle [await-args])]
                   (check-error! api-ctx await-err)))
               (let [destroy-args (.allocate arena (long 24))]
+                (.fill destroy-args (byte 0))
                 (.set ^MemorySegment destroy-args ValueLayout/JAVA_LONG (long 0) (long 24))
                 (.set ^MemorySegment destroy-args ValueLayout/ADDRESS (long 16) event-ptr)
                 (let [destroy-handle (downcall-ptr linker api-ptr OFFSET_EVENT_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])

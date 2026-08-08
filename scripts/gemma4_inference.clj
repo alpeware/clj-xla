@@ -189,6 +189,49 @@
                                   :theta-base theta-base}))
                              (range num-layers))
 
+         layer-packed-info (mapv (fn [i]
+                                  (let [kmap (gemma/gemma4-weight-key-map i (str prefix-base "layers."))
+                                        cfg (nth layer-configs i)
+                                        {:keys [q-dim kv-dim head-dim mlp-dim]} cfg
+                                        v-key (if (or (contains? header (:v-w kmap))
+                                                      (contains? (:tensors weights-mmap) (:v-w kmap)))
+                                                (:v-w kmap)
+                                                (:k-w kmap))
+                                        load-info-fn (fn [name shape default-val]
+                                                       (let [num-el (reduce * 1 shape)
+                                                             has-tensor (or (contains? header name)
+                                                                            (contains? (:tensors weights-mmap) name))]
+                                                         {:name name :shape shape :num-el num-el :has-tensor has-tensor :default-val default-val}))
+                                        base-tensors [(load-info-fn (:input-ln-w kmap) [hidden-dim] 0.0)
+                                                      (load-info-fn (:layer-scalar-w kmap) [1] 1.0)
+                                                      (load-info-fn (:q-w kmap) [q-dim hidden-dim] 0.0)
+                                                      (load-info-fn (:k-w kmap) [kv-dim hidden-dim] 0.0)
+                                                      (load-info-fn v-key [kv-dim hidden-dim] 0.0)
+                                                      (load-info-fn (:o-w kmap) [hidden-dim q-dim] 0.0)
+                                                      (load-info-fn (:q-norm-w kmap) [head-dim] 0.0)
+                                                      (load-info-fn (:k-norm-w kmap) [head-dim] 0.0)
+                                                      (load-info-fn (:post-attn-ln-w kmap) [hidden-dim] 0.0)
+                                                      (load-info-fn (:pre-mlp-ln-w kmap) [hidden-dim] 0.0)
+                                                      (load-info-fn (:post-mlp-ln-w kmap) [hidden-dim] 0.0)
+                                                      (load-info-fn (:gate-w kmap) [mlp-dim hidden-dim] 0.0)
+                                                      (load-info-fn (:up-w kmap) [mlp-dim hidden-dim] 0.0)
+                                                      (load-info-fn (:down-w kmap) [hidden-dim mlp-dim] 0.0)]
+                                        tensors (if (pos? total-pl-dim)
+                                                  (into base-tensors [(load-info-fn (:per-layer-gate-w kmap) [pl-dim hidden-dim] 0.0)
+                                                                      (load-info-fn (:per-layer-proj-w kmap) [hidden-dim pl-dim] 0.0)
+                                                                      (load-info-fn (:post-per-layer-norm-w kmap) [hidden-dim] 0.0)])
+                                                  base-tensors)
+                                        offsets (reduce (fn [acc {:keys [num-el]}]
+                                                          (conj acc (+ (last acc) num-el)))
+                                                        [0]
+                                                        tensors)
+                                        total-el (last offsets)
+                                        tensors-with-off (mapv (fn [t off] (assoc t :offset off)) tensors (pop offsets))]
+                                    {:layer-idx i
+                                     :total-el total-el
+                                     :tensors tensors-with-off}))
+                                (range num-layers))
+
          weight-dtype (or precision :bf16)
          weight-enum (if (= weight-dtype :f32) 11 13)]
 
@@ -215,106 +258,117 @@
                :layer-configs layer-configs
                :num-kv-shared-layers num-kv-shared-layers
                :weight-dtype weight-dtype
-               :weight-enum weight-enum}})))
+               :weight-enum weight-enum
+               :layer-packed-info layer-packed-info}})))
 
 (defn allocate-device-weights
   "Transfers all model layer, embedding, and per-layer input weights to PJRT device memory."
   [{:keys [ctx weights-mmap config]}]
-  (let [{:keys [prefix-base vocab-size hidden-dim total-pl-dim pl-dim num-layers weight-dtype weight-enum layer-configs]} config
+  (let [{:keys [prefix-base vocab-size hidden-dim total-pl-dim pl-dim weight-dtype weight-enum layer-packed-info]} config
+        client (:client ctx)
+        has-ple? (pos? total-pl-dim)
         load-fn (fn
                   ([name shape] (load-weight-buffer ctx weights-mmap name shape weight-dtype weight-enum 0.0))
                   ([name shape default-val] (load-weight-buffer ctx weights-mmap name shape weight-dtype weight-enum default-val)))
         embed-buf (load-fn (str prefix-base "embed_tokens.weight") [vocab-size hidden-dim])
-        embed-pl-buf (load-fn (str prefix-base "embed_tokens_per_layer.weight") [vocab-size total-pl-dim])
-        pl-model-proj-buf (load-fn (str prefix-base "per_layer_model_projection.weight") [total-pl-dim hidden-dim])
-        pl-proj-norm-buf (load-fn (str prefix-base "per_layer_projection_norm.weight") [pl-dim])
         final-norm-buf (load-fn (str prefix-base "norm.weight") [hidden-dim])
-        layer-bufs (mapv (fn [i]
-                           (let [kmap (gemma/gemma4-weight-key-map i (str prefix-base "layers."))
-                                 cfg (nth layer-configs i)
-                                 {:keys [q-dim kv-dim head-dim mlp-dim]} cfg
-                                 v-key (if (or (contains? (:header weights-mmap) (:v-w kmap))
-                                               (contains? (:tensors weights-mmap) (:v-w kmap)))
-                                         (:v-w kmap)
-                                         (:k-w kmap))]
-                             [(load-fn (:input-ln-w kmap) [hidden-dim])
-                              (load-fn (:layer-scalar-w kmap) [1] 1.0)
-                              (load-fn (:q-w kmap) [q-dim hidden-dim])
-                              (load-fn (:k-w kmap) [kv-dim hidden-dim])
-                              (load-fn v-key [kv-dim hidden-dim])
-                              (load-fn (:o-w kmap) [hidden-dim q-dim])
-                              (load-fn (:q-norm-w kmap) [head-dim])
-                              (load-fn (:k-norm-w kmap) [head-dim])
-                              (load-fn (:post-attn-ln-w kmap) [hidden-dim])
-                              (load-fn (:pre-mlp-ln-w kmap) [hidden-dim])
-                              (load-fn (:post-mlp-ln-w kmap) [hidden-dim])
-                              (load-fn (:gate-w kmap) [mlp-dim hidden-dim])
-                              (load-fn (:up-w kmap) [mlp-dim hidden-dim])
-                              (load-fn (:down-w kmap) [hidden-dim mlp-dim])
-                              (load-fn (:per-layer-gate-w kmap) [pl-dim hidden-dim])
-                              (load-fn (:per-layer-proj-w kmap) [hidden-dim pl-dim])
-                              (load-fn (:post-per-layer-norm-w kmap) [hidden-dim])]))
-                         (range num-layers))
-        flat-layer-bufs (vec (apply concat layer-bufs))]
-    (into [embed-buf embed-pl-buf pl-model-proj-buf pl-proj-norm-buf final-norm-buf] flat-layer-bufs)))
+        ple-global-bufs (when has-ple?
+                          [(load-fn (str prefix-base "embed_tokens_per_layer.weight") [vocab-size total-pl-dim])
+                           (load-fn (str prefix-base "per_layer_model_projection.weight") [total-pl-dim hidden-dim])
+                           (load-fn (str prefix-base "per_layer_projection_norm.weight") [pl-dim])])
+        layer-bufs (mapv (fn [{:keys [total-el tensors]}]
+                           (let [is-bf16 (= weight-dtype :bf16)
+                                 arr (if is-bf16 (short-array total-el) (float-array total-el))]
+                             (doseq [{:keys [name num-el offset has-tensor default-val]} tensors]
+                               (if has-tensor
+                                 (let [slice (st/get-tensor-slice weights-mmap name)]
+                                   (if is-bf16
+                                     (java.lang.foreign.MemorySegment/copy slice (java.lang.foreign.ValueLayout/JAVA_SHORT) 0
+                                                                            ^shorts arr offset num-el)
+                                     (java.lang.foreign.MemorySegment/copy slice (java.lang.foreign.ValueLayout/JAVA_FLOAT) 0
+                                                                            ^floats arr offset num-el)))
+                                 (let [default-f (float default-val)]
+                                   (if is-bf16
+                                     (let [bf-bits (short (bit-shift-right (Float/floatToRawIntBits default-f) 16))]
+                                       (java.util.Arrays/fill ^shorts arr offset (+ offset num-el) bf-bits))
+                                     (java.util.Arrays/fill ^floats arr offset (+ offset num-el) default-f)))))
+                             (xla/buffer-from-host-buffer ctx client arr [total-el] weight-enum)))
+                         layer-packed-info)]
+    (vec (concat (into [embed-buf] ple-global-bufs) [final-norm-buf] layer-bufs))))
 
 (defn compile-inference-executables
   "Traces and JIT-compiles a Single Fused Gemma 4 StableHLO Graph into a native PJRT Executable."
   [{:keys [ctx config opts]}]
-  (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim max-seq-len num-layers weight-dtype layer-configs num-heads num-kv-heads num-kv-shared-layers]} config
+  (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim max-seq-len num-layers weight-dtype layer-configs num-heads num-kv-heads num-kv-shared-layers layer-packed-info]} config
         {:keys [verbose quiet]} opts
         num-unshared (- num-layers num-kv-shared-layers)
-
+        has-ple? (pos? total-pl-dim)
+        ple-global-invars (when has-ple?
+                            [[:embed_tokens_per_layer [:tensor [vocab-size total-pl-dim] weight-dtype]]
+                             [:per_layer_model_projection [:tensor [total-pl-dim hidden-dim] weight-dtype]]
+                             [:per_layer_projection_norm [:tensor [pl-dim] weight-dtype]]])
         invars (vec (concat
                      [[:x [:tensor [1 max-seq-len] :i32]]
                       [:pos [:tensor [max-seq-len] :i32]]
-                      [:embed_tokens [:tensor [vocab-size hidden-dim] weight-dtype]]
-                      [:embed_tokens_per_layer [:tensor [vocab-size total-pl-dim] weight-dtype]]
-                      [:per_layer_model_projection [:tensor [total-pl-dim hidden-dim] weight-dtype]]
-                      [:per_layer_projection_norm [:tensor [pl-dim] weight-dtype]]
-                      [:final_norm_w [:tensor [hidden-dim] weight-dtype]]]
-                     (mapcat (fn [i]
-                               (let [cfg (nth layer-configs i)
-                                     {:keys [q-dim kv-dim head-dim mlp-dim]} cfg]
-                                 [[(keyword (str "input_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                  [(keyword (str "layer_scalar_w_" i)) [:tensor [1] weight-dtype]]
-                                  [(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] weight-dtype]]
-                                  [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
-                                  [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
-                                  [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] weight-dtype]]
-                                  [(keyword (str "q_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
-                                  [(keyword (str "k_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
-                                  [(keyword (str "post_attn_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                  [(keyword (str "pre_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                  [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                  [(keyword (str "gate_w_" i)) [:tensor [mlp-dim hidden-dim] weight-dtype]]
-                                  [(keyword (str "up_w_" i)) [:tensor [mlp-dim hidden-dim] weight-dtype]]
-                                  [(keyword (str "down_w_" i)) [:tensor [hidden-dim mlp-dim] weight-dtype]]
-                                  [(keyword (str "per_layer_gate_w_" i)) [:tensor [pl-dim hidden-dim] weight-dtype]]
-                                  [(keyword (str "per_layer_proj_w_" i)) [:tensor [hidden-dim pl-dim] weight-dtype]]
-                                  [(keyword (str "post_per_layer_norm_w_" i)) [:tensor [hidden-dim] weight-dtype]]]))
-                             (range num-layers))))
+                      [:embed_tokens [:tensor [vocab-size hidden-dim] weight-dtype]]]
+                     ple-global-invars
+                     [[:final_norm_w [:tensor [hidden-dim] weight-dtype]]]
+                     (mapv (fn [i]
+                             [(keyword (str "layer_packed_w_" i)) [:tensor [(get-in layer-packed-info [i :total-el])] weight-dtype]])
+                           (range num-layers))))
 
-        trace-fn (fn [x pos-tracer emb emb-pl pl-model-proj pl-proj-norm fn-norm & weight-args]
-                   (let [lw-seq (mapv (fn [i [in-ln ls qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw plg plp pln]]
-                                        (let [cfg (nth layer-configs i)]
-                                          {:input-ln-w in-ln :layer-scalar-w ls
-                                           :q-w qw :k-w kw :v-w vw :o-w ow
-                                           :q-norm-w qn :k-norm-w kn
-                                           :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
-                                           :gate-w gw :up-w uw :down-w dw
-                                           :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
-                                           :num-heads num-heads :num-kv-heads (:num-kv-heads cfg) :head-dim (:head-dim cfg)
-                                           :theta-base (:theta-base cfg)
-                                           :rope-proportion (:rope-proportion cfg)
-                                           :norm-fn norm/rms-norm
-                                           :attn-softcap nil
-                                           :layer-type (:layer-type cfg)
-                                           :is-shared? (>= i num-unshared)}))
-                                      (range num-layers)
-                                      (mapv vec (partition 17 weight-args)))
-                         logits (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads nil 0 {:final-logit-softcap 30.0 :num-kv-shared-layers num-kv-shared-layers})]
-                     (t/convert logits :f32)))
+        trace-fn (if has-ple?
+                   (fn [x pos-tracer emb emb-pl pl-model-proj pl-proj-norm fn-norm & layer-packed-tracers]
+                     (let [lw-seq (mapv (fn [i layer-tr]
+                                          (let [{:keys [tensors]} (nth layer-packed-info i)
+                                                cfg (nth layer-configs i)
+                                                unpacked (mapv (fn [{:keys [shape offset num-el]}]
+                                                                 (let [slice-1d (t/slice layer-tr [offset] [(+ offset num-el)] [1])]
+                                                                   (t/reshape slice-1d shape)))
+                                                               tensors)
+                                                [in-ln ls qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw plg plp pln] unpacked]
+                                            {:input-ln-w in-ln :layer-scalar-w ls
+                                             :q-w qw :k-w kw :v-w vw :o-w ow
+                                             :q-norm-w qn :k-norm-w kn
+                                             :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
+                                             :gate-w gw :up-w uw :down-w dw
+                                             :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
+                                             :num-heads num-heads :num-kv-heads (:num-kv-heads cfg) :head-dim (:head-dim cfg)
+                                             :theta-base (:theta-base cfg)
+                                             :rope-proportion (:rope-proportion cfg)
+                                             :norm-fn norm/rms-norm
+                                             :attn-softcap nil
+                                             :layer-type (:layer-type cfg)
+                                             :is-shared? (>= i num-unshared)}))
+                                        (range num-layers)
+                                        layer-packed-tracers)
+                           logits (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads nil 0 {:final-logit-softcap 30.0 :num-kv-shared-layers num-kv-shared-layers})]
+                       (t/convert logits :f32)))
+                   (fn [x pos-tracer emb fn-norm & layer-packed-tracers]
+                     (let [lw-seq (mapv (fn [i layer-tr]
+                                          (let [{:keys [tensors]} (nth layer-packed-info i)
+                                                cfg (nth layer-configs i)
+                                                unpacked (mapv (fn [{:keys [shape offset num-el]}]
+                                                                 (let [slice-1d (t/slice layer-tr [offset] [(+ offset num-el)] [1])]
+                                                                   (t/reshape slice-1d shape)))
+                                                               tensors)
+                                                [in-ln ls qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw] unpacked]
+                                            {:input-ln-w in-ln :layer-scalar-w ls
+                                             :q-w qw :k-w kw :v-w vw :o-w ow
+                                             :q-norm-w qn :k-norm-w kn
+                                             :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
+                                             :gate-w gw :up-w uw :down-w dw
+                                             :num-heads num-heads :num-kv-heads (:num-kv-heads cfg) :head-dim (:head-dim cfg)
+                                             :theta-base (:theta-base cfg)
+                                             :rope-proportion (:rope-proportion cfg)
+                                             :norm-fn norm/rms-norm
+                                             :attn-softcap nil
+                                             :layer-type (:layer-type cfg)
+                                             :is-shared? (>= i num-unshared)}))
+                                        (range num-layers)
+                                        layer-packed-tracers)
+                           logits (gemma/full-gemma4-forward x emb nil nil nil lw-seq fn-norm pos-tracer num-heads num-kv-heads nil 0 {:final-logit-softcap 30.0 :num-kv-shared-layers num-kv-shared-layers})]
+                       (t/convert logits :f32))))
 
         _ (when-not quiet (println "Tracing & JIT Compiling Single Fused Gemma 4 StableHLO Graph..."))
         fused-graph (trace-graph "gemma4_fused_forward" invars trace-fn)
@@ -347,7 +401,7 @@
               tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) padded-tokens [1 max-seq-len] 4)
               input-args (into [tok-buf pos-buf] device-weights)
               logits-buf (xla/execute exec input-args)
-              step-logits (xla/to-host-slice logits-buf 0 vocab-size vocab-size)
+              step-logits (xla/to-host-slice logits-buf (dec seq-len) vocab-size (* max-seq-len vocab-size))
               next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})
               _ (do (xla/destroy-buffer! ctx tok-buf)
                     (xla/destroy-buffer! ctx logits-buf))]
