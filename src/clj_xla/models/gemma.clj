@@ -192,6 +192,8 @@
                     :theta-base theta-base
                     :attn-softcap attn-softcap
                     :rotary-dim rotary-dim
+                    :full-dim (:full-dim weights)
+                    :head-dim (:head-dim weights)
                     :rope-proportion rope-proportion
                     :norm-fn norm-fn
                     :shared-kv shared-kv}
@@ -328,8 +330,12 @@
                  (map vector (range num-layers) layers-with-ple (or kv-caches (repeat num-layers nil))))
 
          normed (rms-norm x-out final-norm-w 1e-6)
+         normed-last (if-let [idx (:last-token-idx opts)]
+                       (let [[_ [_ _ h-dim] _] (:type normed)]
+                         (reshape (slice normed [0 idx 0] [1 (inc idx) h-dim] [1 1 1]) [1 1 h-dim]))
+                       normed)
          embed-t (transpose embed-tokens [1 0])
-         raw-logits (linear normed embed-t nil)
+         raw-logits (linear normed-last embed-t nil)
          final-softcap (get opts :final-logit-softcap 30.0)
          capped-logits (if (and (number? final-softcap) (pos? final-softcap))
                          (* final-softcap (tanh (/ raw-logits final-softcap)))

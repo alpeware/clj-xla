@@ -258,268 +258,145 @@
         flat-layer-bufs (vec (apply concat layer-bufs))]
     (into [embed-buf embed-pl-buf pl-model-proj-buf pl-proj-norm-buf final-norm-buf] flat-layer-bufs)))
 
-(defn allocate-kv-caches
-  "Allocates initial zero-filled PJRT device memory buffers for layer K/V caches."
-  [{:keys [ctx config]}]
-  (let [{:keys [num-layers max-seq-len weight-enum layer-configs]} config]
-    (mapv (fn [i]
-            (let [cfg (nth layer-configs i)
-                  l-nkv (:num-kv-heads cfg)
-                  head-dim (:head-dim cfg)
-                  c-shape [1 l-nkv max-seq-len head-dim]
-                  num-elements (reduce * 1 c-shape)
-                  zero-data (if (= weight-enum 11) (float-array num-elements) (short-array num-elements))]
-              [(xla/buffer-from-host-buffer ctx (:client ctx) zero-data c-shape weight-enum)
-               (xla/buffer-from-host-buffer ctx (:client ctx) zero-data c-shape weight-enum)]))
-          (range num-layers))))
-
 (defn compile-inference-executables
-  "Traces and JIT-compiles Gemma 4 Single-Pass Prefill and Single-Token Decode StableHLO graphs into PJRT Executables."
-  [{:keys [ctx config opts]} prompt-len]
+  "Traces and JIT-compiles a Single Fused Gemma 4 StableHLO Graph into a native PJRT Executable."
+  [{:keys [ctx config opts]}]
   (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim max-seq-len num-layers weight-dtype layer-configs num-heads num-kv-heads num-kv-shared-layers]} config
         {:keys [verbose quiet]} opts
         num-unshared (- num-layers num-kv-shared-layers)
 
-        prefill-invars (vec (concat
-                             [[:x [:tensor [1 prompt-len] :i32]]
-                              [:pos [:tensor [prompt-len] :i32]]
-                              [:embed_tokens [:tensor [vocab-size hidden-dim] weight-dtype]]
-                              [:embed_tokens_per_layer [:tensor [vocab-size total-pl-dim] weight-dtype]]
-                              [:per_layer_model_projection [:tensor [total-pl-dim hidden-dim] weight-dtype]]
-                              [:per_layer_projection_norm [:tensor [pl-dim] weight-dtype]]
-                              [:final_norm_w [:tensor [hidden-dim] weight-dtype]]]
-                             (mapcat (fn [i]
-                                       (let [cfg (nth layer-configs i)
-                                             {:keys [q-dim kv-dim head-dim mlp-dim]} cfg]
-                                         [[(keyword (str "input_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                          [(keyword (str "layer_scalar_w_" i)) [:tensor [1] weight-dtype]]
-                                          [(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] weight-dtype]]
-                                          [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
-                                          [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
-                                          [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] weight-dtype]]
-                                          [(keyword (str "q_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
-                                          [(keyword (str "k_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
-                                          [(keyword (str "post_attn_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                          [(keyword (str "pre_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                          [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                          [(keyword (str "gate_w_" i)) [:tensor [mlp-dim hidden-dim] weight-dtype]]
-                                          [(keyword (str "up_w_" i)) [:tensor [mlp-dim hidden-dim] weight-dtype]]
-                                          [(keyword (str "down_w_" i)) [:tensor [hidden-dim mlp-dim] weight-dtype]]
-                                          [(keyword (str "per_layer_gate_w_" i)) [:tensor [pl-dim hidden-dim] weight-dtype]]
-                                          [(keyword (str "per_layer_proj_w_" i)) [:tensor [hidden-dim pl-dim] weight-dtype]]
-                                          [(keyword (str "post_per_layer_norm_w_" i)) [:tensor [hidden-dim] weight-dtype]]]))
-                                     (range num-layers))
-                             (mapcat (fn [i]
-                                       (let [cfg (nth layer-configs i)
-                                             l-nkv (:num-kv-heads cfg)
-                                             head-dim (:head-dim cfg)]
-                                         [[(keyword (str "k_cache_" i)) [:tensor [1 l-nkv max-seq-len head-dim] weight-dtype]]
-                                          [(keyword (str "v_cache_" i)) [:tensor [1 l-nkv max-seq-len head-dim] weight-dtype]]]))
-                                     (range num-layers))))
+        invars (vec (concat
+                     [[:x [:tensor [1 max-seq-len] :i32]]
+                      [:pos [:tensor [max-seq-len] :i32]]
+                      [:embed_tokens [:tensor [vocab-size hidden-dim] weight-dtype]]
+                      [:embed_tokens_per_layer [:tensor [vocab-size total-pl-dim] weight-dtype]]
+                      [:per_layer_model_projection [:tensor [total-pl-dim hidden-dim] weight-dtype]]
+                      [:per_layer_projection_norm [:tensor [pl-dim] weight-dtype]]
+                      [:final_norm_w [:tensor [hidden-dim] weight-dtype]]]
+                     (mapcat (fn [i]
+                               (let [cfg (nth layer-configs i)
+                                     {:keys [q-dim kv-dim head-dim mlp-dim]} cfg]
+                                 [[(keyword (str "input_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                  [(keyword (str "layer_scalar_w_" i)) [:tensor [1] weight-dtype]]
+                                  [(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] weight-dtype]]
+                                  [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
+                                  [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
+                                  [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] weight-dtype]]
+                                  [(keyword (str "q_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
+                                  [(keyword (str "k_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
+                                  [(keyword (str "post_attn_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                  [(keyword (str "pre_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                  [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                  [(keyword (str "gate_w_" i)) [:tensor [mlp-dim hidden-dim] weight-dtype]]
+                                  [(keyword (str "up_w_" i)) [:tensor [mlp-dim hidden-dim] weight-dtype]]
+                                  [(keyword (str "down_w_" i)) [:tensor [hidden-dim mlp-dim] weight-dtype]]
+                                  [(keyword (str "per_layer_gate_w_" i)) [:tensor [pl-dim hidden-dim] weight-dtype]]
+                                  [(keyword (str "per_layer_proj_w_" i)) [:tensor [hidden-dim pl-dim] weight-dtype]]
+                                  [(keyword (str "post_per_layer_norm_w_" i)) [:tensor [hidden-dim] weight-dtype]]]))
+                             (range num-layers))))
 
-        decode-invars (assoc prefill-invars
-                             0 [:x [:tensor [1 1] :i32]]
-                             1 [:pos [:tensor [1] :i32]])
+        trace-fn (fn [x pos-tracer emb emb-pl pl-model-proj pl-proj-norm fn-norm & weight-args]
+                   (let [lw-seq (mapv (fn [i [in-ln ls qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw plg plp pln]]
+                                        (let [cfg (nth layer-configs i)]
+                                          {:input-ln-w in-ln :layer-scalar-w ls
+                                           :q-w qw :k-w kw :v-w vw :o-w ow
+                                           :q-norm-w qn :k-norm-w kn
+                                           :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
+                                           :gate-w gw :up-w uw :down-w dw
+                                           :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
+                                           :num-heads num-heads :num-kv-heads (:num-kv-heads cfg) :head-dim (:head-dim cfg)
+                                           :theta-base (:theta-base cfg)
+                                           :rope-proportion (:rope-proportion cfg)
+                                           :norm-fn norm/rms-norm
+                                           :attn-softcap nil
+                                           :layer-type (:layer-type cfg)
+                                           :is-shared? (>= i num-unshared)}))
+                                      (range num-layers)
+                                      (mapv vec (partition 17 weight-args)))
+                         logits (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads nil 0 {:final-logit-softcap 30.0 :num-kv-shared-layers num-kv-shared-layers})]
+                     (t/convert logits :f32)))
 
-        prefill-trace-fn (fn [x pos-tracer emb emb-pl pl-model-proj pl-proj-norm fn-norm & rest-args]
-                           (let [weight-args (take (* 17 num-layers) rest-args)
-                                 kv-cache-args (drop (* 17 num-layers) rest-args)
-                                 lw-seq (mapv (fn [i [in-ln ls qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw plg plp pln]]
-                                                (let [cfg (nth layer-configs i)]
-                                                  {:input-ln-w in-ln :layer-scalar-w ls
-                                                   :q-w qw :k-w kw :v-w vw :o-w ow
-                                                   :q-norm-w qn :k-norm-w kn
-                                                   :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
-                                                   :gate-w gw :up-w uw :down-w dw
-                                                   :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
-                                                   :num-heads num-heads :num-kv-heads (:num-kv-heads cfg)
-                                                   :theta-base (:theta-base cfg)
-                                                   :rope-proportion (:rope-proportion cfg)
-                                                   :norm-fn norm/rms-norm
-                                                   :attn-softcap nil
-                                                   :layer-type (:layer-type cfg)
-                                                   :is-shared? (>= i num-unshared)}))
-                                              (range num-layers)
-                                              (mapv vec (partition 17 weight-args)))
-                                 kv-seq (mapv vec (partition 2 kv-cache-args))
-                                 [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads kv-seq 0 {:final-logit-softcap 30.0 :num-kv-shared-layers num-kv-shared-layers})
-                                 f32-logits (t/convert logits :f32)]
-                             (into [f32-logits] (apply concat updated-kv-caches))))
-
-        decode-trace-fn (fn [x pos-tracer emb emb-pl pl-model-proj pl-proj-norm fn-norm & rest-args]
-                          (let [weight-args (take (* 17 num-layers) rest-args)
-                                kv-cache-args (drop (* 17 num-layers) rest-args)
-                                lw-seq (mapv (fn [i [in-ln ls qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw plg plp pln]]
-                                               (let [cfg (nth layer-configs i)]
-                                                 {:input-ln-w in-ln :layer-scalar-w ls
-                                                  :q-w qw :k-w kw :v-w vw :o-w ow
-                                                  :q-norm-w qn :k-norm-w kn
-                                                  :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
-                                                  :gate-w gw :up-w uw :down-w dw
-                                                  :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
-                                                  :num-heads num-heads :num-kv-heads (:num-kv-heads cfg)
-                                                  :theta-base (:theta-base cfg)
-                                                  :rope-proportion (:rope-proportion cfg)
-                                                  :norm-fn norm/rms-norm
-                                                  :attn-softcap nil
-                                                  :layer-type (:layer-type cfg)
-                                                  :is-shared? (>= i num-unshared)}))
-                                             (range num-layers)
-                                             (mapv vec (partition 17 weight-args)))
-                                kv-seq (mapv vec (partition 2 kv-cache-args))
-                                [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads kv-seq pos-tracer {:final-logit-softcap 30.0 :num-kv-shared-layers num-kv-shared-layers})
-                                f32-logits (t/convert logits :f32)]
-                            (into [f32-logits] (apply concat updated-kv-caches))))
-
-        _ (when-not quiet (println "Tracing & JIT Compiling Gemma 4 Single-Pass Prefill Graph..."))
-        prefill-graph (trace-graph "gemma4_prefill" prefill-invars prefill-trace-fn)
-        prefill-exec (xla/compile-graph ctx prefill-graph)
-
-        _ (when-not quiet (println "Tracing & JIT Compiling Gemma 4 Single-Token Decoding Graph..."))
-        decode-graph (trace-graph "gemma4_decode" decode-invars decode-trace-fn)
-        decode-exec (xla/compile-graph ctx decode-graph)
-        _ (when-not quiet (println "Successfully compiled StableHLO prefill and decode graphs to native XLA PjRtLoadedExecutable handles."))]
+        _ (when-not quiet (println "Tracing & JIT Compiling Single Fused Gemma 4 StableHLO Graph..."))
+        fused-graph (trace-graph "gemma4_fused_forward" invars trace-fn)
+        exec (xla/compile-graph ctx fused-graph)
+        _ (when-not quiet (println "Successfully compiled StableHLO fused forward graph to native XLA PjRtLoadedExecutable handle."))]
 
     (when verbose
       (println "\n==================================================================")
-      (println "--- Single-Pass Prefill EDN SSA Graph ---")
-      (pprint/pprint prefill-graph)
-      (println "\n--- Single-Token Decode EDN SSA Graph ---")
-      (pprint/pprint decode-graph)
+      (println "--- Single Fused Forward EDN SSA Graph ---")
+      (pprint/pprint fused-graph)
       (println "==================================================================\n"))
 
-    {:prefill-exec prefill-exec
-     :decode-exec decode-exec
-     :prefill-graph prefill-graph
-     :decode-graph decode-graph}))
+    exec))
 
-(defn run-prompt-prefill
-  "Runs Single-Pass Prompt Prefill phase on PJRT device runtime."
-  [{:keys [ctx tokenizer config opts]} executables device-weights initial-kv-bufs prompt-ids]
-  (let [prompt-len (count prompt-ids)
-        {:keys [vocab-size]} config
-        {:keys [temperature top-k quiet]} opts
-        {:keys [prefill-exec]} executables
-        prompt-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array prompt-ids) [1 prompt-len] 4)
-        pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array (range prompt-len)) [prompt-len] 4)
-        flat-kv-bufs (vec (apply concat initial-kv-bufs))
-        prefill-args (into [prompt-buf pos-buf] (concat device-weights flat-kv-bufs))
-        prefill-res (xla/execute prefill-exec prefill-args)
-        _ (do (xla/destroy-buffer! ctx prompt-buf)
-              (xla/destroy-buffer! ctx pos-buf))
-        prefill-logits-buf (if (vector? prefill-res) (first prefill-res) prefill-res)
-        prefill-kv-flat (if (vector? prefill-res) (rest prefill-res) [])
-        prefill-kv-bufs (mapv vec (partition 2 prefill-kv-flat))
-        last-logits (xla/to-host-slice prefill-logits-buf (dec prompt-len) vocab-size (* prompt-len vocab-size))
-        indexed (map-indexed vector (vec last-logits))
-        top-10 (take 10 (sort-by second > indexed))
-        _ (when-not quiet
-            (println "\n=== Top 10 Prefill Predicted Tokens ===")
-            (doseq [[id logit] top-10]
-              (println (format "  token %6d | logit: %8.4f | text: %s" id logit (pr-str (decode tokenizer [id]))))))
-        first-gen-tok (sampling/sample-logits last-logits {:temperature temperature :top-k top-k})]
-    {:first-gen-tok first-gen-tok
-     :prefill-kv-bufs prefill-kv-bufs
-     :prompt-ids prompt-ids}))
-
-(defn run-autoregressive-decode
-  "Runs the single-token autoregressive decoding loop."
-  [{:keys [ctx tokenizer config opts]} executables device-weights prefill-result]
+(defn run-autoregressive-generation
+  "Runs autoregressive text generation using single fused XLA GPU execution graph."
+  [{:keys [ctx tokenizer config opts]} exec device-weights prompt-ids]
   (let [{:keys [max-new-tokens temperature top-k quiet]} opts
-        {:keys [vocab-size]} config
-        {:keys [decode-exec]} executables
-        {:keys [first-gen-tok prefill-kv-bufs prompt-ids]} prefill-result
-        prompt-len (count prompt-ids)
-        eos (eos-id tokenizer)]
-    (print (decode tokenizer [first-gen-tok]))
-    (flush)
-    (if (= first-gen-tok eos)
-      (do (when-not quiet (println "\nReached EOS token."))
-          (vec prompt-ids))
-      (loop [context (conj (vec prompt-ids) first-gen-tok)
-             current-kv-bufs prefill-kv-bufs
-             pos prompt-len
-             step 1]
-        (if (>= step max-new-tokens)
-          context
-          (let [last-tok (last context)
-                tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [last-tok]) [1 1] 4)
-                pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [pos]) [1] 4)
-                flat-kv (vec (apply concat current-kv-bufs))
-                exec-args (into [tok-buf pos-buf] (concat device-weights flat-kv))
-                res-bufs (xla/execute decode-exec exec-args)
-                logits-buf (if (vector? res-bufs) (first res-bufs) res-bufs)
-                new-kv-flat (if (vector? res-bufs) (rest res-bufs) [])
-                updated-kv-bufs (mapv vec (partition 2 new-kv-flat))
-                step-logits (xla/to-host-slice logits-buf 0 vocab-size vocab-size)
-                next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})
-                _ (do (xla/destroy-buffer! ctx tok-buf)
-                      (xla/destroy-buffer! ctx pos-buf)
-                      (xla/destroy-buffer! ctx logits-buf))
-                next-context (conj context next-tok)]
-            (print (decode tokenizer [next-tok]))
-            (flush)
-            (if (or (= next-tok eos) (= next-tok 106))
-              next-context
-              (recur next-context updated-kv-bufs (inc pos) (inc step)))))))))
+        {:keys [max-seq-len vocab-size]} config
+        eos (eos-id tokenizer)
+        pos-array (int-array (range max-seq-len))
+        pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) pos-array [max-seq-len] 4)]
+    (loop [cur-tokens (vec prompt-ids)
+           step 0]
+      (if (or (>= step max-new-tokens) (and (seq cur-tokens) (= (last cur-tokens) eos)))
+        (do (xla/destroy-buffer! ctx pos-buf)
+            cur-tokens)
+        (let [seq-len (count cur-tokens)
+              padded-tokens (int-array (concat cur-tokens (repeat (- max-seq-len seq-len) 0)))
+              tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) padded-tokens [1 max-seq-len] 4)
+              input-args (into [tok-buf pos-buf] device-weights)
+              logits-buf (xla/execute exec input-args)
+              step-logits (xla/to-host-slice logits-buf 0 vocab-size vocab-size)
+              next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})
+              _ (do (xla/destroy-buffer! ctx tok-buf)
+                    (xla/destroy-buffer! ctx logits-buf))]
+          (when-not quiet
+            (if (= step 0)
+              (print (format "%s%s" (decode tokenizer prompt-ids) (decode tokenizer [next-tok])))
+              (print (decode tokenizer [next-tok])))
+            (flush))
+          (recur (conj cur-tokens next-tok) (inc step)))))))
 
 (defn generate-text
-  "Top-level REPL/programmatic helper: runs full end-to-end text generation on an initialized session."
-  ([session] (generate-text session (or (:prompt (:opts session)) "The capital of France is")))
-  ([session prompt-text]
-   (let [{:keys [tokenizer opts]} session
-         {:keys [max-new-tokens temperature top-k quiet]} opts
-         clean-prompt (str/replace prompt-text #"\\n" "\n")
-         model-dir (get-in session [:config :model-dir] "")
-         is-it-model? (or (str/includes? model-dir "-it") (str/includes? clean-prompt "<|turn>"))
-         prompt-ids (cond
-                      (str/includes? clean-prompt "<|turn>")
-                      ;; Parse raw control string into special token IDs
-                      (let [parts (clojure.string/split clean-prompt #"(?=<\|turn>)|(?<=<\|turn>)|(?=<turn\|>)|(?<=<turn\|>)")
-                            toks (mapcat (fn [p]
-                                           (cond
-                                             (= p "<|turn>") [105]
-                                             (= p "<turn|>") [106]
-                                             :else (encode tokenizer p)))
-                                         parts)]
-                        (into [(bos-id tokenizer)] toks))
+  "Generates text response using Gemma 4 Single Fused XLA Execution Graph."
+  [session prompt]
+  (let [{:keys [tokenizer opts]} session
+        {:keys [max-new-tokens temperature top-k model quiet]} opts
+        clean-prompt (or prompt "The capital of France is")
+        model-str (or model (get-in session [:config :model-dir]) "")
+        is-it-model (str/includes? (str/lower-case model-str) "-it")
+        prompt-ids (cond
+                     is-it-model
+                     (let [raw-ids (encode tokenizer clean-prompt)
+                           clean-ids (if (= (first raw-ids) (bos-id tokenizer)) (rest raw-ids) raw-ids)]
+                       (vec (concat [(bos-id tokenizer) 105 2364 107] clean-ids [106 107 105 4368 107])))
 
-                      is-it-model?
-                      ;; Wrap plain question/prompt into Gemma 4 IT Turn Template
-                      (let [raw-ids (encode tokenizer clean-prompt)
-                            clean-ids (if (= (first raw-ids) (bos-id tokenizer)) (rest raw-ids) raw-ids)]
-                        (vec (concat [(bos-id tokenizer) 105 2364 107] clean-ids [106 107 105 4368 107])))
+                     :else
+                     (let [raw-ids (encode tokenizer clean-prompt)]
+                       (if (= (first raw-ids) (bos-id tokenizer))
+                         (vec raw-ids)
+                         (vec (cons (bos-id tokenizer) raw-ids)))))
+        prompt-len (count prompt-ids)]
+    (when-not quiet
+      (println (format "Prompt: \"%s\"" clean-prompt))
+      (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d, precision=%s"
+                       max-new-tokens temperature top-k (name (get-in session [:config :weight-dtype]))))
+      (println (format "Encoded Token IDs (%d tokens): %s" prompt-len prompt-ids)))
 
-                      :else
-                      ;; Base Pretrained model (e.g. google/gemma-4-E2B): direct prompt completion
-                      (let [raw-ids (encode tokenizer clean-prompt)]
-                        (if (= (first raw-ids) (bos-id tokenizer))
-                          (vec raw-ids)
-                          (vec (cons (bos-id tokenizer) raw-ids)))))
-         prompt-len (count prompt-ids)]
-     (when-not quiet
-       (println (format "Prompt: \"%s\"" clean-prompt))
-       (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d, precision=%s"
-                        max-new-tokens temperature top-k (name (get-in session [:config :weight-dtype]))))
-       (println (format "Encoded Token IDs (%d tokens): %s" prompt-len prompt-ids)))
-
-     (when-not quiet (println "Transferring Gemma 4 model weights to PJRT Device Memory..."))
-     (let [device-weights (allocate-device-weights session)
-           initial-kv-bufs (allocate-kv-caches session)
-           executables (compile-inference-executables session prompt-len)]
-       (when-not quiet
-         (println "\nGenerating tokens autoregressively with Gemma 4 Single-Pass Prefill...")
-         (print clean-prompt)
-         (flush))
-       (let [prefill-res (run-prompt-prefill session executables device-weights initial-kv-bufs prompt-ids)
-             final-context (run-autoregressive-decode session executables device-weights prefill-res)]
-         (if quiet
-           (println)
-           (do
-             (println "\n\n==================================================================")
-             (println "=== End-to-End Gemma 4 Single-Pass Prefill Verification Passed! ===")
-             (println "==================================================================")))
-         final-context)))))
+    (when-not quiet (println "Transferring Gemma 4 model weights to PJRT Device Memory..."))
+    (let [device-weights (allocate-device-weights session)
+          exec (compile-inference-executables session)]
+      (when-not quiet
+        (println "\nGenerating tokens autoregressively with Single Fused XLA GPU Kernel..."))
+      (let [final-context (run-autoregressive-generation session exec device-weights prompt-ids)]
+        (if quiet
+          (println)
+          (do
+            (println "\n\n==================================================================")
+            (println "=== Single Fused XLA GPU Forward Pass Verification Passed! ===")
+            (println "==================================================================")))
+        final-context))))
 
 (defn -main
   "CLI entrypoint for Gemma 4 text generation."

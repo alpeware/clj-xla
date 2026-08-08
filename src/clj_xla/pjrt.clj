@@ -320,6 +320,7 @@
                out-lists (.allocate arena ValueLayout/ADDRESS (long 1))
                _ (.setAtIndex ^MemorySegment out-lists ValueLayout/ADDRESS (long 0) out-ptrs)
                opts (.allocate arena (long 112))
+               _ (.fill opts (byte 0))
                _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 0) (long 112))
                args (.allocate arena (long 80))]
            (.fill args (byte 0))
