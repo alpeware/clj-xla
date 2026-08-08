@@ -278,61 +278,61 @@
          devs (when cli (addressable-devices api-ctx cli))
          dev (first devs)
          num-args (count input-buffers)
-         num-outs (max 1 (long (or num-outputs 1)))
-         arena (Arena/ofAuto)
-         arg-ptrs (.allocate arena ValueLayout/ADDRESS (long num-args))]
-     (dotimes [i num-args]
-       (.setAtIndex ^MemorySegment arg-ptrs ValueLayout/ADDRESS (long i) (nth input-buffers i)))
-     (let [arg-lists (.allocate arena ValueLayout/ADDRESS (long 1))
-           _ (.setAtIndex ^MemorySegment arg-lists ValueLayout/ADDRESS (long 0) arg-ptrs)
-           out-ptrs (.allocate arena ValueLayout/ADDRESS (long num-outs))
-           out-lists (.allocate arena ValueLayout/ADDRESS (long 1))
-           _ (.setAtIndex ^MemorySegment out-lists ValueLayout/ADDRESS (long 0) out-ptrs)
-           opts (.allocate arena (long 112))
-           _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 0) (long 112))
-           args (.allocate arena (long 80))]
-       (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 80))
-       (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) exec-handle)
-       (.set ^MemorySegment args ValueLayout/ADDRESS (long 24) opts)
-       (.set ^MemorySegment args ValueLayout/ADDRESS (long 32) arg-lists)
-       (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long 1))
-       (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-args))
-       (.set ^MemorySegment args ValueLayout/ADDRESS (long 56) out-lists)
-       (when dev
-         (.set ^MemorySegment args ValueLayout/ADDRESS (long 72) dev))
-       (let [handle (downcall-ptr linker api-ptr OFFSET_LOADED_EXECUTABLE_EXECUTE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-             err (.invokeWithArguments ^MethodHandle handle [args])]
-         (check-error! api-ctx err)
-         (if (= num-outs 1)
-           (.get ^MemorySegment out-ptrs ValueLayout/ADDRESS (long 0))
-           (mapv (fn [i] (.getAtIndex ^MemorySegment out-ptrs ValueLayout/ADDRESS (long i))) (range num-outs))))))))
+         num-outs (max 1 (long (or num-outputs 1)))]
+     (with-open [arena (Arena/ofConfined)]
+       (let [arg-ptrs (.allocate arena ValueLayout/ADDRESS (long num-args))]
+         (dotimes [i num-args]
+           (.setAtIndex ^MemorySegment arg-ptrs ValueLayout/ADDRESS (long i) (nth input-buffers i)))
+         (let [arg-lists (.allocate arena ValueLayout/ADDRESS (long 1))
+               _ (.setAtIndex ^MemorySegment arg-lists ValueLayout/ADDRESS (long 0) arg-ptrs)
+               out-ptrs (.allocate arena ValueLayout/ADDRESS (long num-outs))
+               out-lists (.allocate arena ValueLayout/ADDRESS (long 1))
+               _ (.setAtIndex ^MemorySegment out-lists ValueLayout/ADDRESS (long 0) out-ptrs)
+               opts (.allocate arena (long 112))
+               _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 0) (long 112))
+               args (.allocate arena (long 80))]
+           (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 80))
+           (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) exec-handle)
+           (.set ^MemorySegment args ValueLayout/ADDRESS (long 24) opts)
+           (.set ^MemorySegment args ValueLayout/ADDRESS (long 32) arg-lists)
+           (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long 1))
+           (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-args))
+           (.set ^MemorySegment args ValueLayout/ADDRESS (long 56) out-lists)
+           (when dev
+             (.set ^MemorySegment args ValueLayout/ADDRESS (long 72) dev))
+           (let [handle (downcall-ptr linker api-ptr OFFSET_LOADED_EXECUTABLE_EXECUTE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                 err (.invokeWithArguments ^MethodHandle handle [args])]
+             (check-error! api-ctx err)
+             (if (= num-outs 1)
+               (.get ^MemorySegment out-ptrs ValueLayout/ADDRESS (long 0))
+               (mapv (fn [i] (.getAtIndex ^MemorySegment out-ptrs ValueLayout/ADDRESS (long i))) (range num-outs))))))))))
 
 (defn buffer-to-host-buffer
   "Copies device PJRT_Buffer `buffer-handle` to host float array, awaiting asynchronous completion."
   [api-ctx buffer-handle num-floats]
   (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)
-        byte-size (* num-floats 4)
-        arena (Arena/ofAuto)
-        dst-seg (.allocate arena ValueLayout/JAVA_FLOAT (long num-floats))
-        args (.allocate arena (long 56))]
-    (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 56))
-    (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) buffer-handle)
-    (.set ^MemorySegment args ValueLayout/ADDRESS (long 32) dst-seg)
-    (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long byte-size))
-    (let [handle (downcall-ptr linker api-ptr OFFSET_BUFFER_TO_HOST_BUFFER ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-          err (.invokeWithArguments ^MethodHandle handle [args])]
-      (check-error! api-ctx err)
-      (let [event-ptr (.get ^MemorySegment args ValueLayout/ADDRESS (long 48))]
-        (when (and (some? event-ptr) (not= MemorySegment/NULL event-ptr))
-          (let [await-args (.allocate arena (long 24))]
-            (.set ^MemorySegment await-args ValueLayout/JAVA_LONG (long 0) (long 24))
-            (.set ^MemorySegment await-args ValueLayout/ADDRESS (long 16) event-ptr)
-            (let [await-handle (downcall-ptr linker api-ptr OFFSET_EVENT_AWAIT ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-                  await-err (.invokeWithArguments ^MethodHandle await-handle [await-args])]
-              (check-error! api-ctx await-err)))
-          (let [destroy-args (.allocate arena (long 24))]
-            (.set ^MemorySegment destroy-args ValueLayout/JAVA_LONG (long 0) (long 24))
-            (.set ^MemorySegment destroy-args ValueLayout/ADDRESS (long 16) event-ptr)
-            (let [destroy-handle (downcall-ptr linker api-ptr OFFSET_EVENT_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-                  _ (.invokeWithArguments ^MethodHandle destroy-handle [destroy-args])]))))
-      (.toArray dst-seg ValueLayout/JAVA_FLOAT))))
+        byte-size (* num-floats 4)]
+    (with-open [arena (Arena/ofConfined)]
+      (let [dst-seg (.allocate arena ValueLayout/JAVA_FLOAT (long num-floats))
+            args (.allocate arena (long 56))]
+        (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 56))
+        (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) buffer-handle)
+        (.set ^MemorySegment args ValueLayout/ADDRESS (long 32) dst-seg)
+        (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long byte-size))
+        (let [handle (downcall-ptr linker api-ptr OFFSET_BUFFER_TO_HOST_BUFFER ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+              err (.invokeWithArguments ^MethodHandle handle [args])]
+          (check-error! api-ctx err)
+          (let [event-ptr (.get ^MemorySegment args ValueLayout/ADDRESS (long 48))]
+            (when (and (some? event-ptr) (not= MemorySegment/NULL event-ptr))
+              (let [await-args (.allocate arena (long 24))]
+                (.set ^MemorySegment await-args ValueLayout/JAVA_LONG (long 0) (long 24))
+                (.set ^MemorySegment await-args ValueLayout/ADDRESS (long 16) event-ptr)
+                (let [await-handle (downcall-ptr linker api-ptr OFFSET_EVENT_AWAIT ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                      await-err (.invokeWithArguments ^MethodHandle await-handle [await-args])]
+                  (check-error! api-ctx await-err)))
+              (let [destroy-args (.allocate arena (long 24))]
+                (.set ^MemorySegment destroy-args ValueLayout/JAVA_LONG (long 0) (long 24))
+                (.set ^MemorySegment destroy-args ValueLayout/ADDRESS (long 16) event-ptr)
+                (let [destroy-handle (downcall-ptr linker api-ptr OFFSET_EVENT_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                      _ (.invokeWithArguments ^MethodHandle destroy-handle [destroy-args])])))))
+        (.toArray dst-seg ValueLayout/JAVA_FLOAT)))))

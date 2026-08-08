@@ -45,7 +45,10 @@
     :so-name "libpjrt_rocm.so"
     :entry-pattern #"(xla_rocm_plugin|pjrt_rocm_plugin)\.so$"
     :arch-pkgs ["https://archlinux.org/packages/extra/x86_64/rocprofiler/download/"
-                "https://archlinux.org/packages/extra/x86_64/hsa-amd-aqlprofile/download/"]}})
+                "https://archlinux.org/packages/extra/x86_64/hsa-amd-aqlprofile/download/"
+                "https://archlinux.org/packages/extra/x86_64/google-glog/download/"
+                "https://archlinux.org/packages/extra/x86_64/yaml-cpp/download/"
+                "https://archlinux.org/packages/extra/x86_64/gflags/download/"]}})
 
 (def URL-FALLBACKS
   "Map of primary download URLs to PyPI mirror URLs if primary yields HTTP 404."
@@ -144,7 +147,9 @@
     (doseq [arch-url arch-pkgs]
       (println (str "Fetching companion Arch Linux package: " arch-url "..."))
       (try
-        (let [pb (ProcessBuilder. ["sh" "-c" (str "curl -sL " arch-url " | unzstd | tar -C " (.getAbsolutePath lib-dir) " -xf - --strip-components=3 opt/rocm/lib/")])
+        (let [cmd (str "curl -sL " arch-url " | unzstd | tar -C " (.getAbsolutePath lib-dir) " -xf - --strip-components=3 opt/rocm/lib/ 2>/dev/null || "
+                       "curl -sL " arch-url " | unzstd | tar -C " (.getAbsolutePath lib-dir) " -xf - --strip-components=2 usr/lib/ 2>/dev/null || true")
+              pb (ProcessBuilder. ["sh" "-c" cmd])
               proc (.start pb)]
           (.waitFor proc))
         (catch Exception e
