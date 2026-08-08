@@ -43,7 +43,9 @@
    :rocm
    {:url "https://files.pythonhosted.org/packages/4b/7b/04673b3e351fe02c9380b05740f185a10903b9d9fe222df314391c79e71c/jax_rocm7_pjrt-0.10.2-py3-none-manylinux_2_27_x86_64.whl"
     :so-name "libpjrt_rocm.so"
-    :entry-pattern #"(xla_rocm_plugin|pjrt_rocm_plugin)\.so$"}})
+    :entry-pattern #"(xla_rocm_plugin|pjrt_rocm_plugin)\.so$"
+    :arch-pkgs ["https://archlinux.org/packages/extra/x86_64/rocprofiler/download/"
+                "https://archlinux.org/packages/extra/x86_64/hsa-amd-aqlprofile/download/"]}})
 
 (def URL-FALLBACKS
   "Map of primary download URLs to PyPI mirror URLs if primary yields HTTP 404."
@@ -124,7 +126,7 @@
 (defn fetch-binary
   "Fetches and unpacks native shared objects and dependencies for `target` into bin/ and bin/lib/."
   [target]
-  (let [{:keys [url so-name entry-pattern deps]} (get SOURCES target)
+  (let [{:keys [url so-name entry-pattern deps arch-pkgs]} (get SOURCES target)
         _ (assert (some? url) (str "Unknown target: " target))
         bin-dir (io/file "bin")
         lib-dir (io/file bin-dir "lib")
@@ -138,6 +140,15 @@
     (doseq [dep-url deps]
       (println (str "Fetching companion dependency wheel: " dep-url "..."))
       (unpack-all-sos-from-wheel dep-url lib-dir))
+    ;; Extract companion Arch Linux packages if present
+    (doseq [arch-url arch-pkgs]
+      (println (str "Fetching companion Arch Linux package: " arch-url "..."))
+      (try
+        (let [pb (ProcessBuilder. ["sh" "-c" (str "curl -sL " arch-url " | unzstd | tar -C " (.getAbsolutePath lib-dir) " -xf - --strip-components=3 opt/rocm/lib/")])
+              proc (.start pb)]
+          (.waitFor proc))
+        (catch Exception e
+          (println (str "Warning: Failed to extract Arch package (" (.getMessage e) ")")))))
     ;; Ensure libsycl.so.9 and libccl.so.1 symlinks exist for SYCL backend
     (when (= target :sycl)
       (let [sycl8 (io/file lib-dir "libsycl.so.8")
