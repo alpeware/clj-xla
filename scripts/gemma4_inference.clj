@@ -198,13 +198,16 @@
                                      (contains? (:tensors weights-mmap) (:v-w kmap)))
                                (:v-w kmap)
                                (:k-w kmap))
-                       norms-total-el (+ (* 4 hidden-dim) (* 2 head-dim) 1)
-                       pl-total-el (when (pos? total-pl-dim)
-                                     (+ (* pl-dim hidden-dim) (* hidden-dim pl-dim) hidden-dim))]
+                       norms-base-el (+ (* 4 hidden-dim) (* 2 head-dim) 1)
+                       pl-total-el (if (pos? total-pl-dim)
+                                     (+ (* pl-dim hidden-dim) (* hidden-dim pl-dim) hidden-dim)
+                                     0)
+                       norms-total-el (+ norms-base-el pl-total-el)]
                    {:layer-idx i
                     :q-dim q-dim :kv-dim kv-dim :head-dim head-dim :mlp-dim mlp-dim
                     :qkv-rows (+ q-dim kv-dim kv-dim)
                     :gate-up-rows (* 2 mlp-dim)
+                    :norms-base-el norms-base-el
                     :norms-total-el norms-total-el
                     :pl-total-el pl-total-el
                     :keys {:q-w (:q-w kmap) :k-w (:k-w kmap) :v-w v-key
@@ -280,7 +283,7 @@
                                      (let [bf-bits (short (bit-shift-right (Float/floatToRawIntBits default-f) 16))]
                                        (java.util.Arrays/fill ^shorts arr offset (+ offset num-el) bf-bits))
                                      (java.util.Arrays/fill ^floats arr offset (+ offset num-el) default-f))))))
-        layer-bufs (mapcat (fn [{:keys [q-dim kv-dim head-dim mlp-dim qkv-rows gate-up-rows norms-total-el pl-total-el keys]}]
+        layer-bufs (mapcat (fn [{:keys [q-dim kv-dim head-dim mlp-dim qkv-rows gate-up-rows norms-base-el norms-total-el pl-total-el keys]}]
                              (let [qkv-el (* qkv-rows hidden-dim)
                                    qkv-arr (if is-bf16 (short-array qkv-el) (float-array qkv-el))
                                    _ (copy-tensor-to-arr qkv-arr (:q-w keys) [q-dim hidden-dim] 0 0.0)
@@ -306,17 +309,12 @@
                                    _ (copy-tensor-to-arr norms-arr (:post-attn-ln-w keys) [hidden-dim] (+ hidden-dim 1 head-dim head-dim) 0.0)
                                    _ (copy-tensor-to-arr norms-arr (:pre-mlp-ln-w keys) [hidden-dim] (+ (* 2 hidden-dim) 1 head-dim head-dim) 0.0)
                                    _ (copy-tensor-to-arr norms-arr (:post-mlp-ln-w keys) [hidden-dim] (+ (* 3 hidden-dim) 1 head-dim head-dim) 0.0)
-                                   norms-buf (xla/buffer-from-host-buffer ctx client norms-arr [norms-total-el] weight-enum)
-
-                                   ple-buf (when has-ple?
-                                             (let [ple-arr (if is-bf16 (short-array pl-total-el) (float-array pl-total-el))
-                                                   _ (copy-tensor-to-arr ple-arr (:per-layer-gate-w keys) [pl-dim hidden-dim] 0 0.0)
-                                                   _ (copy-tensor-to-arr ple-arr (:per-layer-proj-w keys) [hidden-dim pl-dim] (* pl-dim hidden-dim) 0.0)
-                                                   _ (copy-tensor-to-arr ple-arr (:post-per-layer-norm-w keys) [hidden-dim] (+ (* pl-dim hidden-dim) (* hidden-dim pl-dim)) 0.0)]
-                                               (xla/buffer-from-host-buffer ctx client ple-arr [pl-total-el] weight-enum)))]
-                               (if has-ple?
-                                 [qkv-buf o-buf gate-up-buf down-buf norms-buf ple-buf]
-                                 [qkv-buf o-buf gate-up-buf down-buf norms-buf])))
+                                   _ (when (pos? pl-total-el)
+                                       (copy-tensor-to-arr norms-arr (:per-layer-gate-w keys) [pl-dim hidden-dim] norms-base-el 0.0)
+                                       (copy-tensor-to-arr norms-arr (:per-layer-proj-w keys) [hidden-dim pl-dim] (+ norms-base-el (* pl-dim hidden-dim)) 0.0)
+                                       (copy-tensor-to-arr norms-arr (:post-per-layer-norm-w keys) [hidden-dim] (+ norms-base-el (* pl-dim hidden-dim) (* hidden-dim pl-dim)) 0.0))
+                                   norms-buf (xla/buffer-from-host-buffer ctx client norms-arr [norms-total-el] weight-enum)]
+                               [qkv-buf o-buf gate-up-buf down-buf norms-buf]))
                            layer-grouped-specs)]
     (vec (concat (into [embed-buf] ple-global-bufs) [final-norm-buf] layer-bufs))))
 
@@ -332,15 +330,12 @@
                              [:per_layer_model_projection [:tensor [total-pl-dim hidden-dim] weight-dtype]]
                              [:per_layer_projection_norm [:tensor [pl-dim] weight-dtype]]])
         layer-invars (mapcat (fn [i]
-                               (let [{:keys [q-dim qkv-rows gate-up-rows mlp-dim norms-total-el pl-total-el]} (nth layer-grouped-specs i)
-                                     base-inv [[(keyword (str "l" i "_qkv")) [:tensor [qkv-rows hidden-dim] weight-dtype]]
-                                               [(keyword (str "l" i "_o")) [:tensor [hidden-dim q-dim] weight-dtype]]
-                                               [(keyword (str "l" i "_gate_up")) [:tensor [gate-up-rows hidden-dim] weight-dtype]]
-                                               [(keyword (str "l" i "_down")) [:tensor [hidden-dim mlp-dim] weight-dtype]]
-                                               [(keyword (str "l" i "_norms")) [:tensor [norms-total-el] weight-dtype]]]]
-                                 (if has-ple?
-                                   (conj base-inv [(keyword (str "l" i "_ple")) [:tensor [pl-total-el] weight-dtype]])
-                                   base-inv)))
+                               (let [{:keys [q-dim qkv-rows gate-up-rows mlp-dim norms-total-el]} (nth layer-grouped-specs i)]
+                                 [[(keyword (str "l" i "_qkv")) [:tensor [qkv-rows hidden-dim] weight-dtype]]
+                                  [(keyword (str "l" i "_o")) [:tensor [hidden-dim q-dim] weight-dtype]]
+                                  [(keyword (str "l" i "_gate_up")) [:tensor [gate-up-rows hidden-dim] weight-dtype]]
+                                  [(keyword (str "l" i "_down")) [:tensor [hidden-dim mlp-dim] weight-dtype]]
+                                  [(keyword (str "l" i "_norms")) [:tensor [norms-total-el] weight-dtype]]]))
                              (range num-layers))
         invars (vec (concat
                      [[:x [:tensor [1 max-seq-len] :i32]]
@@ -352,10 +347,10 @@
 
         trace-fn (if has-ple?
                    (fn [x pos-tracer emb emb-pl pl-model-proj pl-proj-norm fn-norm & all-layer-tracers]
-                     (let [group-size 6
+                     (let [group-size 5
                            tr-partitioned (mapv vec (partition group-size all-layer-tracers))
-                           lw-seq (mapv (fn [i [qkv-tr o-tr gate-up-tr down-tr norms-tr ple-tr]]
-                                          (let [{:keys [q-dim kv-dim head-dim mlp-dim]} (nth layer-grouped-specs i)
+                           lw-seq (mapv (fn [i [qkv-tr o-tr gate-up-tr down-tr norms-tr]]
+                                          (let [{:keys [q-dim kv-dim head-dim mlp-dim norms-base-el]} (nth layer-grouped-specs i)
                                                 cfg (nth layer-configs i)
                                                 qw (t/slice qkv-tr [0 0] [q-dim hidden-dim] [1 1])
                                                 kw (t/slice qkv-tr [q-dim 0] [(+ q-dim kv-dim) hidden-dim] [1 1])
@@ -369,11 +364,11 @@
                                                 post-attn-ln (t/slice norms-tr [(+ hidden-dim 1 head-dim head-dim)] [(+ (* 2 hidden-dim) 1 head-dim head-dim)] [1])
                                                 pre-mlp-ln (t/slice norms-tr [(+ (* 2 hidden-dim) 1 head-dim head-dim)] [(+ (* 3 hidden-dim) 1 head-dim head-dim)] [1])
                                                 post-mlp-ln (t/slice norms-tr [(+ (* 3 hidden-dim) 1 head-dim head-dim)] [(+ (* 4 hidden-dim) 1 head-dim head-dim)] [1])
-                                                plg-1d (t/slice ple-tr [0] [(* pl-dim hidden-dim)] [1])
+                                                plg-1d (t/slice norms-tr [norms-base-el] [(+ norms-base-el (* pl-dim hidden-dim))] [1])
                                                 plg (t/reshape plg-1d [pl-dim hidden-dim])
-                                                plp-1d (t/slice ple-tr [(* pl-dim hidden-dim)] [(+ (* pl-dim hidden-dim) (* hidden-dim pl-dim))] [1])
+                                                plp-1d (t/slice norms-tr [(+ norms-base-el (* pl-dim hidden-dim))] [(+ norms-base-el (* pl-dim hidden-dim) (* hidden-dim pl-dim))] [1])
                                                 plp (t/reshape plp-1d [hidden-dim pl-dim])
-                                                pln (t/slice ple-tr [(+ (* pl-dim hidden-dim) (* hidden-dim pl-dim))] [(+ (* pl-dim hidden-dim) (* hidden-dim pl-dim) hidden-dim)] [1])]
+                                                pln (t/slice norms-tr [(+ norms-base-el (* pl-dim hidden-dim) (* hidden-dim pl-dim))] [(+ norms-base-el (* pl-dim hidden-dim) (* hidden-dim pl-dim) hidden-dim)] [1])]
                                             {:input-ln-w in-ln :layer-scalar-w ls
                                              :q-w qw :k-w kw :v-w vw :o-w o-tr
                                              :q-norm-w qn :k-norm-w kn

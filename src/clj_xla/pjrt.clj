@@ -378,9 +378,9 @@
                out-ptrs (.allocate arena ValueLayout/ADDRESS (long num-outs))
                out-lists (.allocate arena ValueLayout/ADDRESS (long 1))
                _ (.setAtIndex ^MemorySegment out-lists ValueLayout/ADDRESS (long 0) out-ptrs)
-               opts (.allocate arena (long 112))
+               opts (.allocate arena (long 144))
                _ (.fill opts (byte 0))
-               _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 0) (long 112))
+               _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 0) (long 144))
                args (.allocate arena (long 80))]
            (.fill args (byte 0))
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 80))
@@ -390,6 +390,9 @@
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long 1))
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-args))
            (.set ^MemorySegment args ValueLayout/ADDRESS (long 56) out-lists)
+           (when-let [devs (addressable-devices api-ctx (:client api-ctx))]
+             (when (seq devs)
+               (.set ^MemorySegment args ValueLayout/ADDRESS (long 72) ^MemorySegment (first devs))))
            (let [handle (downcall-ptr linker api-ptr OFFSET_LOADED_EXECUTABLE_EXECUTE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
                  err (.invokeWithArguments ^MethodHandle handle [args])]
              (check-error! api-ctx err)
