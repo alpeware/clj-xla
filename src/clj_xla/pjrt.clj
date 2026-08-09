@@ -296,6 +296,13 @@
                                           (int-array (map int (flatten host-data))))]
                            (.allocateFrom arena ValueLayout/JAVA_INT ia))
 
+                         (instance? (Class/forName "[B") host-data)
+                         (let [^bytes ba ^bytes host-data
+                               num-bytes (alength ba)
+                               seg (.allocate arena (long num-bytes) (long 64))]
+                           (MemorySegment/copy ba 0 seg ValueLayout/JAVA_BYTE (long 0) num-bytes)
+                           seg)
+
                          (instance? (Class/forName "[S") host-data)
                          (let [^shorts sa ^shorts host-data
                                num-shorts (alength sa)
@@ -323,7 +330,7 @@
           (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-dims))
           ;; Compute row-major byte strides for dense layout.
           ;; ROCm PJRT requires byte_strides when num_dims > 0.
-          (let [elem-bytes (case (int dtype-enum) 4 4, 11 4, 10 2, 13 2, 4)
+          (let [elem-bytes (case (int dtype-enum) 2 1, 4 4, 11 4, 10 2, 13 2, 4)
                 strides-seg (when (pos? num-dims)
                               (let [seg (.allocate arena ValueLayout/JAVA_LONG (long num-dims))]
                                 (loop [i (dec num-dims) stride (long elem-bytes)]

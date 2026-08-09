@@ -119,7 +119,7 @@
                                    (if (instance? java.lang.foreign.MemorySegment input-data)
                                      input-data
                                      (let [[_var-name [_kw shape dtype]] (nth invars idx)
-                                           dtype-enum (case dtype :i32 4 :f32 11 :bf16 13 :f16 10 11)]
+                                           dtype-enum (case dtype :i8 2 :i32 4 :f32 11 :bf16 13 :f16 10 11)]
                                        (pjrt/buffer-from-host-buffer ctx (:client ctx) input-data shape dtype-enum))))
                                  (range (count flat-inputs))
                                  flat-inputs)

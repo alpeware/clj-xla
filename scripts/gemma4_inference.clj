@@ -160,6 +160,31 @@
      (let [slice (st/get-tensor-slice weights-mmap tensor-name)]
        (xla/buffer-from-host-buffer ctx (:client ctx) slice shape weight-enum)))))
 
+(defn quantize-bf16-to-int8
+  "Quantizes a BF16 short-array to INT8 byte-array with per-tensor symmetric quantization.
+   Returns {:data byte-array :scale float}."
+  [^shorts bf16-shorts]
+  (let [n (alength bf16-shorts)
+        ;; Find max absolute value in BF16
+        max-abs (loop [i 0 m (float 0.0)]
+                  (if (>= i n)
+                    m
+                    (let [s (int (aget bf16-shorts i))
+                          bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))
+                          f (Math/abs (Float/intBitsToFloat bits))]
+                      (recur (inc i) (max m f)))))
+        scale (if (zero? max-abs) 1.0 (/ (double max-abs) 127.0))
+        inv-scale (float (/ 1.0 scale))
+        result (byte-array n)]
+    (dotimes [i n]
+      (let [s (int (aget bf16-shorts i))
+            bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))
+            f (Float/intBitsToFloat bits)
+            q (Math/round (* f inv-scale))
+            clamped (max -127 (min 127 q))]
+        (aset result i (byte clamped))))
+    {:data result :scale (float scale)}))
+
 (defn init-inference-session
   "Initializes PJRT runtime, loads safetensors weights, and prepares model configuration for Gemma 4 REPL/CLI sessions."
   ([opts]
@@ -258,7 +283,10 @@
                (range num-layers))
 
          weight-dtype (or precision :bf16)
-         weight-enum (if (= weight-dtype :f32) 11 13)]
+         is-int8 (= weight-dtype :int8)
+         ;; For int8: matmul weights use S8 (enum 2), norms/embeddings stay BF16 (enum 13)
+         weight-enum (cond is-int8 2 (= weight-dtype :f32) 11 :else 13)
+         norm-enum (if (= weight-dtype :f32) 11 13)]
 
      (when-not (:quiet opts)
        (println (str "Loaded Gemma 4 model weights from [" resolved-model-dir "] in [" (name weight-dtype) "] precision (" num-layers " layers, " num-heads " heads, " num-kv-heads " kv-heads).")))
@@ -284,18 +312,20 @@
                :num-kv-shared-layers num-kv-shared-layers
                :weight-dtype weight-dtype
                :weight-enum weight-enum
+               :is-int8 is-int8
+               :norm-enum norm-enum
                :layer-grouped-specs layer-grouped-specs}})))
 
 (defn allocate-device-weights
   "Transfers all model layer, embedding, and per-layer input weights to PJRT device memory."
   [{:keys [ctx weights-mmap config]}]
-  (let [{:keys [prefix-base vocab-size hidden-dim total-pl-dim pl-dim weight-dtype weight-enum layer-grouped-specs]} config
+  (let [{:keys [prefix-base vocab-size hidden-dim total-pl-dim pl-dim weight-dtype weight-enum is-int8 norm-enum layer-grouped-specs]} config
         client (:client ctx)
-        is-bf16 (= weight-dtype :bf16)
+        is-bf16-format (not= weight-dtype :f32)
         has-ple? (pos? total-pl-dim)
         load-fn (fn
-                  ([name shape] (load-weight-buffer ctx weights-mmap name shape weight-dtype weight-enum 0.0))
-                  ([name shape default-val] (load-weight-buffer ctx weights-mmap name shape weight-dtype weight-enum default-val)))
+                  ([name shape] (load-weight-buffer ctx weights-mmap name shape (if is-int8 :bf16 weight-dtype) norm-enum 0.0))
+                  ([name shape default-val] (load-weight-buffer ctx weights-mmap name shape (if is-int8 :bf16 weight-dtype) norm-enum default-val)))
         embed-buf (load-fn (str prefix-base "embed_tokens.weight") [vocab-size hidden-dim])
         final-norm-buf (load-fn (str prefix-base "norm.weight") [hidden-dim])
         ple-global-bufs (when has-ple?
@@ -307,35 +337,57 @@
                                    has-tensor (contains? (:tensors weights-mmap) name)]
                                (if has-tensor
                                  (let [slice (st/get-tensor-slice weights-mmap name)]
-                                   (if is-bf16
+                                   (if is-bf16-format
                                      (java.lang.foreign.MemorySegment/copy slice (java.lang.foreign.ValueLayout/JAVA_SHORT) 0
                                                                            ^shorts arr offset num-el)
                                      (java.lang.foreign.MemorySegment/copy slice (java.lang.foreign.ValueLayout/JAVA_FLOAT) 0
                                                                            ^floats arr offset num-el)))
                                  (let [default-f (float default-val)]
-                                   (if is-bf16
+                                   (if is-bf16-format
                                      (let [bf-bits (short (bit-shift-right (Float/floatToRawIntBits default-f) 16))]
                                        (java.util.Arrays/fill ^shorts arr offset (+ offset num-el) bf-bits))
                                      (java.util.Arrays/fill ^floats arr offset (+ offset num-el) default-f))))))
         layer-bufs (mapcat (fn [{:keys [q-dim kv-dim head-dim mlp-dim qkv-rows gate-up-rows norms-base-el norms-total-el pl-total-el keys]}]
                              (let [qkv-el (* qkv-rows hidden-dim)
-                                   qkv-arr (if is-bf16 (short-array qkv-el) (float-array qkv-el))
+                                   qkv-arr (if is-bf16-format (short-array qkv-el) (float-array qkv-el))
                                    _ (copy-tensor-to-arr qkv-arr (:q-w keys) [q-dim hidden-dim] 0 0.0)
                                    _ (copy-tensor-to-arr qkv-arr (:k-w keys) [kv-dim hidden-dim] (* q-dim hidden-dim) 0.0)
                                    _ (copy-tensor-to-arr qkv-arr (:v-w keys) [kv-dim hidden-dim] (* (+ q-dim kv-dim) hidden-dim) 0.0)
-                                   qkv-buf (xla/buffer-from-host-buffer ctx client qkv-arr [qkv-rows hidden-dim] weight-enum)
+                                   [qkv-buf qkv-scale] (if is-int8
+                                                         (let [q (quantize-bf16-to-int8 qkv-arr)]
+                                                           [(xla/buffer-from-host-buffer ctx client (:data q) [qkv-rows hidden-dim] weight-enum)
+                                                            (xla/buffer-from-host-buffer ctx client (float-array [(:scale q)]) [1] 11)])
+                                                         [(xla/buffer-from-host-buffer ctx client qkv-arr [qkv-rows hidden-dim] weight-enum) nil])
 
-                                   o-buf (load-fn (:o-w keys) [hidden-dim q-dim])
+                                   o-el (* hidden-dim q-dim)
+                                   o-arr (if is-bf16-format (short-array o-el) (float-array o-el))
+                                   _ (copy-tensor-to-arr o-arr (:o-w keys) [hidden-dim q-dim] 0 0.0)
+                                   [o-buf o-scale] (if is-int8
+                                                     (let [q (quantize-bf16-to-int8 o-arr)]
+                                                       [(xla/buffer-from-host-buffer ctx client (:data q) [hidden-dim q-dim] weight-enum)
+                                                        (xla/buffer-from-host-buffer ctx client (float-array [(:scale q)]) [1] 11)])
+                                                     [(xla/buffer-from-host-buffer ctx client o-arr [hidden-dim q-dim] weight-enum) nil])
 
                                    gate-up-el (* gate-up-rows hidden-dim)
-                                   gate-up-arr (if is-bf16 (short-array gate-up-el) (float-array gate-up-el))
+                                   gate-up-arr (if is-bf16-format (short-array gate-up-el) (float-array gate-up-el))
                                    _ (copy-tensor-to-arr gate-up-arr (:gate-w keys) [mlp-dim hidden-dim] 0 0.0)
                                    _ (copy-tensor-to-arr gate-up-arr (:up-w keys) [mlp-dim hidden-dim] (* mlp-dim hidden-dim) 0.0)
-                                   gate-up-buf (xla/buffer-from-host-buffer ctx client gate-up-arr [gate-up-rows hidden-dim] weight-enum)
+                                   [gate-up-buf gate-up-scale] (if is-int8
+                                                                 (let [q (quantize-bf16-to-int8 gate-up-arr)]
+                                                                   [(xla/buffer-from-host-buffer ctx client (:data q) [gate-up-rows hidden-dim] weight-enum)
+                                                                    (xla/buffer-from-host-buffer ctx client (float-array [(:scale q)]) [1] 11)])
+                                                                 [(xla/buffer-from-host-buffer ctx client gate-up-arr [gate-up-rows hidden-dim] weight-enum) nil])
 
-                                   down-buf (load-fn (:down-w keys) [hidden-dim mlp-dim])
+                                   down-el (* hidden-dim mlp-dim)
+                                   down-arr (if is-bf16-format (short-array down-el) (float-array down-el))
+                                   _ (copy-tensor-to-arr down-arr (:down-w keys) [hidden-dim mlp-dim] 0 0.0)
+                                   [down-buf down-scale] (if is-int8
+                                                           (let [q (quantize-bf16-to-int8 down-arr)]
+                                                             [(xla/buffer-from-host-buffer ctx client (:data q) [hidden-dim mlp-dim] weight-enum)
+                                                              (xla/buffer-from-host-buffer ctx client (float-array [(:scale q)]) [1] 11)])
+                                                           [(xla/buffer-from-host-buffer ctx client down-arr [hidden-dim mlp-dim] weight-enum) nil])
 
-                                   norms-arr (if is-bf16 (short-array norms-total-el) (float-array norms-total-el))
+                                   norms-arr (if is-bf16-format (short-array norms-total-el) (float-array norms-total-el))
                                    _ (copy-tensor-to-arr norms-arr (:input-ln-w keys) [hidden-dim] 0 0.0)
                                    _ (copy-tensor-to-arr norms-arr (:layer-scalar-w keys) [1] hidden-dim 1.0)
                                    _ (copy-tensor-to-arr norms-arr (:q-norm-w keys) [head-dim] (+ hidden-dim 1) 0.0)
@@ -347,44 +399,64 @@
                                        (copy-tensor-to-arr norms-arr (:per-layer-gate-w keys) [pl-dim hidden-dim] norms-base-el 0.0)
                                        (copy-tensor-to-arr norms-arr (:per-layer-proj-w keys) [hidden-dim pl-dim] (+ norms-base-el (* pl-dim hidden-dim)) 0.0)
                                        (copy-tensor-to-arr norms-arr (:post-per-layer-norm-w keys) [hidden-dim] (+ norms-base-el (* pl-dim hidden-dim) (* hidden-dim pl-dim)) 0.0))
-                                   norms-buf (xla/buffer-from-host-buffer ctx client norms-arr [norms-total-el] weight-enum)]
-                               [qkv-buf o-buf gate-up-buf down-buf norms-buf]))
+                                   norms-buf (xla/buffer-from-host-buffer ctx client norms-arr [norms-total-el] norm-enum)]
+                               (if is-int8
+                                 [qkv-buf qkv-scale o-buf o-scale gate-up-buf gate-up-scale down-buf down-scale norms-buf]
+                                 [qkv-buf o-buf gate-up-buf down-buf norms-buf])))
                            layer-grouped-specs)]
     (vec (concat (into [embed-buf] ple-global-bufs) [final-norm-buf] layer-bufs))))
 
 (defn compile-inference-executables
   "Traces and JIT-compiles a Single Fused Gemma 4 StableHLO Graph into a native PJRT Executable."
   [{:keys [ctx config opts]}]
-  (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim max-seq-len num-layers weight-dtype layer-configs num-heads num-kv-heads num-kv-shared-layers layer-grouped-specs]} config
+  (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim max-seq-len num-layers weight-dtype is-int8 layer-configs num-heads num-kv-heads num-kv-shared-layers layer-grouped-specs]} config
         {:keys [verbose quiet]} opts
         num-unshared (- num-layers num-kv-shared-layers)
+        norm-dtype (if is-int8 :bf16 weight-dtype)
         has-ple? (pos? total-pl-dim)
         ple-global-invars (when has-ple?
-                            [[:embed_tokens_per_layer [:tensor [vocab-size total-pl-dim] weight-dtype]]
-                             [:per_layer_model_projection [:tensor [total-pl-dim hidden-dim] weight-dtype]]
-                             [:per_layer_projection_norm [:tensor [pl-dim] weight-dtype]]])
+                            [[:embed_tokens_per_layer [:tensor [vocab-size total-pl-dim] norm-dtype]]
+                             [:per_layer_model_projection [:tensor [total-pl-dim hidden-dim] norm-dtype]]
+                             [:per_layer_projection_norm [:tensor [pl-dim] norm-dtype]]])
         layer-invars (mapcat (fn [i]
                                (let [{:keys [q-dim qkv-rows gate-up-rows mlp-dim norms-total-el]} (nth layer-grouped-specs i)]
-                                 [[(keyword (str "l" i "_qkv")) [:tensor [qkv-rows hidden-dim] weight-dtype]]
-                                  [(keyword (str "l" i "_o")) [:tensor [hidden-dim q-dim] weight-dtype]]
-                                  [(keyword (str "l" i "_gate_up")) [:tensor [gate-up-rows hidden-dim] weight-dtype]]
-                                  [(keyword (str "l" i "_down")) [:tensor [hidden-dim mlp-dim] weight-dtype]]
-                                  [(keyword (str "l" i "_norms")) [:tensor [norms-total-el] weight-dtype]]]))
+                                 (if is-int8
+                                   [[(keyword (str "l" i "_qkv")) [:tensor [qkv-rows hidden-dim] :i8]]
+                                    [(keyword (str "l" i "_qkv_s")) [:tensor [1] :f32]]
+                                    [(keyword (str "l" i "_o")) [:tensor [hidden-dim q-dim] :i8]]
+                                    [(keyword (str "l" i "_o_s")) [:tensor [1] :f32]]
+                                    [(keyword (str "l" i "_gate_up")) [:tensor [gate-up-rows hidden-dim] :i8]]
+                                    [(keyword (str "l" i "_gate_up_s")) [:tensor [1] :f32]]
+                                    [(keyword (str "l" i "_down")) [:tensor [hidden-dim mlp-dim] :i8]]
+                                    [(keyword (str "l" i "_down_s")) [:tensor [1] :f32]]
+                                    [(keyword (str "l" i "_norms")) [:tensor [norms-total-el] :bf16]]]
+                                   [[(keyword (str "l" i "_qkv")) [:tensor [qkv-rows hidden-dim] weight-dtype]]
+                                    [(keyword (str "l" i "_o")) [:tensor [hidden-dim q-dim] weight-dtype]]
+                                    [(keyword (str "l" i "_gate_up")) [:tensor [gate-up-rows hidden-dim] weight-dtype]]
+                                    [(keyword (str "l" i "_down")) [:tensor [hidden-dim mlp-dim] weight-dtype]]
+                                    [(keyword (str "l" i "_norms")) [:tensor [norms-total-el] weight-dtype]]])))
                              (range num-layers))
         invars (vec (concat
                      [[:x [:tensor [1 max-seq-len] :i32]]
                       [:pos [:tensor [max-seq-len] :i32]]
-                      [:embed_tokens [:tensor [vocab-size hidden-dim] weight-dtype]]]
+                      [:embed_tokens [:tensor [vocab-size hidden-dim] norm-dtype]]]
                      ple-global-invars
-                     [[:final_norm_w [:tensor [hidden-dim] weight-dtype]]]
+                     [[:final_norm_w [:tensor [hidden-dim] norm-dtype]]]
                      layer-invars))
 
         trace-fn (if has-ple?
                    (fn [x pos-tracer emb emb-pl pl-model-proj pl-proj-norm fn-norm & all-layer-tracers]
-                     (let [group-size 5
+                     (let [group-size (if is-int8 9 5)
                            tr-partitioned (mapv vec (partition group-size all-layer-tracers))
-                           lw-seq (mapv (fn [i [qkv-tr o-tr gate-up-tr down-tr norms-tr]]
-                                          (let [{:keys [q-dim kv-dim head-dim mlp-dim norms-base-el]} (nth layer-grouped-specs i)
+                           deq (fn [w s] (t/* (t/convert w :bf16) (t/convert s :bf16)))
+                           lw-seq (mapv (fn [i trs]
+                                          (let [[qkv-tr qkv-s-tr o-tr o-s-tr gate-up-tr gate-up-s-tr down-tr down-s-tr norms-tr]
+                                                (if is-int8 trs [(nth trs 0) nil (nth trs 1) nil (nth trs 2) nil (nth trs 3) nil (nth trs 4)])
+                                                qkv-tr (if is-int8 (deq qkv-tr qkv-s-tr) qkv-tr)
+                                                o-tr (if is-int8 (deq o-tr o-s-tr) o-tr)
+                                                gate-up-tr (if is-int8 (deq gate-up-tr gate-up-s-tr) gate-up-tr)
+                                                down-tr (if is-int8 (deq down-tr down-s-tr) down-tr)
+                                                {:keys [q-dim kv-dim head-dim mlp-dim norms-base-el]} (nth layer-grouped-specs i)
                                                 cfg (nth layer-configs i)
                                                 qw (t/slice qkv-tr [0 0] [q-dim hidden-dim] [1 1])
                                                 kw (t/slice qkv-tr [q-dim 0] [(+ q-dim kv-dim) hidden-dim] [1 1])
@@ -421,10 +493,17 @@
                            logits (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads nil 0 {:final-logit-softcap 30.0 :num-kv-shared-layers num-kv-shared-layers})]
                        (t/convert logits :f32)))
                    (fn [x pos-tracer emb fn-norm & all-layer-tracers]
-                     (let [group-size 5
+                     (let [group-size (if is-int8 9 5)
                            tr-partitioned (mapv vec (partition group-size all-layer-tracers))
-                           lw-seq (mapv (fn [i [qkv-tr o-tr gate-up-tr down-tr norms-tr]]
-                                          (let [{:keys [q-dim kv-dim head-dim mlp-dim]} (nth layer-grouped-specs i)
+                           deq (fn [w s] (t/* (t/convert w :bf16) (t/convert s :bf16)))
+                           lw-seq (mapv (fn [i trs]
+                                          (let [[qkv-tr qkv-s-tr o-tr o-s-tr gate-up-tr gate-up-s-tr down-tr down-s-tr norms-tr]
+                                                (if is-int8 trs [(nth trs 0) nil (nth trs 1) nil (nth trs 2) nil (nth trs 3) nil (nth trs 4)])
+                                                qkv-tr (if is-int8 (deq qkv-tr qkv-s-tr) qkv-tr)
+                                                o-tr (if is-int8 (deq o-tr o-s-tr) o-tr)
+                                                gate-up-tr (if is-int8 (deq gate-up-tr gate-up-s-tr) gate-up-tr)
+                                                down-tr (if is-int8 (deq down-tr down-s-tr) down-tr)
+                                                {:keys [q-dim kv-dim head-dim mlp-dim]} (nth layer-grouped-specs i)
                                                 cfg (nth layer-configs i)
                                                 qw (t/slice qkv-tr [0 0] [q-dim hidden-dim] [1 1])
                                                 kw (t/slice qkv-tr [q-dim 0] [(+ q-dim kv-dim) hidden-dim] [1 1])
@@ -537,7 +616,7 @@
     (let [opts (parse-cli-args args)]
       (when-not (:quiet opts)
         (println "==================================================================")
-        (println "  clj-xla Gemma 4 Single-Pass Prefill & BF16 Generation ")
+        (println (str "  clj-xla Gemma 4 Single-Pass Prefill & " (if (= (:precision opts) :int8) "INT8" "BF16") " Generation "))
         (println "=================================================================="))
       (let [session (init-inference-session opts)]
         (generate-text session (:prompt opts))))
