@@ -11,6 +11,25 @@
    :rocm   {:default "bin/libpjrt_rocm.so" :env "PJRT_ROCM_LIBRARY_PATH"}
    :cuda12 {:default "bin/libpjrt_cuda.so" :env "PJRT_CUDA_LIBRARY_PATH"}})
 
+(defn- setenv-native [^String k ^String v]
+  (try
+    (let [linker (java.lang.foreign.Linker/nativeLinker)
+          default-lookup (.defaultLookup linker)
+          setenv-opt (.find default-lookup "setenv")]
+      (when (.isPresent setenv-opt)
+        (let [setenv-ptr ^java.lang.foreign.MemorySegment (.get setenv-opt)
+              fd (java.lang.foreign.FunctionDescriptor/of java.lang.foreign.ValueLayout/JAVA_INT
+                                                          (into-array java.lang.foreign.MemoryLayout
+                                                                      [java.lang.foreign.ValueLayout/ADDRESS
+                                                                       java.lang.foreign.ValueLayout/ADDRESS
+                                                                       java.lang.foreign.ValueLayout/JAVA_INT]))
+              handle (.downcallHandle linker setenv-ptr fd (make-array java.lang.foreign.Linker$Option 0))]
+          (with-open [arena (java.lang.foreign.Arena/ofConfined)]
+            (let [k-seg (.allocateFrom arena k)
+                  v-seg (.allocateFrom arena v)]
+              (.invokeWithArguments handle [k-seg v-seg (int 1)]))))))
+    (catch Exception _ nil)))
+
 (defn init-backend!
   "Initializes PJRT C API client runtime for specified target (:cpu, :sycl, :rocm, :cuda12, or a custom string path).
    Accepts optional `client-opts` map (defaults to `{:allocator \"platform\"}`).
@@ -20,11 +39,14 @@
   ([target client-opts]
    (when (= target :rocm)
      (when-not (System/getenv "HSA_OVERRIDE_GFX_VERSION")
-       (System/setProperty "HSA_OVERRIDE_GFX_VERSION" "11.0.0"))
+       (System/setProperty "HSA_OVERRIDE_GFX_VERSION" "11.0.0")
+       (setenv-native "HSA_OVERRIDE_GFX_VERSION" "11.0.0"))
      (when-not (System/getenv "ROCR_VISIBLE_DEVICES")
-       (System/setProperty "ROCR_VISIBLE_DEVICES" "0"))
+       (System/setProperty "ROCR_VISIBLE_DEVICES" "0")
+       (setenv-native "ROCR_VISIBLE_DEVICES" "0"))
      (when-not (System/getenv "HIP_VISIBLE_DEVICES")
-       (System/setProperty "HIP_VISIBLE_DEVICES" "0")))
+       (System/setProperty "HIP_VISIBLE_DEVICES" "0")
+       (setenv-native "HIP_VISIBLE_DEVICES" "0")))
    (let [lib-path (cond
                     (string? target) target
                     (keyword? target) (let [{:keys [default env]} (get BACKEND-LIBRARY-MAP target)]

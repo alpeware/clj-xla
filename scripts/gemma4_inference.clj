@@ -65,7 +65,26 @@
           (recur (subvec remaining 2) (assoc opts :top-k (Long/parseLong val)))
 
           (and (= flag "--backend") val)
-          (recur (subvec remaining 2) (assoc opts :backend (keyword val)))
+          (do
+            (when (= (keyword val) :rocm)
+              (try
+                (let [linker (java.lang.foreign.Linker/nativeLinker)
+                      lookup (.defaultLookup linker)
+                      setenv-opt (.find lookup "setenv")]
+                  (when (.isPresent setenv-opt)
+                    (let [setenv-ptr ^java.lang.foreign.MemorySegment (.get setenv-opt)
+                          fd (java.lang.foreign.FunctionDescriptor/of java.lang.foreign.ValueLayout/JAVA_INT
+                                                                      (into-array java.lang.foreign.MemoryLayout
+                                                                                  [java.lang.foreign.ValueLayout/ADDRESS
+                                                                                   java.lang.foreign.ValueLayout/ADDRESS
+                                                                                   java.lang.foreign.ValueLayout/JAVA_INT]))
+                          handle (.downcallHandle linker setenv-ptr fd (make-array java.lang.foreign.Linker$Option 0))]
+                      (with-open [arena (java.lang.foreign.Arena/ofConfined)]
+                        (.invokeWithArguments handle [(.allocateFrom arena "HIP_VISIBLE_DEVICES") (.allocateFrom arena "0") (int 1)])
+                        (.invokeWithArguments handle [(.allocateFrom arena "ROCR_VISIBLE_DEVICES") (.allocateFrom arena "0") (int 1)])
+                        (.invokeWithArguments handle [(.allocateFrom arena "HSA_OVERRIDE_GFX_VERSION") (.allocateFrom arena "11.0.0") (int 1)])))))
+                (catch Exception _ nil)))
+            (recur (subvec remaining 2) (assoc opts :backend (keyword val))))
 
           (and (= flag "--precision") val)
           (recur (subvec remaining 2) (assoc opts :precision (keyword val)))
@@ -496,7 +515,7 @@
         (println "\nGenerating tokens autoregressively with Single Fused XLA GPU Kernel..."))
       (let [final-context (run-autoregressive-generation session exec device-weights prompt-ids)]
         (if quiet
-          (println)
+          (println (decode tokenizer final-context))
           (do
             (println "\n\n==================================================================")
             (println "=== Single Fused XLA GPU Forward Pass Verification Passed! ===")
