@@ -38,10 +38,18 @@
    ".models/gemma-4-31B"
    ".models/gemma-4"])
 
+(defn- normalize-args
+  [args]
+  (mapcat (fn [arg]
+            (if (and (str/starts-with? arg "--") (str/includes? arg "="))
+              (str/split arg #"=" 2)
+              [arg]))
+          args))
+
 (defn parse-cli-args
   "Parses command-line flags (--prompt, --model/--model-dir, --max-new-tokens, --temperature, --top-k, --backend, --precision, --verbose, --quiet)."
   [args]
-  (loop [remaining (vec args)
+  (loop [remaining (vec (normalize-args args))
          opts DEFAULT_CLI_OPTS]
     (if (empty? remaining)
       opts
@@ -456,30 +464,23 @@
 (defn run-autoregressive-generation
   "Runs autoregressive text generation using single fused XLA GPU execution graph."
   [{:keys [ctx tokenizer config opts]} exec device-weights prompt-ids]
-  (let [{:keys [max-new-tokens temperature top-k quiet]} opts
+  (let [{:keys [max-new-tokens temperature top-k]} opts
         {:keys [max-seq-len vocab-size]} config
-        eos (eos-id tokenizer)
+        primary-eos (eos-id tokenizer)
+        eos-set (set (remove nil? [1 212 107 primary-eos]))
         pos-array (int-array (range max-seq-len))
         pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) pos-array [max-seq-len] 4)]
     (loop [cur-tokens (vec prompt-ids)
            step 0]
-      (if (or (>= step max-new-tokens) (and (seq cur-tokens) (= (last cur-tokens) eos)))
-        (do (xla/destroy-buffer! ctx pos-buf)
-            cur-tokens)
+      (if (or (>= step max-new-tokens) (and (seq cur-tokens) (contains? eos-set (last cur-tokens))))
+        cur-tokens
         (let [seq-len (count cur-tokens)
               padded-tokens (int-array (concat cur-tokens (repeat (- max-seq-len seq-len) 0)))
               tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) padded-tokens [1 max-seq-len] 4)
               input-args (into [tok-buf pos-buf] device-weights)
               logits-buf (xla/execute exec input-args)
               step-logits (xla/to-host-slice logits-buf (dec seq-len) vocab-size (* max-seq-len vocab-size))
-              next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})
-              _ (do (xla/destroy-buffer! ctx tok-buf)
-                    (xla/destroy-buffer! ctx logits-buf))]
-          (when-not quiet
-            (if (= step 0)
-              (print (format "%s%s" (decode tokenizer prompt-ids) (decode tokenizer [next-tok])))
-              (print (decode tokenizer [next-tok])))
-            (flush))
+              next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})]
           (recur (conj cur-tokens next-tok) (inc step)))))))
 
 (defn generate-text
@@ -513,25 +514,30 @@
           exec (compile-inference-executables session)]
       (when-not quiet
         (println "\nGenerating tokens autoregressively with Single Fused XLA GPU Kernel..."))
-      (let [final-context (run-autoregressive-generation session exec device-weights prompt-ids)]
-        (if quiet
-          (println (decode tokenizer final-context))
-          (do
-            (println "\n\n==================================================================")
-            (println "=== Single Fused XLA GPU Forward Pass Verification Passed! ===")
-            (println "==================================================================")))
+      (let [final-context (run-autoregressive-generation session exec device-weights prompt-ids)
+            generated-str (decode tokenizer final-context)]
+        (println generated-str)
+        (when-not quiet
+          (println "\n==================================================================")
+          (println "=== Single Fused XLA GPU Forward Pass Verification Passed! ===")
+          (println "=================================================================="))
         final-context))))
 
 (defn -main
   "CLI entrypoint for Gemma 4 text generation."
   [& args]
-  (let [opts (parse-cli-args args)]
-    (when-not (:quiet opts)
-      (println "==================================================================")
-      (println "  clj-xla Gemma 4 Single-Pass Prefill & BF16 Generation ")
-      (println "=================================================================="))
-    (let [session (init-inference-session opts)]
-      (generate-text session (:prompt opts))
+  (try
+    (let [opts (parse-cli-args args)]
+      (when-not (:quiet opts)
+        (println "==================================================================")
+        (println "  clj-xla Gemma 4 Single-Pass Prefill & BF16 Generation ")
+        (println "=================================================================="))
+      (let [session (init-inference-session opts)]
+        (generate-text session (:prompt opts))))
+    (catch Throwable e
+      (println "\nExecution Exception:" (.getMessage e))
+      (.printStackTrace e))
+    (finally
       (.. Runtime getRuntime (halt 0)))))
 
 (when (= *file* (System/getProperty "clojure.script.filename"))

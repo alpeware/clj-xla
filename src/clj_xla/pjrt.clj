@@ -395,12 +395,6 @@
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long 1))
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-args))
            (.set ^MemorySegment args ValueLayout/ADDRESS (long 56) out-lists)
-           (when-let [dev (or (:execute-device api-ctx)
-                              (when-let [cli (:client api-ctx)]
-                                (first (addressable-devices api-ctx cli))))]
-             (.set ^MemorySegment args ValueLayout/ADDRESS (long 72) ^MemorySegment dev))
-           (.flush System/out)
-           (.flush System/err)
            (let [handle (downcall-ptr linker api-ptr OFFSET_LOADED_EXECUTABLE_EXECUTE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
                  err (.invokeWithArguments ^MethodHandle handle [args])]
              (check-error! api-ctx err)

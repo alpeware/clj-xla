@@ -61,9 +61,7 @@
          api-ctx (pjrt/load-plugin! lib-path)
          client (pjrt/create-client api-ctx (or client-opts {}))
          pname (pjrt/platform-name api-ctx client)
-         devs (pjrt/addressable-devices api-ctx client)
-         exec-dev (first devs)
-         ctx (assoc api-ctx :client client :platform pname :target target :execute-device exec-dev)]
+         ctx (assoc api-ctx :client client :platform pname :target target)]
      (alter-var-root #'*default-context* (constantly ctx))
      (when-not (Boolean/getBoolean "clj-xla.quiet")
        (println (format "clj-xla initialized PJRT Backend: [%s] via plugin [%s]" pname lib-path)))
