@@ -99,6 +99,14 @@
           (.invokeWithArguments dlopen-fn [py-path (Integer/valueOf 258)]))
         (catch Exception _ nil)))))
 
+(defn api-version
+  "Returns [major minor] version numbers from PJRT_Api struct."
+  [api-ctx]
+  (let [{:keys [^MemorySegment api-ptr]} (extract-ctx api-ctx)
+        major (.get api-ptr ValueLayout/JAVA_INT (long OFFSET_API_VERSION))
+        minor (.get api-ptr ValueLayout/JAVA_INT (long (+ OFFSET_API_VERSION 4)))]
+    [major minor]))
+
 (defn load-plugin!
   "Loads the PJRT shared object from `lib-path` and initializes the PJRT plugin."
   [lib-path]
@@ -132,6 +140,10 @@
         ^MemorySegment api-ptr (.reinterpret ^MemorySegment raw-api 984)
         api-ctx {:api-ptr api-ptr :linker linker :arena arena}]
 
+    (let [[major minor] (api-version api-ctx)]
+      (when-not (Boolean/getBoolean "clj-xla.quiet")
+        (println (format "PJRT Plugin loaded [%s] (API Version: %d.%d)" lib-path major minor))))
+
     ;; Call PJRT_Plugin_Initialize
     (let [init-handle (downcall-ptr linker api-ptr OFFSET_PLUGIN_INITIALIZE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
           init-args (.allocate arena (long 16))]
@@ -140,16 +152,60 @@
         (check-error! api-ctx err)))
     api-ctx))
 
+(defn- build-named-values [^Arena arena opts]
+  (if (empty? opts)
+    [MemorySegment/NULL 0]
+    (let [num-opts (count opts)
+          named-vals (.allocate arena (long (* 64 num-opts)) (long 8))]
+      (doseq [[idx [k v]] (map-indexed vector opts)]
+        (let [n-str (name k)
+              n-bytes (.getBytes ^String n-str "UTF-8")
+              n-seg (.allocateFrom arena (String. ^bytes n-bytes "UTF-8"))
+              elem (.asSlice named-vals (* idx 64) 64)]
+          (.set ^MemorySegment elem ValueLayout/JAVA_LONG (long 0) (long 64))
+          (.set ^MemorySegment elem ValueLayout/ADDRESS (long 16) n-seg)
+          (.set ^MemorySegment elem ValueLayout/JAVA_LONG (long 24) (long (alength n-bytes)))
+          (cond
+            (string? v)
+            (let [v-seg (.allocateFrom arena (String. ^bytes (.getBytes ^String v "UTF-8")))]
+              (.set ^MemorySegment elem ValueLayout/JAVA_INT (long 32) (int 0))
+              (.set ^MemorySegment elem ValueLayout/ADDRESS (long 40) v-seg)
+              (.set ^MemorySegment elem ValueLayout/JAVA_LONG (long 48) (long (count v))))
+
+            (integer? v)
+            (do
+              (.set ^MemorySegment elem ValueLayout/JAVA_INT (long 32) (int 1))
+              (.set ^MemorySegment elem ValueLayout/JAVA_LONG (long 40) (long v))
+              (.set ^MemorySegment elem ValueLayout/JAVA_LONG (long 48) (long 1)))
+
+            (float? v)
+            (do
+              (.set ^MemorySegment elem ValueLayout/JAVA_INT (long 32) (int 3))
+              (.set ^MemorySegment elem ValueLayout/JAVA_FLOAT (long 40) (float v))
+              (.set ^MemorySegment elem ValueLayout/JAVA_LONG (long 48) (long 1)))
+
+            (boolean? v)
+            (do
+              (.set ^MemorySegment elem ValueLayout/JAVA_INT (long 32) (int 4))
+              (.set ^MemorySegment elem ValueLayout/JAVA_BYTE (long 40) (byte (if v 1 0)))
+              (.set ^MemorySegment elem ValueLayout/JAVA_LONG (long 48) (long 1))))))
+      [named-vals num-opts])))
+
 (defn create-client
-  "Creates a PJRT_Client for the loaded plugin."
-  [api-ctx]
-  (let [{:keys [api-ptr linker arena]} (extract-ctx api-ctx)
-        create-handle (downcall-ptr linker api-ptr OFFSET_CLIENT_CREATE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-        create-args (.allocate ^Arena arena (long 88))]
-    (.set ^MemorySegment create-args ValueLayout/JAVA_LONG (long 0) (long 88))
-    (let [err (.invokeWithArguments ^MethodHandle create-handle [create-args])]
-      (check-error! api-ctx err)
-      (.get ^MemorySegment create-args ValueLayout/ADDRESS (long 64)))))
+  "Creates a PJRT_Client for the loaded plugin, optionally accepting a `create-options` map."
+  ([api-ctx] (create-client api-ctx {}))
+  ([api-ctx opts]
+   (let [{:keys [api-ptr linker arena]} (extract-ctx api-ctx)
+         create-handle (downcall-ptr linker api-ptr OFFSET_CLIENT_CREATE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+         create-args (.allocate ^Arena arena (long 88))
+         [opts-seg num-opts] (build-named-values arena opts)]
+     (.set ^MemorySegment create-args ValueLayout/JAVA_LONG (long 0) (long 88))
+     (when (and (some? opts-seg) (not= MemorySegment/NULL opts-seg))
+       (.set ^MemorySegment create-args ValueLayout/ADDRESS (long 16) opts-seg)
+       (.set ^MemorySegment create-args ValueLayout/JAVA_LONG (long 24) (long num-opts)))
+     (let [err (.invokeWithArguments ^MethodHandle create-handle [create-args])]
+       (check-error! api-ctx err)
+       (.get ^MemorySegment create-args ValueLayout/ADDRESS (long 64))))))
 
 (defn platform-name
   "Queries the platform name string from `client` (e.g. 'cpu', 'cuda')."
@@ -290,14 +346,19 @@
   "Frees native device PJRT_Buffer `buffer-handle`."
   [api-ctx buffer-handle]
   (when (and (some? buffer-handle) (not= MemorySegment/NULL buffer-handle))
-    (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)
-          arena (Arena/ofAuto)
-          args (.allocate arena (long 24))]
-      (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 24))
-      (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) buffer-handle)
-      (let [handle (downcall-ptr linker api-ptr OFFSET_BUFFER_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-            err (.invokeWithArguments ^MethodHandle handle [args])]
-        (check-error! api-ctx err)))))
+    (try
+      (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)
+            ^MemorySegment buf-seg (cond
+                                     (instance? MemorySegment buffer-handle) buffer-handle
+                                     :else buffer-handle)
+            arena (Arena/ofAuto)
+            args (.allocate arena (long 24))]
+        (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 24))
+        (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) buf-seg)
+        (let [handle (downcall-ptr linker api-ptr OFFSET_BUFFER_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+              err (.invokeWithArguments ^MethodHandle handle [args])]
+          (check-error! api-ctx err)))
+      (catch Exception _ nil))))
 
 (defn execute-executable
   "Executes compiled PjRtLoadedExecutable native handle `exec-handle` with device `PjRtBuffer` handles `input-buffers`."
@@ -310,7 +371,8 @@
      (with-open [arena (Arena/ofConfined)]
        (let [arg-ptrs (.allocate arena ValueLayout/ADDRESS (long num-args))]
          (dotimes [i num-args]
-           (.setAtIndex ^MemorySegment arg-ptrs ValueLayout/ADDRESS (long i) (nth input-buffers i)))
+           (let [^MemorySegment buf-seg (nth input-buffers i)]
+             (.setAtIndex ^MemorySegment arg-ptrs ValueLayout/ADDRESS (long i) buf-seg)))
          (let [arg-lists (.allocate arena ValueLayout/ADDRESS (long 1))
                _ (.setAtIndex ^MemorySegment arg-lists ValueLayout/ADDRESS (long 0) arg-ptrs)
                out-ptrs (.allocate arena ValueLayout/ADDRESS (long num-outs))
@@ -339,6 +401,9 @@
   "Copies device PJRT_Buffer `buffer-handle` to host float array, awaiting asynchronous completion."
   [api-ctx buffer-handle num-floats]
   (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)
+        ^MemorySegment buf-seg (cond
+                                 (instance? MemorySegment buffer-handle) buffer-handle
+                                 :else buffer-handle)
         num-floats (long num-floats)
         byte-size (* num-floats 4)]
     (with-open [arena (Arena/ofConfined)]
@@ -346,7 +411,7 @@
             args (.allocate arena (long 56))]
         (.fill args (byte 0))
         (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 56))
-        (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) buffer-handle)
+        (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) buf-seg)
         (.set ^MemorySegment args ValueLayout/ADDRESS (long 24) MemorySegment/NULL)
         (.set ^MemorySegment args ValueLayout/ADDRESS (long 32) dst-seg)
         (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long byte-size))

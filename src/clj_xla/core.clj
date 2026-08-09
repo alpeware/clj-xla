@@ -13,9 +13,11 @@
 
 (defn init-backend!
   "Initializes PJRT C API client runtime for specified target (:cpu, :sycl, :rocm, :cuda12, or a custom string path).
+   Accepts optional `client-opts` map (defaults to `{:allocator \"platform\"}`).
    Sets and returns the thread-root default context *default-context*."
   ([] (init-backend! :cpu))
-  ([target]
+  ([target] (init-backend! target {:allocator "platform"}))
+  ([target client-opts]
    (when (= target :rocm)
      (when-not (System/getenv "HSA_OVERRIDE_GFX_VERSION")
        (System/setProperty "HSA_OVERRIDE_GFX_VERSION" "11.0.0"))
@@ -31,7 +33,7 @@
                                             (throw (ex-info "Unknown backend target" {:target target}))))
                     :else (throw (ex-info "Invalid backend target specifier" {:target target})))
          api-ctx (pjrt/load-plugin! lib-path)
-         client (pjrt/create-client api-ctx)
+         client (pjrt/create-client api-ctx (or client-opts {}))
          pname (pjrt/platform-name api-ctx client)
          ctx (assoc api-ctx :client client :platform pname :target target)]
      (alter-var-root #'*default-context* (constantly ctx))

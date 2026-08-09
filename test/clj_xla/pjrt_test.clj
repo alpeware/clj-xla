@@ -9,6 +9,11 @@
     (let [api (pjrt/load-plugin! "bin/libpjrt_cpu.so")]
       (is (some? (:api-ptr api)))
       (is (some? (:linker api)))
+      (let [[major minor] (pjrt/api-version api)]
+        (is (integer? major))
+        (is (integer? minor))
+        (is (>= major 0))
+        (is (>= minor 0)))
       (let [client (pjrt/create-client api)]
         (is (some? client))
         (is (= "cpu" (pjrt/platform-name api client)))))))
