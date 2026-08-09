@@ -38,6 +38,15 @@
   ([target] (init-backend! target {:allocator "platform"}))
   ([target client-opts]
    (when (= target :rocm)
+     (try
+       (let [jh (System/getProperty "java.home")
+             paths [(str jh "/lib/server/libjsig.so")
+                    (str jh "/lib/libjsig.so")
+                    "/usr/lib64/openjdk-25/lib/server/libjsig.so"]]
+         (doseq [p paths]
+           (when (.exists (java.io.File. ^String p))
+             (try (System/load p) (catch Throwable _ nil)))))
+       (catch Throwable _ nil))
      (when-not (System/getenv "HSA_OVERRIDE_GFX_VERSION")
        (System/setProperty "HSA_OVERRIDE_GFX_VERSION" "11.0.0")
        (setenv-native "HSA_OVERRIDE_GFX_VERSION" "11.0.0"))
