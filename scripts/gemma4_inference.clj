@@ -553,21 +553,31 @@
   (let [{:keys [max-new-tokens temperature top-k]} opts
         {:keys [max-seq-len vocab-size]} config
         primary-eos (eos-id tokenizer)
-        eos-set (set (remove nil? [1 212 107 primary-eos]))
+        ;; Hard EOS tokens that always terminate generation immediately
+        hard-eos (set (remove nil? [1 primary-eos]))
+        ;; Token 107 (<turn|>) only terminates when repeated consecutively
+        ;; (the first 107 may just end a thought channel in 12B-it models)
+        turn-end-token 107
         pos-array (int-array (range max-seq-len))
         pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) pos-array [max-seq-len] 4)]
     (loop [cur-tokens (vec prompt-ids)
-           step 0]
-      (if (or (>= step max-new-tokens) (and (pos? step) (contains? eos-set (last cur-tokens))))
-        cur-tokens
-        (let [seq-len (count cur-tokens)
-              padded-tokens (int-array (concat cur-tokens (repeat (- max-seq-len seq-len) 0)))
-              tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) padded-tokens [1 max-seq-len] 4)
-              input-args (into [tok-buf pos-buf] device-weights)
-              logits-buf (xla/execute exec input-args)
-              step-logits (xla/to-host-slice logits-buf (dec seq-len) vocab-size (* max-seq-len vocab-size))
-              next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})]
-          (recur (conj cur-tokens next-tok) (inc step)))))))
+           step 0
+           consecutive-turn-ends 0]
+      (let [last-tok (when (pos? step) (last cur-tokens))
+            hit-hard-eos (and (pos? step) (contains? hard-eos last-tok))
+            ;; Stop on consecutive <turn|> tokens (model is truly done)
+            new-consecutive (if (= last-tok turn-end-token) (inc consecutive-turn-ends) 0)
+            hit-turn-end (>= new-consecutive 2)]
+        (if (or (>= step max-new-tokens) hit-hard-eos hit-turn-end)
+          cur-tokens
+          (let [seq-len (count cur-tokens)
+                padded-tokens (int-array (concat cur-tokens (repeat (- max-seq-len seq-len) 0)))
+                tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) padded-tokens [1 max-seq-len] 4)
+                input-args (into [tok-buf pos-buf] device-weights)
+                logits-buf (xla/execute exec input-args)
+                step-logits (xla/to-host-slice logits-buf (dec seq-len) vocab-size (* max-seq-len vocab-size))
+                next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})]
+            (recur (conj cur-tokens next-tok) (inc step) new-consecutive)))))))
 
 (defn generate-text
   "Generates text response using Gemma 4 Single Fused XLA Execution Graph."
