@@ -386,6 +386,11 @@
                opts (.allocate arena (long 144))
                _ (.fill opts (byte 0))
                _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 0) (long 144))
+               non-donatable-arr (.allocate arena ValueLayout/JAVA_LONG (long num-args))
+               _ (dotimes [i num-args]
+                   (.setAtIndex ^MemorySegment non-donatable-arr ValueLayout/JAVA_LONG (long i) (long i)))
+               _ (.set ^MemorySegment opts ValueLayout/ADDRESS (long 56) non-donatable-arr)
+               _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 64) (long num-args))
                args (.allocate arena (long 80))]
            (.fill args (byte 0))
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 80))
@@ -395,6 +400,8 @@
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long 1))
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-args))
            (.set ^MemorySegment args ValueLayout/ADDRESS (long 56) out-lists)
+           (.flush System/out)
+           (.flush System/err)
            (let [handle (downcall-ptr linker api-ptr OFFSET_LOADED_EXECUTABLE_EXECUTE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
                  err (.invokeWithArguments ^MethodHandle handle [args])]
              (check-error! api-ctx err)

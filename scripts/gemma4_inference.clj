@@ -472,7 +472,7 @@
         pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) pos-array [max-seq-len] 4)]
     (loop [cur-tokens (vec prompt-ids)
            step 0]
-      (if (or (>= step max-new-tokens) (and (seq cur-tokens) (contains? eos-set (last cur-tokens))))
+      (if (or (>= step max-new-tokens) (and (pos? step) (contains? eos-set (last cur-tokens))))
         cur-tokens
         (let [seq-len (count cur-tokens)
               padded-tokens (int-array (concat cur-tokens (repeat (- max-seq-len seq-len) 0)))
