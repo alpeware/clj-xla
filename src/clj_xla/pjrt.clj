@@ -321,26 +321,43 @@
           (.set ^MemorySegment args ValueLayout/JAVA_INT (long 32) (int dtype-enum))
           (.set ^MemorySegment args ValueLayout/ADDRESS (long 40) dims-seg)
           (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-dims))
-          (when dev
-            (.set ^MemorySegment args ValueLayout/ADDRESS (long 80) dev))
-          (let [handle (downcall-ptr linker api-ptr OFFSET_CLIENT_BUFFER_FROM_HOST_BUFFER ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-                err (.invokeWithArguments ^MethodHandle handle [args])]
-            (check-error! api-ctx err)
-            (let [done-event (.get ^MemorySegment args ValueLayout/ADDRESS (long 104))
-                  buf (.get ^MemorySegment args ValueLayout/ADDRESS (long 112))]
-              (when (and (some? done-event) (not= MemorySegment/NULL done-event))
-                (let [await-args (.allocate arena (long 24))]
-                  (.set ^MemorySegment await-args ValueLayout/JAVA_LONG (long 0) (long 24))
-                  (.set ^MemorySegment await-args ValueLayout/ADDRESS (long 16) done-event)
-                  (let [await-handle (downcall-ptr linker api-ptr OFFSET_EVENT_AWAIT ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-                        await-err (.invokeWithArguments ^MethodHandle await-handle [await-args])]
-                    (check-error! api-ctx await-err)))
-                (let [destroy-args (.allocate arena (long 24))]
-                  (.set ^MemorySegment destroy-args ValueLayout/JAVA_LONG (long 0) (long 24))
-                  (.set ^MemorySegment destroy-args ValueLayout/ADDRESS (long 16) done-event)
-                  (let [destroy-handle (downcall-ptr linker api-ptr OFFSET_EVENT_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-                        _ (.invokeWithArguments ^MethodHandle destroy-handle [destroy-args])])))
-              buf)))))))
+          ;; Compute row-major byte strides for dense layout.
+          ;; ROCm PJRT requires byte_strides when num_dims > 0.
+          (let [elem-bytes (case (int dtype-enum) 4 4, 11 4, 10 2, 13 2, 4)
+                strides-seg (when (pos? num-dims)
+                              (let [seg (.allocate arena ValueLayout/JAVA_LONG (long num-dims))]
+                                (loop [i (dec num-dims) stride (long elem-bytes)]
+                                  (when (>= i 0)
+                                    (.setAtIndex ^MemorySegment seg ValueLayout/JAVA_LONG (long i) stride)
+                                    (recur (dec i) (* stride (long (nth shape i))))))
+                                seg))]
+            (when strides-seg
+              (.set ^MemorySegment args ValueLayout/ADDRESS (long 56) strides-seg)
+              (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 64) (long num-dims)))
+            ;; host_buffer_semantics = kImmutableUntilTransferCompletes (1) at offset 72.
+            ;; Ensures GPU backends (ROCm/CUDA) complete async DMA before the host buffer is freed.
+            ;; Default 0 (kImmutableOnlyDuringCall) risks SEGFAULT on async GPU transfers.
+            (.set ^MemorySegment args ValueLayout/JAVA_INT (long 72) (int 1))
+            (when dev
+              (.set ^MemorySegment args ValueLayout/ADDRESS (long 80) dev))
+            (let [handle (downcall-ptr linker api-ptr OFFSET_CLIENT_BUFFER_FROM_HOST_BUFFER ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                  err (.invokeWithArguments ^MethodHandle handle [args])]
+              (check-error! api-ctx err)
+              (let [done-event (.get ^MemorySegment args ValueLayout/ADDRESS (long 104))
+                    buf (.get ^MemorySegment args ValueLayout/ADDRESS (long 112))]
+                (when (and (some? done-event) (not= MemorySegment/NULL done-event))
+                  (let [await-args (.allocate arena (long 24))]
+                    (.set ^MemorySegment await-args ValueLayout/JAVA_LONG (long 0) (long 24))
+                    (.set ^MemorySegment await-args ValueLayout/ADDRESS (long 16) done-event)
+                    (let [await-handle (downcall-ptr linker api-ptr OFFSET_EVENT_AWAIT ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                          await-err (.invokeWithArguments ^MethodHandle await-handle [await-args])]
+                      (check-error! api-ctx await-err)))
+                  (let [destroy-args (.allocate arena (long 24))]
+                    (.set ^MemorySegment destroy-args ValueLayout/JAVA_LONG (long 0) (long 24))
+                    (.set ^MemorySegment destroy-args ValueLayout/ADDRESS (long 16) done-event)
+                    (let [destroy-handle (downcall-ptr linker api-ptr OFFSET_EVENT_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                          _ (.invokeWithArguments ^MethodHandle destroy-handle [destroy-args])])))
+                buf))))))))
 
 (defn destroy-buffer!
   "Frees native device PJRT_Buffer `buffer-handle`."
@@ -383,9 +400,14 @@
                out-ptrs (.allocate arena ValueLayout/ADDRESS (long num-outs))
                out-lists (.allocate arena ValueLayout/ADDRESS (long 1))
                _ (.setAtIndex ^MemorySegment out-lists ValueLayout/ADDRESS (long 0) out-ptrs)
+               events-ptrs (.allocate arena ValueLayout/ADDRESS (long 1))
                opts (.allocate arena (long 144))
                _ (.fill opts (byte 0))
-               _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 0) (long 144))
+               ;; struct_size = 112: matches the PJRT_ExecuteOptions size expected by the ROCm
+               ;; plugin (API version 0.112). Must be at least 112 or the plugin rejects it.
+               ;; The original 144 was too large and caused SEGFAULT by exposing uninitialized
+               ;; fields that the plugin dereferenced.
+               _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 0) (long 112))
                non-donatable-arr (.allocate arena ValueLayout/JAVA_LONG (long num-args))
                _ (dotimes [i num-args]
                    (.setAtIndex ^MemorySegment non-donatable-arr ValueLayout/JAVA_LONG (long i) (long i)))
@@ -400,11 +422,30 @@
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long 1))
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-args))
            (.set ^MemorySegment args ValueLayout/ADDRESS (long 56) out-lists)
+           ;; device_complete_events at offset 64: GPU backends populate this to signal
+           ;; when execution completes. We must await it before reading output buffers.
+           (.set ^MemorySegment args ValueLayout/ADDRESS (long 64) events-ptrs)
            (.flush System/out)
            (.flush System/err)
            (let [handle (downcall-ptr linker api-ptr OFFSET_LOADED_EXECUTABLE_EXECUTE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
                  err (.invokeWithArguments ^MethodHandle handle [args])]
              (check-error! api-ctx err)
+             ;; Await device completion event if the runtime returned one
+             (let [event-ptr (.getAtIndex ^MemorySegment events-ptrs ValueLayout/ADDRESS (long 0))]
+               (when (and (some? event-ptr) (not= MemorySegment/NULL event-ptr))
+                 (let [await-args (.allocate arena (long 24))]
+                   (.fill await-args (byte 0))
+                   (.set ^MemorySegment await-args ValueLayout/JAVA_LONG (long 0) (long 24))
+                   (.set ^MemorySegment await-args ValueLayout/ADDRESS (long 16) event-ptr)
+                   (let [await-handle (downcall-ptr linker api-ptr OFFSET_EVENT_AWAIT ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                         await-err (.invokeWithArguments ^MethodHandle await-handle [await-args])]
+                     (check-error! api-ctx await-err)))
+                 (let [destroy-args (.allocate arena (long 24))]
+                   (.fill destroy-args (byte 0))
+                   (.set ^MemorySegment destroy-args ValueLayout/JAVA_LONG (long 0) (long 24))
+                   (.set ^MemorySegment destroy-args ValueLayout/ADDRESS (long 16) event-ptr)
+                   (let [destroy-handle (downcall-ptr linker api-ptr OFFSET_EVENT_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                         _ (.invokeWithArguments ^MethodHandle destroy-handle [destroy-args])]))))
              (if (= num-outs 1)
                (.get ^MemorySegment out-ptrs ValueLayout/ADDRESS (long 0))
                (mapv (fn [i] (.getAtIndex ^MemorySegment out-ptrs ValueLayout/ADDRESS (long i))) (range num-outs))))))))))
