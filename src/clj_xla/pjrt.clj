@@ -140,16 +140,16 @@
         ^MemorySegment api-ptr (.reinterpret ^MemorySegment raw-api 984)
         api-ctx {:api-ptr api-ptr :linker linker :arena arena}]
 
-    (let [[major minor] (api-version api-ctx)]
-      (when-not (Boolean/getBoolean "clj-xla.quiet")
-        (println (format "PJRT Plugin loaded [%s] (API Version: %d.%d)" lib-path major minor))))
-
     ;; Call PJRT_Plugin_Initialize
     (let [init-handle (downcall-ptr linker api-ptr OFFSET_PLUGIN_INITIALIZE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
           init-args (.allocate arena (long 16))]
       (.set ^MemorySegment init-args ValueLayout/JAVA_LONG (long 0) (long 16))
       (let [err (.invokeWithArguments ^MethodHandle init-handle [init-args])]
         (check-error! api-ctx err)))
+
+    (let [[major minor] (api-version api-ctx)]
+      (when-not (Boolean/getBoolean "clj-xla.quiet")
+        (println (format "PJRT Plugin loaded [%s] (API Version: %d.%d)" lib-path major minor))))
     api-ctx))
 
 (defn- build-named-values [^Arena arena opts]
@@ -371,7 +371,12 @@
      (with-open [arena (Arena/ofConfined)]
        (let [arg-ptrs (.allocate arena ValueLayout/ADDRESS (long num-args))]
          (dotimes [i num-args]
-           (let [^MemorySegment buf-seg (nth input-buffers i)]
+           (let [buf (nth input-buffers i)
+                 ^MemorySegment buf-seg (cond
+                                          (instance? MemorySegment buf) buf
+                                          :else (throw (ex-info "Invalid non-MemorySegment input buffer" {:index i :buf buf})))]
+             (when (or (nil? buf-seg) (= MemorySegment/NULL buf-seg))
+               (throw (ex-info "NULL MemorySegment input buffer" {:index i})))
              (.setAtIndex ^MemorySegment arg-ptrs ValueLayout/ADDRESS (long i) buf-seg)))
          (let [arg-lists (.allocate arena ValueLayout/ADDRESS (long 1))
                _ (.setAtIndex ^MemorySegment arg-lists ValueLayout/ADDRESS (long 0) arg-ptrs)
@@ -390,9 +395,12 @@
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long 1))
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-args))
            (.set ^MemorySegment args ValueLayout/ADDRESS (long 56) out-lists)
-           (when-let [devs (addressable-devices api-ctx (:client api-ctx))]
-             (when (seq devs)
-               (.set ^MemorySegment args ValueLayout/ADDRESS (long 72) ^MemorySegment (first devs))))
+           (when-let [dev (or (:execute-device api-ctx)
+                              (when-let [cli (:client api-ctx)]
+                                (first (addressable-devices api-ctx cli))))]
+             (.set ^MemorySegment args ValueLayout/ADDRESS (long 72) ^MemorySegment dev))
+           (.flush System/out)
+           (.flush System/err)
            (let [handle (downcall-ptr linker api-ptr OFFSET_LOADED_EXECUTABLE_EXECUTE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
                  err (.invokeWithArguments ^MethodHandle handle [args])]
              (check-error! api-ctx err)

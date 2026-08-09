@@ -46,7 +46,11 @@
        (setenv-native "ROCR_VISIBLE_DEVICES" "0"))
      (when-not (System/getenv "HIP_VISIBLE_DEVICES")
        (System/setProperty "HIP_VISIBLE_DEVICES" "0")
-       (setenv-native "HIP_VISIBLE_DEVICES" "0")))
+       (setenv-native "HIP_VISIBLE_DEVICES" "0"))
+     (when-not (System/getenv "TF_CPP_MIN_LOG_LEVEL")
+       (setenv-native "TF_CPP_MIN_LOG_LEVEL" "3"))
+     (when-not (System/getenv "GLOG_minloglevel")
+       (setenv-native "GLOG_minloglevel" "3")))
    (let [lib-path (cond
                     (string? target) target
                     (keyword? target) (let [{:keys [default env]} (get BACKEND-LIBRARY-MAP target)]
@@ -57,7 +61,9 @@
          api-ctx (pjrt/load-plugin! lib-path)
          client (pjrt/create-client api-ctx (or client-opts {}))
          pname (pjrt/platform-name api-ctx client)
-         ctx (assoc api-ctx :client client :platform pname :target target)]
+         devs (pjrt/addressable-devices api-ctx client)
+         exec-dev (first devs)
+         ctx (assoc api-ctx :client client :platform pname :target target :execute-device exec-dev)]
      (alter-var-root #'*default-context* (constantly ctx))
      (when-not (Boolean/getBoolean "clj-xla.quiet")
        (println (format "clj-xla initialized PJRT Backend: [%s] via plugin [%s]" pname lib-path)))

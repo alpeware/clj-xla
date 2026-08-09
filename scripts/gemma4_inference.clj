@@ -531,7 +531,8 @@
       (println "  clj-xla Gemma 4 Single-Pass Prefill & BF16 Generation ")
       (println "=================================================================="))
     (let [session (init-inference-session opts)]
-      (generate-text session (:prompt opts)))))
+      (generate-text session (:prompt opts))
+      (.. Runtime getRuntime (halt 0)))))
 
 (when (= *file* (System/getProperty "clojure.script.filename"))
   (apply -main *command-line-args*))
