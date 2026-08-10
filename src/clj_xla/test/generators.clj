@@ -37,4 +37,4 @@
       :eqns [{:op :stablehlo/constant :value c-val :outvars [:c0]}
              {:op op :invars [:x :y] :outvars [:tmp]}
              {:op :stablehlo/add :invars [:tmp :c0] :outvars [:out]}]})
-   (gen/tuple gen-elementwise-op gen-shape gen-dtype (gen/double* {:nan? false :infinite? false}))))
+   (gen/tuple gen-elementwise-op gen-shape gen-dtype (gen/double* {:NaN? false :infinite? false}))))
