@@ -38,8 +38,12 @@
       (is (set? (:detected-backends probe)))
       (is (map? (:details probe)))
       (is (contains? (:detected-backends probe) :cpu) "CPU backend must always be detected as fallback")
+      (is (contains? (:details probe) :sycl) "SYCL backend details map must exist")
+      (is (boolean? (get-in probe [:details :sycl :detected?])))
       (when (contains? (:detected-backends probe) :rocm)
-        (is (string? (get-in probe [:details :rocm :version])) "ROCm version string must be populated when detected")))))
+        (is (string? (get-in probe [:details :rocm :version])) "ROCm version string must be populated when detected"))
+      (when (contains? (:detected-backends probe) :sycl)
+        (is (true? (get-in probe [:details :sycl :detected?])) "SYCL detected? must be true when in detected-backends")))))
 
 (deftest test-ensure-hsaco-cache-dir
   (testing "HSACO cache directory environment configuration"

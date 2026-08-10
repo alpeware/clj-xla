@@ -7,6 +7,7 @@
             [clj-xla.fetch-pjrt-binaries-test]
             [clj-xla.generation-test]
             [clj-xla.integration.rocm-e2e-test]
+            [clj-xla.integration.sycl-e2e-test]
             [clj-xla.kernels-test]
             [clj-xla.models.gemma-test]
             [clj-xla.models.gpt2-test]
@@ -61,11 +62,14 @@
                            'clj-xla.fetch-pjrt-binaries-test
                            'clj-xla.core-test)
         rocm-res (isolated-runner/run-isolated-test 'clj-xla.integration.rocm-e2e-test {"HIP_VISIBLE_DEVICES" "0" "ROCR_VISIBLE_DEVICES" "0"})
+        sycl-res (isolated-runner/run-isolated-test 'clj-xla.integration.sycl-e2e-test)
         {:keys [fail error]} results
         rocm-ok? (= (:status rocm-res) :pass)
-        _ (telemetry/generate-edn-report {:in-process-results results :isolated-hardware-results rocm-res})]
-    (if (and (zero? fail) (zero? error) rocm-ok?)
+        sycl-ok? (= (:status sycl-res) :pass)
+        _ (telemetry/generate-edn-report {:in-process-results results
+                                          :isolated-hardware-results {:rocm rocm-res :sycl sycl-res}})]
+    (if (and (zero? fail) (zero? error) rocm-ok? sycl-ok?)
       (do (println "All unit, generative, and hardware integration tests passed successfully.")
           (System/exit 0))
-      (do (println (str "Test failures detected: " fail " failures, " error " errors, ROCm status: " (:status rocm-res)))
+      (do (println (str "Test failures detected: " fail " failures, " error " errors, ROCm status: " (:status rocm-res) ", SYCL status: " (:status sycl-res)))
           (System/exit 1)))))

@@ -28,12 +28,20 @@
          stdout (:out res)
          stderr (:err res)
          summary (parse-summary-map stdout)
-         passed? (and (zero? exit-code)
-                      (some? summary)
-                      (zero? (get summary :fail 0))
-                      (zero? (get summary :error 0)))]
+         status (cond
+                  (and (some? summary)
+                       (zero? (get summary :fail 0))
+                       (zero? (get summary :error 0)))
+                  :pass
+
+                  (and (some? summary)
+                       (or (pos? (get summary :fail 0))
+                           (pos? (get summary :error 0))))
+                  :failed
+
+                  :else :crashed)]
      {:namespace test-ns-sym
-      :status (if passed? :pass :failed-or-crashed)
+      :status status
       :exit exit-code
       :summary summary
       :stdout stdout

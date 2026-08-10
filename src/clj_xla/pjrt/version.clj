@@ -88,9 +88,15 @@
         hsa-lib-opt     (io/file "/opt/rocm/lib/libhsa-runtime64.so")
         nvidia-ver-file (io/file "/proc/driver/nvidia/version")
         cuda-lib64      (io/file "/usr/local/cuda/lib64/libcudart.so")
+        sycl-lib64-1    (io/file "/usr/lib64/libze_loader.so")
+        sycl-lib64-2    (io/file "/usr/lib/x86_64-linux-gnu/libze_loader.so")
+        sycl-lib64-3    (io/file "/usr/lib/libze_loader.so")
+        sycl-pjrt-so    (io/file "bin/libpjrt_sycl.so")
 
         cmd-rocm-ver    (or (exec-cmd-string "hipconfig --version 2>/dev/null")
                             (exec-cmd-string "rocminfo 2>/dev/null | grep -i 'ROCm Version' | head -n1 | awk '{print $3}'"))
+        cmd-sycl-ver    (or (exec-cmd-string "sycl-ls --version 2>/dev/null")
+                            (exec-cmd-string "clinfo 2>/dev/null | grep -i 'Platform Name' | grep -i 'Intel' | head -n1"))
 
         rocm-detected? (or (.exists amdgpu-ver-file)
                            (.exists rocm-ver-file)
@@ -100,6 +106,12 @@
 
         cuda-detected? (or (.exists nvidia-ver-file)
                            (.exists cuda-lib64))
+
+        sycl-detected? (or (.exists sycl-lib64-1)
+                           (.exists sycl-lib64-2)
+                           (.exists sycl-lib64-3)
+                           (.exists sycl-pjrt-so)
+                           (some? cmd-sycl-ver))
 
         rocm-ver (or cmd-rocm-ver
                      (cond
@@ -114,12 +126,16 @@
                                                (catch Exception _ nil))
                    :else nil)
 
+        sycl-ver (or cmd-sycl-ver (when sycl-detected? "Level-Zero/oneAPI"))
+
         detected (cond-> #{:cpu}
                    rocm-detected? (conj :rocm)
-                   cuda-detected? (conj :cuda12))]
+                   cuda-detected? (conj :cuda12)
+                   sycl-detected? (conj :sycl))]
     {:detected-backends detected
      :details {:rocm {:detected? rocm-detected? :version rocm-ver}
                :cuda {:detected? cuda-detected? :version cuda-ver}
+               :sycl {:detected? sycl-detected? :version sycl-ver}
                :cpu  {:detected? true :java-version (System/getProperty "java.version")}}}))
 
 (defn inspect-plugin
