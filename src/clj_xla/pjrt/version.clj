@@ -95,8 +95,10 @@
 
         cmd-rocm-ver    (or (exec-cmd-string "hipconfig --version 2>/dev/null")
                             (exec-cmd-string "rocminfo 2>/dev/null | grep -i 'ROCm Version' | head -n1 | awk '{print $3}'"))
-        cmd-sycl-ver    (or (exec-cmd-string "sycl-ls --version 2>/dev/null")
-                            (exec-cmd-string "clinfo 2>/dev/null | grep -i 'Platform Name' | grep -i 'Intel' | head -n1"))
+        cmd-sycl-drv    (or (exec-cmd-string "clinfo 2>/dev/null | grep -i 'Driver Version' | head -n1 | awk '{print $3}'")
+                            (exec-cmd-string "sycl-ls --version 2>/dev/null"))
+        cmd-ze-ver      (or (exec-cmd-string "ls -la /usr/lib*/libze_loader.so.1 2>/dev/null | awk '{print $NF}' | sed 's/.*libze_loader.so.//'")
+                            (exec-cmd-string "ls -la /usr/lib*/libze_intel_gpu.so.1 2>/dev/null | awk '{print $NF}' | sed 's/.*libze_intel_gpu.so.//'"))
 
         rocm-detected? (or (.exists amdgpu-ver-file)
                            (.exists rocm-ver-file)
@@ -111,7 +113,8 @@
                            (.exists sycl-lib64-2)
                            (.exists sycl-lib64-3)
                            (.exists sycl-pjrt-so)
-                           (some? cmd-sycl-ver))
+                           (some? cmd-sycl-drv)
+                           (some? cmd-ze-ver))
 
         rocm-ver (or cmd-rocm-ver
                      (cond
@@ -126,7 +129,12 @@
                                                (catch Exception _ nil))
                    :else nil)
 
-        sycl-ver (or cmd-sycl-ver (when sycl-detected? "Level-Zero/oneAPI"))
+        sycl-ver (cond
+                   (and cmd-sycl-drv cmd-ze-ver) (str "Driver " cmd-sycl-drv " (Level-Zero v" cmd-ze-ver ")")
+                   cmd-sycl-drv (str "Driver " cmd-sycl-drv)
+                   cmd-ze-ver (str "Level-Zero v" cmd-ze-ver)
+                   sycl-detected? "Level-Zero/oneAPI"
+                   :else nil)
 
         detected (cond-> #{:cpu}
                    rocm-detected? (conj :rocm)

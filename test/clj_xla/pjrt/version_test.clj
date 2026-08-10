@@ -2,6 +2,7 @@
   "Generative property tests for PJRT versioning, compatibility validation, and driver probing."
   (:require [clj-xla.pjrt.version :as v]
             [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
@@ -43,7 +44,10 @@
       (when (contains? (:detected-backends probe) :rocm)
         (is (string? (get-in probe [:details :rocm :version])) "ROCm version string must be populated when detected"))
       (when (contains? (:detected-backends probe) :sycl)
-        (is (true? (get-in probe [:details :sycl :detected?])) "SYCL detected? must be true when in detected-backends")))))
+        (is (true? (get-in probe [:details :sycl :detected?])) "SYCL detected? must be true when in detected-backends")
+        (is (string? (get-in probe [:details :sycl :version])) "SYCL version string must be populated when detected")
+        (is (or (str/includes? (get-in probe [:details :sycl :version]) "Driver")
+                (str/includes? (get-in probe [:details :sycl :version]) "Level-Zero")) "SYCL version string must include driver or Level-Zero version info")))))
 
 (deftest test-ensure-hsaco-cache-dir
   (testing "HSACO cache directory environment configuration"
