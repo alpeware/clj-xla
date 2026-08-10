@@ -559,25 +559,34 @@
         ;; (the first 107 may just end a thought channel in 12B-it models)
         turn-end-token 107
         pos-array (int-array (range max-seq-len))
-        pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) pos-array [max-seq-len] 4)]
-    (loop [cur-tokens (vec prompt-ids)
-           step 0
-           consecutive-turn-ends 0]
-      (let [last-tok (when (pos? step) (last cur-tokens))
-            hit-hard-eos (and (pos? step) (contains? hard-eos last-tok))
-            ;; Stop on consecutive <turn|> tokens (model is truly done)
-            new-consecutive (if (= last-tok turn-end-token) (inc consecutive-turn-ends) 0)
-            hit-turn-end (>= new-consecutive 2)]
-        (if (or (>= step max-new-tokens) hit-hard-eos hit-turn-end)
-          cur-tokens
-          (let [seq-len (count cur-tokens)
-                padded-tokens (int-array (concat cur-tokens (repeat (- max-seq-len seq-len) 0)))
-                tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) padded-tokens [1 max-seq-len] 4)
-                input-args (into [tok-buf pos-buf] device-weights)
-                logits-buf (xla/execute exec input-args)
-                step-logits (xla/to-host-slice logits-buf (dec seq-len) vocab-size (* max-seq-len vocab-size))
-                next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})]
-            (recur (conj cur-tokens next-tok) (inc step) new-consecutive)))))))
+        pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) pos-array [max-seq-len] 4)
+        ;; Accumulate intermediate device buffers for deferred cleanup.
+        ;; Destroying buffers mid-loop crashes ROCm PJRT (the plugin retains
+        ;; internal references even after the completion event is awaited).
+        intermediate-bufs (atom [])]
+    (try
+      (loop [cur-tokens (vec prompt-ids)
+             step 0
+             consecutive-turn-ends 0]
+        (let [last-tok (when (pos? step) (last cur-tokens))
+              hit-hard-eos (and (pos? step) (contains? hard-eos last-tok))
+              ;; Stop on consecutive <turn|> tokens (model is truly done)
+              new-consecutive (if (= last-tok turn-end-token) (inc consecutive-turn-ends) 0)
+              hit-turn-end (>= new-consecutive 2)]
+          (if (or (>= step max-new-tokens) hit-hard-eos hit-turn-end)
+            cur-tokens
+            (let [seq-len (count cur-tokens)
+                  padded-tokens (int-array (concat cur-tokens (repeat (- max-seq-len seq-len) 0)))
+                  tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) padded-tokens [1 max-seq-len] 4)
+                  input-args (into [tok-buf pos-buf] device-weights)
+                  logits-buf (xla/execute exec input-args)
+                  step-logits (xla/to-host-slice logits-buf (dec seq-len) vocab-size (* max-seq-len vocab-size))
+                  next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})]
+              (swap! intermediate-bufs into [tok-buf logits-buf])
+              (recur (conj cur-tokens next-tok) (inc step) new-consecutive)))))
+      (finally
+        (doseq [buf @intermediate-bufs]
+          (xla/destroy-buffer! ctx buf))))))
 
 (defn generate-text
   "Generates text response using Gemma 4 Single Fused XLA Execution Graph."
@@ -619,11 +628,66 @@
           (println "=================================================================="))
         final-context))))
 
+(defn- find-libjsig
+  "Searches standard JDK paths for libjsig.so."
+  []
+  (let [jh (System/getProperty "java.home")
+        paths [(str jh "/lib/server/libjsig.so")
+               (str jh "/lib/libjsig.so")
+               "/usr/lib64/openjdk-25/lib/server/libjsig.so"]]
+    (first (filter #(.exists (io/file %)) paths))))
+
+(defn- needs-libjsig-reexec?
+  "Returns true when running with ROCm backend and LD_PRELOAD does not
+   already include libjsig.so.  Signal chaining via LD_PRELOAD is required
+   because the ROCm PJRT plugin bundles LLVM, which installs its own signal
+   handlers that conflict with the JVM's.  System.load cannot interpose
+   symbols globally — only LD_PRELOAD does."
+  [opts]
+  (and (= (:backend opts) :rocm)
+       (not (some-> (System/getenv "LD_PRELOAD")
+                    (.contains "libjsig")))))
+
+(defn- reexec-with-libjsig!
+  "Re-launches the current JVM process with LD_PRELOAD=libjsig.so so that
+   the OpenJDK signal-chaining library intercepts all sigaction calls before
+   the ROCm PJRT plugin installs LLVM's conflicting signal handlers."
+  [args]
+  (let [jsig-path (find-libjsig)]
+    (when-not jsig-path
+      (binding [*out* *err*]
+        (println "WARNING: libjsig.so not found — ROCm signal chaining unavailable."))
+      (flush)
+      nil)
+    (when jsig-path
+      (let [jh (System/getProperty "java.home")
+            java-bin (str jh "/bin/java")
+            rt-bean (java.lang.management.ManagementFactory/getRuntimeMXBean)
+            jvm-args (.getInputArguments rt-bean)
+            cp (System/getProperty "java.class.path")
+            cmd (vec (concat [java-bin]
+                             jvm-args
+                             ["-cp" cp "clojure.main" "-m" "scripts.gemma4-inference"]
+                             args))
+            pb (ProcessBuilder. ^java.util.List cmd)
+            env (.environment pb)
+            existing-preload (.get env "LD_PRELOAD")
+            new-preload (if (and existing-preload (not (.isEmpty ^String existing-preload)))
+                          (str jsig-path ":" existing-preload)
+                          jsig-path)]
+        (.put env "LD_PRELOAD" new-preload)
+        (.inheritIO pb)
+        (System/exit (.waitFor (.start pb)))))))
+
 (defn -main
   "CLI entrypoint for Gemma 4 text generation."
   [& args]
   (try
     (let [opts (parse-cli-args args)]
+      ;; Re-exec with LD_PRELOAD=libjsig.so for ROCm signal chaining.
+      ;; Must happen before any PJRT plugin is loaded.
+      (when (needs-libjsig-reexec? opts)
+        (reexec-with-libjsig! args))
       (when-not (:quiet opts)
         (println "==================================================================")
         (println (str "  clj-xla Gemma 4 Single-Pass Prefill & " (if (= (:precision opts) :int8) "INT8" "BF16") " Generation "))
