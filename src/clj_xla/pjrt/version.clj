@@ -2,11 +2,38 @@
   "PJRT API and driver version inspection, compatibility checking, and backend telemetry."
   (:require [clj-xla.pjrt :as pjrt]
             [clojure.java.io :as io]
-            [clojure.string :as str]))
+            [clojure.string :as str])
+  (:import [java.lang.foreign Arena FunctionDescriptor Linker Linker$Option MemoryLayout ValueLayout]))
 
 (def MINIMUM_SUPPORTED_PJRT_MINOR
   "Minimum required PJRT C API minor version supported by clj-xla."
   10)
+
+(defn set-c-env!
+  "Sets a native C process environment variable via Panama setenv downcall."
+  [k v]
+  (try
+    (let [linker (Linker/nativeLinker)
+          stdlib (.defaultLookup linker)]
+      (when-let [setenv-seg (.orElse nil (.find stdlib "setenv"))]
+        (let [fd (FunctionDescriptor/of ValueLayout/JAVA_INT
+                                        (into-array MemoryLayout [ValueLayout/ADDRESS ValueLayout/ADDRESS ValueLayout/JAVA_INT]))
+              handle (.downcallHandle linker setenv-seg fd (into-array Linker$Option []))]
+          (with-open [arena (Arena/ofConfined)]
+            (let [k-seg (.allocateFrom arena ^String k)
+                  v-seg (.allocateFrom arena ^String v)]
+              (.invokeWithArguments handle [k-seg v-seg (Integer/valueOf 0)]))))))
+    (catch Exception _ nil)))
+
+(defn ensure-hsaco-cache-dir!
+  "Ensures TF_XLA_HSACO_CACHE_DIR environment variable is configured to enable OpenXLA HSACO on-disk binary caching."
+  []
+  (let [cache-dir (io/file (System/getProperty "user.home") ".cache" "hsa_cache")
+        abs-path (.getAbsolutePath cache-dir)]
+    (.mkdirs cache-dir)
+    (System/setProperty "TF_XLA_HSACO_CACHE_DIR" abs-path)
+    (set-c-env! "TF_XLA_HSACO_CACHE_DIR" abs-path)
+    abs-path))
 
 (defn validate-version-compatibility
   "Validates if PJRT C API `major` and `minor` numbers meet framework requirements."
@@ -41,6 +68,17 @@
      :driver-version (when driver-ver (str driver-ver))
      :platform-name (str platform)}))
 
+(defn- exec-cmd-string
+  "Executes shell command `cmd` returning non-empty stdout line or nil."
+  [cmd]
+  (try
+    (let [pb (ProcessBuilder. ["sh" "-c" cmd])
+          proc (.start pb)
+          out (str/trim (slurp (.getInputStream proc)))]
+      (.waitFor proc)
+      (when-not (str/blank? out) out))
+    (catch Exception _ nil)))
+
 (defn probe-system-driver
   "Probes system drivers for ROCm, CUDA, SYCL, and CPU support."
   []
@@ -51,18 +89,23 @@
         nvidia-ver-file (io/file "/proc/driver/nvidia/version")
         cuda-lib64      (io/file "/usr/local/cuda/lib64/libcudart.so")
 
+        cmd-rocm-ver    (or (exec-cmd-string "hipconfig --version 2>/dev/null")
+                            (exec-cmd-string "rocminfo 2>/dev/null | grep -i 'ROCm Version' | head -n1 | awk '{print $3}'"))
+
         rocm-detected? (or (.exists amdgpu-ver-file)
                            (.exists rocm-ver-file)
                            (.exists hsa-lib64)
-                           (.exists hsa-lib-opt))
+                           (.exists hsa-lib-opt)
+                           (some? cmd-rocm-ver))
 
         cuda-detected? (or (.exists nvidia-ver-file)
                            (.exists cuda-lib64))
 
-        rocm-ver (cond
-                   (.exists amdgpu-ver-file) (try (str/trim (slurp amdgpu-ver-file)) (catch Exception _ nil))
-                   (.exists rocm-ver-file)   (try (str/trim (slurp rocm-ver-file)) (catch Exception _ nil))
-                   :else nil)
+        rocm-ver (or cmd-rocm-ver
+                     (cond
+                       (.exists amdgpu-ver-file) (try (str/trim (slurp amdgpu-ver-file)) (catch Exception _ nil))
+                       (.exists rocm-ver-file)   (try (str/trim (slurp rocm-ver-file)) (catch Exception _ nil))
+                       :else nil))
 
         cuda-ver (cond
                    (.exists nvidia-ver-file) (try

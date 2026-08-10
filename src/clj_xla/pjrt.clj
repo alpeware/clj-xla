@@ -139,10 +139,32 @@
                          [attr-name attr-val]))
                      (range num-attrs))))))))
 
+(defn- ensure-hsaco-cache-dir!
+  "Ensures TF_XLA_HSACO_CACHE_DIR environment variable is set to enable OpenXLA HSACO on-disk binary caching."
+  []
+  (try
+    (when (nil? (System/getenv "TF_XLA_HSACO_CACHE_DIR"))
+      (let [cache-dir (io/file (System/getProperty "user.home") ".cache" "hsa_cache")
+            abs-path (.getAbsolutePath cache-dir)
+            linker (Linker/nativeLinker)
+            stdlib (.defaultLookup linker)]
+        (.mkdirs cache-dir)
+        (System/setProperty "TF_XLA_HSACO_CACHE_DIR" abs-path)
+        (when-let [setenv-seg (.orElse nil (.find stdlib "setenv"))]
+          (let [fd (FunctionDescriptor/of ValueLayout/JAVA_INT
+                                          (into-array MemoryLayout [ValueLayout/ADDRESS ValueLayout/ADDRESS ValueLayout/JAVA_INT]))
+                handle (.downcallHandle linker setenv-seg fd NO_OPTIONS)]
+            (with-open [arena (Arena/ofConfined)]
+              (let [k-seg (.allocateFrom arena "TF_XLA_HSACO_CACHE_DIR")
+                    v-seg (.allocateFrom arena ^String abs-path)]
+                (.invokeWithArguments handle [k-seg v-seg (Integer/valueOf 0)])))))))
+    (catch Exception _ nil)))
+
 (defn load-plugin!
   "Loads the PJRT shared object from `lib-path` and initializes the PJRT plugin."
   [lib-path]
   (preload-libpython!)
+  (ensure-hsaco-cache-dir!)
   (let [arena (Arena/global)
         abs-file (io/file lib-path)
         abs-path (.toAbsolutePath (.toPath abs-file))

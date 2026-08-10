@@ -1,6 +1,7 @@
 (ns clj-xla.pjrt.version-test
   "Generative property tests for PJRT versioning, compatibility validation, and driver probing."
   (:require [clj-xla.pjrt.version :as v]
+            [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
@@ -36,4 +37,12 @@
       (is (map? probe))
       (is (set? (:detected-backends probe)))
       (is (map? (:details probe)))
-      (is (contains? (:detected-backends probe) :cpu) "CPU backend must always be detected as fallback"))))
+      (is (contains? (:detected-backends probe) :cpu) "CPU backend must always be detected as fallback")
+      (when (contains? (:detected-backends probe) :rocm)
+        (is (string? (get-in probe [:details :rocm :version])) "ROCm version string must be populated when detected")))))
+
+(deftest test-ensure-hsaco-cache-dir
+  (testing "HSACO cache directory environment configuration"
+    (let [cache-path (v/ensure-hsaco-cache-dir!)]
+      (is (string? cache-path))
+      (is (.exists (io/file cache-path))))))
