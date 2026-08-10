@@ -248,8 +248,8 @@ gantt
 ```
 
 ### Milestone Checklist:
-- [ ] **Milestone 1:** Implement `clj-xla.pjrt.version` & ROCm 7.2 RTLD preloader.
-- [ ] **Milestone 2:** Implement `clj-xla.test.isolated-runner` to insulate JVM against native segfaults.
-- [ ] **Milestone 3:** Add `clj-xla.test.generators` with 100-iteration `defspec` property checks for graph invariants.
-- [ ] **Milestone 4:** Build dual ROCm GPU multi-device execution integration tests in `test/clj_xla/integration/rocm_e2e_test.clj`.
-- [ ] **Milestone 5:** Generate structured EDN hardware reports and submit PR for OpenXLA PJRT Examples inclusion.
+- [x] **Milestone 1:** Implement `clj-xla.pjrt.version` & ROCm 7.2 RTLD preloader.
+- [x] **Milestone 2:** Implement `clj-xla.test.isolated-runner` to insulate JVM against native segfaults.
+- [x] **Milestone 3:** Add `clj-xla.test.generators` with 100-iteration `defspec` property checks for graph invariants.
+- [x] **Milestone 4:** Build dual ROCm GPU multi-device execution integration tests in `test/clj_xla/integration/rocm_e2e_test.clj`.
+- [x] **Milestone 5:** Generate structured EDN hardware reports and submit PR for OpenXLA PJRT Examples inclusion.
