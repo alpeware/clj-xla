@@ -15,10 +15,13 @@
             [clj-xla.nn.norm-test]
             [clj-xla.opt-test]
             [clj-xla.pjrt-test]
+            [clj-xla.pjrt.version-test]
             [clj-xla.safetensors-test]
             [clj-xla.sampling-test]
             [clj-xla.stablehlo-test]
             [clj-xla.tensor-test]
+            [clj-xla.test.generators-test]
+            [clj-xla.test.isolated-runner-test]
             [clj-xla.tokenizer-test]
             [clj-xla.trace-test]
             [clojure.test :refer [run-tests]]))
@@ -28,6 +31,9 @@
   [& _args]
   (let [results (run-tests 'clj-xla.stablehlo-test
                            'clj-xla.pjrt-test
+                           'clj-xla.pjrt.version-test
+                           'clj-xla.test.generators-test
+                           'clj-xla.test.isolated-runner-test
                            'clj-xla.compile-test
                            'clj-xla.tensor-test
                            'clj-xla.trace-test

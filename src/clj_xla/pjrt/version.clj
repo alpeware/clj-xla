@@ -1,0 +1,91 @@
+(ns clj-xla.pjrt.version
+  "PJRT API and driver version inspection, compatibility checking, and backend telemetry."
+  (:require [clj-xla.pjrt :as pjrt]
+            [clojure.java.io :as io]
+            [clojure.string :as str]))
+
+(def MINIMUM_SUPPORTED_PJRT_MINOR
+  "Minimum required PJRT C API minor version supported by clj-xla."
+  10)
+
+(defn validate-version-compatibility
+  "Validates if PJRT C API `major` and `minor` numbers meet framework requirements."
+  ([major minor] (validate-version-compatibility major minor MINIMUM_SUPPORTED_PJRT_MINOR))
+  ([major minor min-minor]
+   (let [target-major 0
+         major-ok (= major target-major)
+         minor-ok (>= minor min-minor)
+         compat (and major-ok minor-ok)
+         reason (cond
+                  (not major-ok) (format "Incompatible PJRT C API major version %d (expected %d)." major target-major)
+                  (not minor-ok) (format "PJRT C API minor version %d is below minimum required %d." minor min-minor)
+                  :else "Compatible PJRT C API version.")]
+     {:compatible? compat
+      :reason reason
+      :major major
+      :minor minor
+      :min-minor min-minor})))
+
+(defn parse-plugin-attributes
+  "Parses raw string/integer attribute map from `pjrt/plugin-attributes` into structured telemetry."
+  [attrs]
+  (let [attrs (or attrs {})
+        driver-ver (or (get attrs "rocm_version")
+                       (get attrs "cuda_version")
+                       (get attrs "driver_version")
+                       (get attrs "version"))
+        platform (or (get attrs "platform_name")
+                     (get attrs "platform")
+                     "unknown")]
+    {:raw-attributes attrs
+     :driver-version (when driver-ver (str driver-ver))
+     :platform-name (str platform)}))
+
+(defn probe-system-driver
+  "Probes system drivers for ROCm, CUDA, SYCL, and CPU support."
+  []
+  (let [amdgpu-ver-file (io/file "/sys/module/amdgpu/version")
+        rocm-ver-file   (io/file "/opt/rocm/version")
+        hsa-lib64       (io/file "/usr/lib64/libhsa-runtime64.so")
+        hsa-lib-opt     (io/file "/opt/rocm/lib/libhsa-runtime64.so")
+        nvidia-ver-file (io/file "/proc/driver/nvidia/version")
+        cuda-lib64      (io/file "/usr/local/cuda/lib64/libcudart.so")
+
+        rocm-detected? (or (.exists amdgpu-ver-file)
+                           (.exists rocm-ver-file)
+                           (.exists hsa-lib64)
+                           (.exists hsa-lib-opt))
+
+        cuda-detected? (or (.exists nvidia-ver-file)
+                           (.exists cuda-lib64))
+
+        rocm-ver (cond
+                   (.exists amdgpu-ver-file) (try (str/trim (slurp amdgpu-ver-file)) (catch Exception _ nil))
+                   (.exists rocm-ver-file)   (try (str/trim (slurp rocm-ver-file)) (catch Exception _ nil))
+                   :else nil)
+
+        cuda-ver (cond
+                   (.exists nvidia-ver-file) (try
+                                               (let [line (first (str/split-lines (slurp nvidia-ver-file)))]
+                                                 (second (re-find #"Kernel Module\s+([\d.]+)" line)))
+                                               (catch Exception _ nil))
+                   :else nil)
+
+        detected (cond-> #{:cpu}
+                   rocm-detected? (conj :rocm)
+                   cuda-detected? (conj :cuda12))]
+    {:detected-backends detected
+     :details {:rocm {:detected? rocm-detected? :version rocm-ver}
+               :cuda {:detected? cuda-detected? :version cuda-ver}
+               :cpu  {:detected? true :java-version (System/getProperty "java.version")}}}))
+
+(defn inspect-plugin
+  "Queries `api-ctx` for PJRT C API version, validates compatibility, and retrieves telemetry."
+  [api-ctx]
+  (let [[major minor] (pjrt/api-version api-ctx)
+        compat-map (validate-version-compatibility major minor)
+        attrs (try (pjrt/plugin-attributes api-ctx) (catch Exception _ {}))
+        parsed-attrs (parse-plugin-attributes attrs)]
+    (merge compat-map
+           parsed-attrs
+           {:system-driver (probe-system-driver)})))

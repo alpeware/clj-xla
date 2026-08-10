@@ -107,6 +107,38 @@
         minor (.get api-ptr ValueLayout/JAVA_INT (long (+ OFFSET_API_VERSION 4)))]
     [major minor]))
 
+(defn plugin-attributes
+  "Queries the attributes map from the loaded PJRT plugin using PJRT_Plugin_Attributes."
+  [api-ctx]
+  (let [{:keys [api-ptr linker arena]} (extract-ctx api-ctx)
+        attr-handle (downcall-ptr linker api-ptr OFFSET_PLUGIN_ATTRIBUTES ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+        args (.allocate ^Arena arena (long 32))]
+    (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 32))
+    (let [err (.invokeWithArguments ^MethodHandle attr-handle [args])]
+      (check-error! api-ctx err)
+      (let [attrs-ptr (.get ^MemorySegment args ValueLayout/ADDRESS (long 16))
+            num-attrs (.get ^MemorySegment args ValueLayout/JAVA_LONG (long 24))]
+        (if (or (nil? attrs-ptr) (= MemorySegment/NULL attrs-ptr) (zero? num-attrs))
+          {}
+          (into {}
+                (map (fn [i]
+                       (let [elem (.asSlice (.reinterpret ^MemorySegment attrs-ptr (* num-attrs 64)) (* i 64) 64)
+                             name-ptr (.get ^MemorySegment elem ValueLayout/ADDRESS (long 16))
+                             name-len (.get ^MemorySegment elem ValueLayout/JAVA_LONG (long 24))
+                             attr-name (String. (.toArray (.reinterpret ^MemorySegment name-ptr name-len) ValueLayout/JAVA_BYTE) "UTF-8")
+                             val-type (.get ^MemorySegment elem ValueLayout/JAVA_INT (long 32))
+                             attr-val (case val-type
+                                        0 (let [str-ptr (.get ^MemorySegment elem ValueLayout/ADDRESS (long 40))
+                                                val-len (.get ^MemorySegment elem ValueLayout/JAVA_LONG (long 48))]
+                                            (String. (.toArray (.reinterpret ^MemorySegment str-ptr val-len) ValueLayout/JAVA_BYTE) "UTF-8"))
+                                        1 (.get ^MemorySegment elem ValueLayout/JAVA_LONG (long 40))
+                                        2 (.get ^MemorySegment elem ValueLayout/JAVA_FLOAT (long 40))
+                                        3 (.get ^MemorySegment elem ValueLayout/JAVA_DOUBLE (long 40))
+                                        4 (not (zero? (.get ^MemorySegment elem ValueLayout/JAVA_BYTE (long 40))))
+                                        nil)]
+                         [attr-name attr-val]))
+                     (range num-attrs))))))))
+
 (defn load-plugin!
   "Loads the PJRT shared object from `lib-path` and initializes the PJRT plugin."
   [lib-path]
