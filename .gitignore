@@ -14,6 +14,7 @@ bin/
 .models/
 .venv/
 __pycache__
+third_party/
 
 .python-version
 *.safetensors
