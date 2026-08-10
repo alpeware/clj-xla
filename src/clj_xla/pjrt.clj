@@ -160,6 +160,15 @@
                 (.invokeWithArguments handle [k-seg v-seg (Integer/valueOf 0)])))))))
     (catch Exception _ nil)))
 
+(defn companion-lib?
+  "Returns true if file `f` (File object or filename string) is a companion library that should be preloaded,
+   excluding main PJRT plugin shared objects (e.g. libpjrt_*, xla_cpu_pjrt.so, pjrt_plugin_xpu.so) and rocprofiler."
+  [f]
+  (let [name (if (string? f) f (.getName ^java.io.File f))]
+    (and (boolean (re-find #"\.so(\.\d+)*$" name))
+         (not (boolean (re-find #"rocprofiler" name)))
+         (not (boolean (re-find #"^(xla_cpu|pjrt_plugin|libpjrt)" name))))))
+
 (defn load-plugin!
   "Loads the PJRT shared object from `lib-path` and initializes the PJRT plugin."
   [lib-path]
@@ -178,9 +187,7 @@
                   dlopen-fn (.downcallHandle linker dlopen-seg desc (make-array Linker$Option 0))]
               (dotimes [_ 5]
                 (doseq [f (file-seq bin-lib-dir)]
-                  (when (and (.isFile f)
-                             (re-find #"\.so(\.\d+)*$" (.getName f))
-                             (not (re-find #"rocprofiler" (.getName f))))
+                  (when (and (.isFile f) (companion-lib? f))
                     (try
                       (let [p-seg (.allocateFrom arena (.getAbsolutePath f))]
                         (.invokeWithArguments dlopen-fn [p-seg (Integer/valueOf 258)]))

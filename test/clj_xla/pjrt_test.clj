@@ -4,6 +4,18 @@
             [clj-xla.stablehlo :as shlo]
             [clojure.test :refer [deftest is testing]]))
 
+(deftest pjrt-companion-lib-test
+  (testing "companion-lib? filters out main PJRT plugin binaries and rocprofiler while allowing runtime shared libraries"
+    (is (false? (pjrt/companion-lib? "xla_cpu_pjrt.so")))
+    (is (false? (pjrt/companion-lib? "pjrt_plugin_xpu.so")))
+    (is (false? (pjrt/companion-lib? "libpjrt_cpu.so")))
+    (is (false? (pjrt/companion-lib? "libpjrt_sycl.so")))
+    (is (false? (pjrt/companion-lib? "libpjrt_rocm.so")))
+    (is (false? (pjrt/companion-lib? "rocprofiler.so")))
+    (is (true? (pjrt/companion-lib? "libsycl.so")))
+    (is (true? (pjrt/companion-lib? "libmkl_core.so.2")))
+    (is (true? (pjrt/companion-lib? "libccl.so")))))
+
 (deftest pjrt-cpu-plugin-test
   (testing "Loading CPU PJRT plugin and initializing client"
     (let [api (pjrt/load-plugin! "bin/libpjrt_cpu.so")]
