@@ -3,14 +3,33 @@
 JAX Workload Benchmark Suite for clj-xla Parity & Performance Gap Verification.
 
 Measures JAX JIT compilation latency, execution warmup, mean/P99 latencies,
-and FLOPs/TFLOPS for standard ML kernels and transformer layer blocks.
+and FLOPs/TFLOPS for standard ML kernels and transformer layer blocks across CPU and SYCL backends.
 """
 
+import sys
 import time
 import json
+import argparse
 import numpy as np
-import jax
-import jax.numpy as jnp
+
+def setup_jax_backend(backend_name):
+    from jax._src.lib import xla_client
+    import jax
+    import jax.numpy as jnp
+
+    target_dev = None
+    if backend_name == "sycl":
+        try:
+            xla_client.load_pjrt_plugin_dynamically("sycl", "bin/libpjrt_sycl.so")
+            client = xla_client.make_c_api_client("sycl", {"allocator": "platform"})
+            target_dev = client.devices()[0]
+        except Exception as e:
+            print(f"Warning initializing SYCL C API client: {e}", flush=True)
+
+    if target_dev is None:
+        target_dev = jax.devices("cpu")[0]
+
+    return jax, jnp, target_dev
 
 def calculate_stats(latencies_ms):
     sorted_ms = sorted(latencies_ms)
@@ -65,45 +84,48 @@ def benchmark_fn(name, jit_fn, args, warmup_iters=5, measure_iters=50, flops=Non
 
     return stats
 
+def dev_put(tensor, jax, dev):
+    return jax.device_put(tensor, dev)
+
 # --- Workload Definitions in JAX ---
 
-def make_gemm_fp32():
+def make_gemm_fp32(jnp, jax, dev):
     m, k, n = 1024, 1024, 1024
-    a = jnp.ones((m, k), dtype=jnp.float32)
-    b = jnp.ones((k, n), dtype=jnp.float32)
+    a = dev_put(jnp.ones((m, k), dtype=jnp.float32), jax, dev)
+    b = dev_put(jnp.ones((k, n), dtype=jnp.float32), jax, dev)
     flops = 2 * m * n * k
     @jax.jit
     def run(a_t, b_t):
         return jnp.matmul(a_t, b_t)
     return "gemm-fp32", run, (a, b), flops
 
-def make_gemm_bf16():
+def make_gemm_bf16(jnp, jax, dev):
     m, k, n = 1024, 1024, 1024
-    a = jnp.ones((m, k), dtype=jnp.bfloat16)
-    b = jnp.ones((k, n), dtype=jnp.bfloat16)
+    a = dev_put(jnp.ones((m, k), dtype=jnp.bfloat16), jax, dev)
+    b = dev_put(jnp.ones((k, n), dtype=jnp.bfloat16), jax, dev)
     flops = 2 * m * n * k
     @jax.jit
     def run(a_t, b_t):
         return jnp.matmul(a_t, b_t)
     return "gemm-bf16", run, (a, b), flops
 
-def make_rms_norm():
+def make_rms_norm(jnp, jax, dev):
     b, s, d = 1, 2048, 4096
-    x = jnp.ones((b, s, d), dtype=jnp.float32)
-    gamma = jnp.ones((d,), dtype=jnp.float32)
+    x = dev_put(jnp.ones((b, s, d), dtype=jnp.float32), jax, dev)
+    gamma = dev_put(jnp.ones((d,), dtype=jnp.float32), jax, dev)
     @jax.jit
     def run(x_t, g_t):
         ms = jnp.mean(x_t ** 2, axis=-1, keepdims=True)
         return (x_t / jnp.sqrt(ms + 1e-6)) * g_t
     return "rms-norm", run, (x, gamma), None
 
-def make_swiglu():
+def make_swiglu(jnp, jax, dev):
     b, s, d = 1, 2048, 4096
     inter = 4096
-    x = jnp.ones((b, s, d), dtype=jnp.float32)
-    w_gate = jnp.ones((d, inter), dtype=jnp.float32)
-    w_up = jnp.ones((d, inter), dtype=jnp.float32)
-    w_down = jnp.ones((inter, d), dtype=jnp.float32)
+    x = dev_put(jnp.ones((b, s, d), dtype=jnp.float32), jax, dev)
+    w_gate = dev_put(jnp.ones((d, inter), dtype=jnp.float32), jax, dev)
+    w_up = dev_put(jnp.ones((d, inter), dtype=jnp.float32), jax, dev)
+    w_down = dev_put(jnp.ones((inter, d), dtype=jnp.float32), jax, dev)
     flops = 2 * (2 * b * s * d * inter + b * s * inter * d)
     @jax.jit
     def run(x_t, wg, wu, wd):
@@ -112,12 +134,12 @@ def make_swiglu():
         return jnp.matmul(gate * up, wd)
     return "swiglu", run, (x, w_gate, w_up, w_down), flops
 
-def make_gqa_causal_attn():
+def make_gqa_causal_attn(jnp, jax, dev):
     b, seq, h_q, h_kv, d_k = 1, 128, 8, 1, 256
-    q = jnp.ones((b, seq, h_q, d_k), dtype=jnp.float32)
-    k = jnp.ones((b, seq, h_kv, d_k), dtype=jnp.float32)
-    v = jnp.ones((b, seq, h_kv, d_k), dtype=jnp.float32)
-    o_w = jnp.ones((h_q * d_k, h_q * d_k), dtype=jnp.float32)
+    q = dev_put(jnp.ones((b, seq, h_q, d_k), dtype=jnp.float32), jax, dev)
+    k = dev_put(jnp.ones((b, seq, h_kv, d_k), dtype=jnp.float32), jax, dev)
+    v = dev_put(jnp.ones((b, seq, h_kv, d_k), dtype=jnp.float32), jax, dev)
+    o_w = dev_put(jnp.ones((h_q * d_k, h_q * d_k), dtype=jnp.float32), jax, dev)
     @jax.jit
     def run(q_t, k_t, v_t, ow):
         k_exp = jnp.repeat(k_t, h_q // h_kv, axis=2)
@@ -132,23 +154,21 @@ def make_gqa_causal_attn():
         return jnp.matmul(context_flat, ow)
     return "gqa-causal-attn", run, (q, k, v, o_w), None
 
-def make_gpt2_block():
+def make_gpt2_block(jnp, jax, dev):
     b, s, d = 1, 128, 768
-    x = jnp.ones((b, s, d), dtype=jnp.float32)
-    c_attn_w = jnp.ones((d, 3 * d), dtype=jnp.float32)
-    c_proj_w = jnp.ones((d, d), dtype=jnp.float32)
-    mlp_fc_w = jnp.ones((d, 4 * d), dtype=jnp.float32)
-    mlp_proj_w = jnp.ones((4 * d, d), dtype=jnp.float32)
+    x = dev_put(jnp.ones((b, s, d), dtype=jnp.float32), jax, dev)
+    c_attn_w = dev_put(jnp.ones((d, 3 * d), dtype=jnp.float32), jax, dev)
+    c_proj_w = dev_put(jnp.ones((d, d), dtype=jnp.float32), jax, dev)
+    mlp_fc_w = dev_put(jnp.ones((d, 4 * d), dtype=jnp.float32), jax, dev)
+    mlp_proj_w = dev_put(jnp.ones((4 * d, d), dtype=jnp.float32), jax, dev)
     flops = 2 * (b * s * d * (3 * d) + b * s * d * d + b * s * d * (4 * d) + b * s * (4 * d) * d)
     @jax.jit
     def run(x_t, c_attn, c_proj, mlp_fc, mlp_proj):
-        # Pre-LN Attn
         ms1 = jnp.mean(x_t ** 2, axis=-1, keepdims=True)
         ln1 = x_t / jnp.sqrt(ms1 + 1e-5)
         qkv = jnp.matmul(ln1, c_attn)
         attn_out = jnp.matmul(qkv[:, :, :d], c_proj)
         res1 = x_t + attn_out
-        # Pre-LN MLP
         ms2 = jnp.mean(res1 ** 2, axis=-1, keepdims=True)
         ln2 = res1 / jnp.sqrt(ms2 + 1e-5)
         fc = jax.nn.gelu(jnp.matmul(ln2, mlp_fc))
@@ -156,16 +176,16 @@ def make_gpt2_block():
         return res1 + mlp_out
     return "gpt2-block", run, (x, c_attn_w, c_proj_w, mlp_fc_w, mlp_proj_w), flops
 
-def make_gemma4_block():
+def make_gemma4_block(jnp, jax, dev):
     b, s, d = 1, 128, 1536
-    x = jnp.ones((b, s, d), dtype=jnp.float32)
-    q_w = jnp.ones((d, 2048), dtype=jnp.float32)
-    k_w = jnp.ones((d, 256), dtype=jnp.float32)
-    v_w = jnp.ones((d, 256), dtype=jnp.float32)
-    o_w = jnp.ones((2048, d), dtype=jnp.float32)
-    gate_w = jnp.ones((d, 6144), dtype=jnp.float32)
-    up_w = jnp.ones((d, 6144), dtype=jnp.float32)
-    down_w = jnp.ones((6144, d), dtype=jnp.float32)
+    x = dev_put(jnp.ones((b, s, d), dtype=jnp.float32), jax, dev)
+    q_w = dev_put(jnp.ones((d, 2048), dtype=jnp.float32), jax, dev)
+    k_w = dev_put(jnp.ones((d, 256), dtype=jnp.float32), jax, dev)
+    v_w = dev_put(jnp.ones((d, 256), dtype=jnp.float32), jax, dev)
+    o_w = dev_put(jnp.ones((2048, d), dtype=jnp.float32), jax, dev)
+    gate_w = dev_put(jnp.ones((d, 6144), dtype=jnp.float32), jax, dev)
+    up_w = dev_put(jnp.ones((d, 6144), dtype=jnp.float32), jax, dev)
+    down_w = dev_put(jnp.ones((6144, d), dtype=jnp.float32), jax, dev)
     flops = 2 * (b * s * d * 2048 + b * s * d * 256 + b * s * d * 256 + b * s * 2048 * d + 2 * b * s * d * 6144 + b * s * 6144 * d)
     @jax.jit
     def run(x_t, qw, kw, vw, ow, gw, uw, dw):
@@ -184,30 +204,60 @@ def make_gemma4_block():
         return res1 + mlp_out
     return "gemma4-block", run, (x, q_w, k_w, v_w, o_w, gate_w, up_w, down_w), flops
 
-def main():
-    print(f"JAX Device: {jax.devices()[0]}")
+def run_benchmarks_for_backend(backend_name):
+    print(f"\n==========================================================================", flush=True)
+    print(f"               Running JAX Benchmarks for Backend: [{backend_name}]        ", flush=True)
+    print(f"==========================================================================", flush=True)
+    jax, jnp, dev = setup_jax_backend(backend_name)
+    print(f"Active JAX Device: {dev}", flush=True)
+
     workloads = [
-        make_gemm_fp32(),
-        make_gemm_bf16(),
-        make_rms_norm(),
-        make_swiglu(),
-        make_gqa_causal_attn(),
-        make_gpt2_block(),
-        make_gemma4_block()
+        make_gemm_fp32(jnp, jax, dev),
+        make_gemm_bf16(jnp, jax, dev),
+        make_rms_norm(jnp, jax, dev),
+        make_swiglu(jnp, jax, dev),
+        make_gqa_causal_attn(jnp, jax, dev),
+        make_gpt2_block(jnp, jax, dev),
+        make_gemma4_block(jnp, jax, dev)
     ]
     results = {}
-    print(f"{'Kernel':<18} | {'Mean (ms)':<10} | {'P99 (ms)':<10} | {'TFLOPS':<8} | {'Cold JIT (ms)':<12}")
-    print("-" * 70)
+    print(f"{'Kernel':<18} | {'Mean (ms)':<10} | {'P99 (ms)':<10} | {'TFLOPS':<8} | {'Cold JIT (ms)':<12}", flush=True)
+    print("-" * 70, flush=True)
     for name, fn, args, flops in workloads:
         stats = benchmark_fn(name, fn, args, flops=flops)
+        stats["backend"] = str(backend_name)
         results[name] = stats
-        print(f"{name:<18} | {stats['mean_ms']:<10.3f} | {stats['p99_ms']:<10.3f} | {stats['tflops']:<8.3f} | {stats['cold_jit_ms']:<12.3f}")
+        print(f"{name:<18} | {stats['mean_ms']:<10.3f} | {stats['p99_ms']:<10.3f} | {stats['tflops']:<8.3f} | {stats['cold_jit_ms']:<12.3f}", flush=True)
+
+    return results
+
+def main():
+    parser = argparse.ArgumentParser(description="JAX Benchmark Suite")
+    parser.add_argument("--backend", "-b", choices=["auto", "cpu", "sycl", "all"], default="auto",
+                        help="Target backend platform")
+    args = parser.parse_args()
+
+    backends = []
+    if args.backend == "all":
+        backends = ["sycl", "cpu"]
+    elif args.backend == "auto":
+        backends = ["sycl", "cpu"]
+    else:
+        backends = [args.backend]
+
+    all_results = {}
+    for b in backends:
+        try:
+            res = run_benchmarks_for_backend(b)
+            all_results[b] = res
+        except Exception as e:
+            print(f"Error benchmarking JAX backend {b}: {e}")
 
     import os
     os.makedirs("target/benchmark-reports", exist_ok=True)
     report_path = "target/benchmark-reports/jax_benchmark_results.json"
     with open(report_path, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(all_results, f, indent=2)
     print(f"\nJAX benchmark report saved to: {report_path}")
 
 if __name__ == "__main__":
