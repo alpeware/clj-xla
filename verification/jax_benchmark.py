@@ -123,36 +123,58 @@ def make_swiglu(jnp, jax, dev):
     b, s, d = 1, 2048, 4096
     inter = 4096
     x = dev_put(jnp.ones((b, s, d), dtype=jnp.float32), jax, dev)
-    w_gate = dev_put(jnp.ones((d, inter), dtype=jnp.float32), jax, dev)
-    w_up = dev_put(jnp.ones((d, inter), dtype=jnp.float32), jax, dev)
-    w_down = dev_put(jnp.ones((inter, d), dtype=jnp.float32), jax, dev)
-    flops = 2 * (2 * b * s * d * inter + b * s * inter * d)
+    w_gate = dev_put(jnp.ones((inter, d), dtype=jnp.float32), jax, dev)
+    w_up = dev_put(jnp.ones((inter, d), dtype=jnp.float32), jax, dev)
+    flops = 2 * (2 * b * s * d * inter)
+
     @jax.jit
-    def run(x_t, wg, wu, wd):
-        gate = jax.nn.silu(jnp.matmul(x_t, wg))
-        up = jnp.matmul(x_t, wu)
-        return jnp.matmul(gate * up, wd)
-    return "swiglu", run, (x, w_gate, w_up, w_down), flops
+    def run(x_t, wg, wu):
+        gate = jax.nn.silu(jnp.matmul(x_t, wg.T))
+        up = jnp.matmul(x_t, wu.T)
+        return gate * up
+
+    return "swiglu", run, (x, w_gate, w_up), flops
 
 def make_gqa_causal_attn(jnp, jax, dev):
     b, seq, h_q, h_kv, d_k = 1, 128, 8, 1, 256
-    q = dev_put(jnp.ones((b, seq, h_q, d_k), dtype=jnp.float32), jax, dev)
-    k = dev_put(jnp.ones((b, seq, h_kv, d_k), dtype=jnp.float32), jax, dev)
-    v = dev_put(jnp.ones((b, seq, h_kv, d_k), dtype=jnp.float32), jax, dev)
-    o_w = dev_put(jnp.ones((h_q * d_k, h_q * d_k), dtype=jnp.float32), jax, dev)
+    q_dim = h_q * d_k
+    kv_dim = h_kv * d_k
+    hidden_dim = q_dim
+
+    x = dev_put(jnp.ones((b, seq, hidden_dim), dtype=jnp.float32), jax, dev)
+    qw = dev_put(jnp.ones((q_dim, hidden_dim), dtype=jnp.float32), jax, dev)
+    kw = dev_put(jnp.ones((kv_dim, hidden_dim), dtype=jnp.float32), jax, dev)
+    vw = dev_put(jnp.ones((kv_dim, hidden_dim), dtype=jnp.float32), jax, dev)
+    ow = dev_put(jnp.ones((hidden_dim, q_dim), dtype=jnp.float32), jax, dev)
+    qn = dev_put(jnp.ones((d_k,), dtype=jnp.float32), jax, dev)
+    kn = dev_put(jnp.ones((d_k,), dtype=jnp.float32), jax, dev)
+
+    flops = 2 * (b * seq * hidden_dim * q_dim + 2 * b * seq * hidden_dim * kv_dim + b * seq * q_dim * hidden_dim)
+
     @jax.jit
-    def run(q_t, k_t, v_t, ow):
-        k_exp = jnp.repeat(k_t, h_q // h_kv, axis=2)
-        v_exp = jnp.repeat(v_t, h_q // h_kv, axis=2)
-        q_trans = jnp.transpose(q_t, (0, 2, 1, 3))
-        k_trans = jnp.transpose(k_exp, (0, 2, 3, 1))
-        v_trans = jnp.transpose(v_exp, (0, 2, 1, 3))
-        scores = jnp.matmul(q_trans, k_trans) / (d_k ** 0.5)
+    def run(x_t, q_w, k_w, v_w, o_w, q_n, k_n):
+        q_proj = jnp.matmul(x_t, q_w.T).reshape(b, seq, h_q, d_k)
+        k_proj = jnp.matmul(x_t, k_w.T).reshape(b, seq, h_kv, d_k)
+        v_proj = jnp.matmul(x_t, v_w.T).reshape(b, seq, h_kv, d_k)
+
+        # Per-head RMSNorm
+        q_ms = jnp.mean(q_proj ** 2, axis=-1, keepdims=True)
+        k_ms = jnp.mean(k_proj ** 2, axis=-1, keepdims=True)
+        q_norm = (q_proj / jnp.sqrt(q_ms + 1e-6)) * (1.0 + q_n)
+        k_norm = (k_proj / jnp.sqrt(k_ms + 1e-6)) * (1.0 + k_n)
+
+        # Repeat KV heads for GQA
+        k_exp = jnp.repeat(k_norm, h_q // h_kv, axis=2).transpose(0, 2, 3, 1)
+        v_exp = jnp.repeat(v_proj, h_q // h_kv, axis=2).transpose(0, 2, 1, 3)
+        q_trans = q_norm.transpose(0, 2, 1, 3)
+
+        # Multi-Head Causal Attention
+        scores = jnp.matmul(q_trans, k_exp) / (d_k ** 0.5)
         probs = jax.nn.softmax(scores, axis=-1)
-        context = jnp.matmul(probs, v_trans)
-        context_flat = jnp.reshape(jnp.transpose(context, (0, 2, 1, 3)), (b, seq, -1))
-        return jnp.matmul(context_flat, ow)
-    return "gqa-causal-attn", run, (q, k, v, o_w), None
+        context = jnp.matmul(probs, v_exp).transpose(0, 2, 1, 3).reshape(b, seq, q_dim)
+        return jnp.matmul(context, o_w.T)
+
+    return "gqa-causal-attn", run, (x, qw, kw, vw, ow, qn, kn), flops
 
 def make_gpt2_block(jnp, jax, dev):
     b, s, d = 1, 128, 768

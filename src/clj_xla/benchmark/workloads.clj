@@ -16,11 +16,14 @@
                (fn [a b] (t/matmul a b))))
 
 (defn make-gemm-inputs
-  [m n k _dtype]
+  [m n k dtype]
   (let [num-a (* m k)
         num-b (* k n)]
-    {:a (float-array (repeat num-a 1.0))
-     :b (float-array (repeat num-b 1.0))}))
+    (if (= dtype :bf16)
+      {:a (short-array (repeat num-a (short 16256)))
+       :b (short-array (repeat num-b (short 16256)))}
+      {:a (float-array (repeat num-a 1.0))
+       :b (float-array (repeat num-b 1.0))})))
 
 (defn build-rms-norm-graph
   [batch seq-len dim dtype]
