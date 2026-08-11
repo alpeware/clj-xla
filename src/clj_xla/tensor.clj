@@ -159,6 +159,16 @@
       (swap! (:eqns *trace-ctx*) conj eqn))
     (->Tracer out-id (:type tx))))
 
+(defn sigmoid
+  "Elementwise logistic sigmoid function: 1 / (1 + exp(-x)). Emits native stablehlo/logistic."
+  [x]
+  (let [tx (emit-constant! x nil)
+        out-id (gen-var-id! "t_logistic")
+        eqn {:op :stablehlo/logistic :invars [(:id tx)] :outvars [out-id]}]
+    (when *trace-ctx*
+      (swap! (:eqns *trace-ctx*) conj eqn))
+    (->Tracer out-id (:type tx))))
+
 (defn sin
   "Elementwise sine function."
   [x]

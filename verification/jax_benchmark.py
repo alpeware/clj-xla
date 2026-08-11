@@ -121,7 +121,7 @@ def make_rms_norm(jnp, jax, dev):
 
 def make_swiglu(jnp, jax, dev):
     b, s, d = 1, 2048, 4096
-    inter = 4096
+    inter = 4 * d
     x = dev_put(jnp.ones((b, s, d), dtype=jnp.float32), jax, dev)
     w_gate = dev_put(jnp.ones((inter, d), dtype=jnp.float32), jax, dev)
     w_up = dev_put(jnp.ones((inter, d), dtype=jnp.float32), jax, dev)
