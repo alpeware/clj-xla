@@ -341,7 +341,7 @@ def run_benchmarks_for_backend(backend_name):
 
 def main():
     parser = argparse.ArgumentParser(description="JAX Benchmark Suite")
-    parser.add_argument("--backend", "-b", choices=["auto", "cpu", "sycl", "all"], default="auto",
+    parser.add_argument("--backend", "-b", choices=["auto", "cpu", "sycl", "rocm", "cuda12", "all"], default="auto",
                         help="Target backend platform")
     args = parser.parse_args()
 
