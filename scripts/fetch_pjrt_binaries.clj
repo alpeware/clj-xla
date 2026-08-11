@@ -41,14 +41,11 @@
            "https://files.pythonhosted.org/packages/6f/2e/5a009451929da21a4898cb8f1925fc6a484e848cbed2e496aac5b14ab795/onemkl_sycl_datafitting-2025.3.0-py2.py3-none-manylinux_2_28_x86_64.whl"]}
 
    :rocm
-   {:url "https://files.pythonhosted.org/packages/4b/7b/04673b3e351fe02c9380b05740f185a10903b9d9fe222df314391c79e71c/jax_rocm7_pjrt-0.10.2-py3-none-manylinux_2_27_x86_64.whl"
+   {:url "https://repo.amd.com/rocm/whl-multi-arch/jax_rocm7_plugin-0.10.0%2Brocm7.14.0-cp312-cp312-manylinux_2_27_x86_64.whl"
     :so-name "libpjrt_rocm.so"
     :entry-pattern #"(xla_rocm_plugin|pjrt_rocm_plugin)\.so$"
     :arch-pkgs ["https://archlinux.org/packages/extra/x86_64/rocprofiler/download/"
-                "https://archlinux.org/packages/extra/x86_64/hsa-amd-aqlprofile/download/"
-                "https://archlinux.org/packages/extra/x86_64/google-glog/download/"
-                "https://archlinux.org/packages/extra/x86_64/yaml-cpp/download/"
-                "https://archlinux.org/packages/extra/x86_64/gflags/download/"]}})
+                "https://archlinux.org/packages/extra/x86_64/hsa-amd-aqlprofile/download/"]}})
 
 (def URL-FALLBACKS
   "Map of primary download URLs to PyPI mirror URLs if primary yields HTTP 404."
