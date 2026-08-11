@@ -1,0 +1,39 @@
+# Gemma 2 / 3 / 4 Model Architecture Specification & Verification
+
+- **Status**: **Fully Supported** (Gemma 2B, Gemma 3 1B/4B/12B/27B, Gemma 4 E2B/E4B/12B/26B-A4B/31B)
+- **Clojure Source**: [`src/clj_xla/models/gemma.clj`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/models/gemma.clj)
+- **CLI Runner**: [`scripts/gemma4_inference.clj`](file:///home/simonpure/src/alpeware/clj-xla/scripts/gemma4_inference.clj)
+- **Test Suite**: [`test/clj_xla/models/gemma_test.clj`](file:///home/simonpure/src/alpeware/clj-xla/test/clj_xla/models/gemma_test.clj)
+
+---
+
+## 1. Model Configurations
+
+| Variant | Hidden Dim | Layers | Query Heads | KV Heads | Head Dim | Per-Layer Gate Dim |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Gemma 2B** | 2048 | 18 | 8 | 1 | 256 | N/A |
+| **Gemma 3 1B** | 1536 | 22 | 8 | 1 | 256 | N/A |
+| **Gemma 4 E2B** | 1536 | 22 | 8 | 1 | 256 | 256 |
+| **Gemma 4 E4B** | 2560 | 34 | 10 | 2 | 256 | 256 |
+
+---
+
+## 2. Key Neural Network Components
+
+1. **Gemma RMSNorm**: $+1.0$ weight scaling offset $y = \frac{x}{\text{RMS}(x)} \times (1.0 + w)$.
+2. **Grouped-Query Attention (GQA)**: Multi-query attention with Rotary Position Embeddings (RoPE).
+3. **SwiGLU MLP**: Gated Feed-Forward blocks ($\text{SiLU}(x W_{gate}) \odot (x W_{up}) W_{down}$).
+4. **Per-Layer Input Residual Gating**: Gemma 4 per-layer scalar gating projections.
+
+---
+
+## 3. Verification & Execution
+
+* **Interactive CLI Hardware Execution (SYCL / CPU)**:
+  ```bash
+  clojure -M scripts/gemma4_inference.clj --model Gemma-4-E2B-it --backend sycl --precision int8
+  ```
+* **Generative Unit & Property Tests**:
+  ```bash
+  clojure -M:test -e "(require '[clj-xla.models.gemma-test]) (clojure.test/run-tests 'clj-xla.models.gemma-test)"
+  ```
