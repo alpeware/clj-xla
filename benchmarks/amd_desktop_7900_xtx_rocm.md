@@ -27,13 +27,31 @@
 
 ---
 
-## 2. Reproduction Commands
+## 2. Python/XLA (Official AMD `rocm/jax:latest` Container) vs. JVM/XLA (`clj-xla`) Matrix
+
+*Comparison collected on the AMD Radeon RX 7900 XTX 24GB GPU running official AMD `rocm/jax:latest` container vs native `clj-xla` OpenXLA PJRT C API backend.*
+
+| Workload Kernel | Official AMD JAX `rocm/jax` Mean | `clj-xla` ROCm GPU Mean | `clj-xla` ROCm GPU P50 | Official JAX TFLOPS | `clj-xla` ROCm TFLOPS |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **GEMM FP32 ($1024^3$)** | **0.146 ms** | 0.464 ms | 0.468 ms | **14.71 TFLOPS** | 4.63 TFLOPS |
+| **GEMM BF16 ($1024^3$)** | **0.078 ms** | 0.123 ms | 0.122 ms | **27.53 TFLOPS** | 17.47 TFLOPS |
+| **RMSNorm ($1 \times 2048 \times 4096$)** | **0.092 ms** | 0.183 ms | 0.191 ms | **$727.8\text{ GB/s}$** | $365.88\text{ GB/s}$ |
+| **SwiGLU Activation ($1 \times 2048 \times 4096$)** | **19.138 ms** | 97.669 ms | 97.396 ms | **28.73 TFLOPS** | 2.81 TFLOPS |
+| **GQA Causal Attention ($1 \times 128 \times 8 \times 256$)** | **0.332 ms** | 0.724 ms | 0.704 ms | **7.28 TFLOPS** | 1.48 TFLOPS |
+| **GPT-2 Layer Block ($1 \times 128 \times 768$)** | **0.288 ms** | 0.488 ms | 0.485 ms | **6.29 TFLOPS** | 3.71 TFLOPS |
+| **Gemma 4 Layer Block ($1 \times 128 \times 1536$)** | **0.881 ms** | 2.989 ms | 2.805 ms | **10.28 TFLOPS** | 3.23 TFLOPS |
+
+---
+
+## 3. Reproduction Commands
 
 - **Run `clj-xla` ROCm Hardware Benchmark**:
   ```bash
   ./scripts/benchmark.sh --backend rocm --warmup 5 --measure 50
   ```
-- **Run Python JAX Verification Script**:
+- **Run Python JAX Benchmark in Official AMD ROCm Container**:
   ```bash
-  verification/.venv/bin/python verification/jax_benchmark.py
+  docker run --rm --device=/dev/kfd --device=/dev/dri --group-add video \
+    --security-opt seccomp=unconfined -v $(pwd):/workspace -w /workspace \
+    rocm/jax:latest python3 verification/jax_benchmark.py --backend rocm
   ```
