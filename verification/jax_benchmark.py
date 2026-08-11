@@ -25,6 +25,20 @@ def setup_jax_backend(backend_name):
             target_dev = client.devices()[0]
         except Exception as e:
             print(f"Warning initializing SYCL C API client: {e}", flush=True)
+    elif backend_name == "rocm":
+        try:
+            xla_client.load_pjrt_plugin_dynamically("rocm", "bin/libpjrt_rocm.so")
+            client = xla_client.make_c_api_client("rocm", {"allocator": "platform"})
+            target_dev = client.devices()[0]
+        except Exception as e:
+            print(f"Warning initializing ROCm C API client: {e}", flush=True)
+    elif backend_name == "cuda12" or backend_name == "cuda":
+        try:
+            xla_client.load_pjrt_plugin_dynamically("cuda", "bin/libpjrt_cuda.so")
+            client = xla_client.make_c_api_client("cuda", {"allocator": "platform"})
+            target_dev = client.devices()[0]
+        except Exception as e:
+            print(f"Warning initializing CUDA C API client: {e}", flush=True)
 
     if target_dev is None:
         target_dev = jax.devices("cpu")[0]
