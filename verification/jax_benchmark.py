@@ -156,53 +156,125 @@ def make_gqa_causal_attn(jnp, jax, dev):
 
 def make_gpt2_block(jnp, jax, dev):
     b, s, d = 1, 128, 768
+    num_heads = 12
+    head_dim = d // num_heads
     x = dev_put(jnp.ones((b, s, d), dtype=jnp.float32), jax, dev)
+    ln1_g = dev_put(jnp.ones((d,), dtype=jnp.float32), jax, dev)
+    ln1_b = dev_put(jnp.zeros((d,), dtype=jnp.float32), jax, dev)
     c_attn_w = dev_put(jnp.ones((d, 3 * d), dtype=jnp.float32), jax, dev)
+    c_attn_b = dev_put(jnp.zeros((3 * d,), dtype=jnp.float32), jax, dev)
     c_proj_w = dev_put(jnp.ones((d, d), dtype=jnp.float32), jax, dev)
+    c_proj_b = dev_put(jnp.zeros((d,), dtype=jnp.float32), jax, dev)
+    ln2_g = dev_put(jnp.ones((d,), dtype=jnp.float32), jax, dev)
+    ln2_b = dev_put(jnp.zeros((d,), dtype=jnp.float32), jax, dev)
     mlp_fc_w = dev_put(jnp.ones((d, 4 * d), dtype=jnp.float32), jax, dev)
+    mlp_fc_b = dev_put(jnp.zeros((4 * d,), dtype=jnp.float32), jax, dev)
     mlp_proj_w = dev_put(jnp.ones((4 * d, d), dtype=jnp.float32), jax, dev)
+    mlp_proj_b = dev_put(jnp.zeros((d,), dtype=jnp.float32), jax, dev)
     flops = 2 * (b * s * d * (3 * d) + b * s * d * d + b * s * d * (4 * d) + b * s * (4 * d) * d)
+
     @jax.jit
-    def run(x_t, c_attn, c_proj, mlp_fc, mlp_proj):
-        ms1 = jnp.mean(x_t ** 2, axis=-1, keepdims=True)
-        ln1 = x_t / jnp.sqrt(ms1 + 1e-5)
-        qkv = jnp.matmul(ln1, c_attn)
-        attn_out = jnp.matmul(qkv[:, :, :d], c_proj)
+    def run(x_t, g1, b1, c_attn, cb, c_proj, pb, g2, b2, mlp_fc, fcb, mlp_proj, pb2):
+        # LayerNorm 1
+        m1 = jnp.mean(x_t, axis=-1, keepdims=True)
+        v1 = jnp.mean((x_t - m1) ** 2, axis=-1, keepdims=True)
+        ln1 = (x_t - m1) / jnp.sqrt(v1 + 1e-5) * g1 + b1
+        # QKV Projection
+        qkv = jnp.matmul(ln1, c_attn) + cb
+        q = qkv[:, :, :d].reshape(b, s, num_heads, head_dim).transpose(0, 2, 1, 3)
+        k = qkv[:, :, d:2*d].reshape(b, s, num_heads, head_dim).transpose(0, 2, 3, 1)
+        v = qkv[:, :, 2*d:].reshape(b, s, num_heads, head_dim).transpose(0, 2, 1, 3)
+        # Multi-Head Causal Self-Attention
+        scores = jnp.matmul(q, k) / (head_dim ** 0.5)
+        probs = jax.nn.softmax(scores, axis=-1)
+        attn_context = jnp.matmul(probs, v).transpose(0, 2, 1, 3).reshape(b, s, d)
+        attn_out = jnp.matmul(attn_context, c_proj) + pb
         res1 = x_t + attn_out
-        ms2 = jnp.mean(res1 ** 2, axis=-1, keepdims=True)
-        ln2 = res1 / jnp.sqrt(ms2 + 1e-5)
-        fc = jax.nn.gelu(jnp.matmul(ln2, mlp_fc))
-        mlp_out = jnp.matmul(fc, mlp_proj)
+        # LayerNorm 2 & MLP
+        m2 = jnp.mean(res1, axis=-1, keepdims=True)
+        v2 = jnp.mean((res1 - m2) ** 2, axis=-1, keepdims=True)
+        ln2 = (res1 - m2) / jnp.sqrt(v2 + 1e-5) * g2 + b2
+        fc = jax.nn.gelu(jnp.matmul(ln2, mlp_fc) + fcb)
+        mlp_out = jnp.matmul(fc, mlp_proj) + pb2
         return res1 + mlp_out
-    return "gpt2-block", run, (x, c_attn_w, c_proj_w, mlp_fc_w, mlp_proj_w), flops
+
+    args = (x, ln1_g, ln1_b, c_attn_w, c_attn_b, c_proj_w, c_proj_b, ln2_g, ln2_b, mlp_fc_w, mlp_fc_b, mlp_proj_w, mlp_proj_b)
+    return "gpt2-block", run, args, flops
 
 def make_gemma4_block(jnp, jax, dev):
     b, s, d = 1, 128, 1536
+    num_heads, num_kv_heads, head_dim = 8, 1, 256
+    q_dim = num_heads * head_dim
+    kv_dim = num_kv_heads * head_dim
+    mlp_dim = 4 * d
+    pl_dim = 256
+
     x = dev_put(jnp.ones((b, s, d), dtype=jnp.float32), jax, dev)
-    q_w = dev_put(jnp.ones((d, 2048), dtype=jnp.float32), jax, dev)
-    k_w = dev_put(jnp.ones((d, 256), dtype=jnp.float32), jax, dev)
-    v_w = dev_put(jnp.ones((d, 256), dtype=jnp.float32), jax, dev)
-    o_w = dev_put(jnp.ones((2048, d), dtype=jnp.float32), jax, dev)
-    gate_w = dev_put(jnp.ones((d, 6144), dtype=jnp.float32), jax, dev)
-    up_w = dev_put(jnp.ones((d, 6144), dtype=jnp.float32), jax, dev)
-    down_w = dev_put(jnp.ones((6144, d), dtype=jnp.float32), jax, dev)
+    in_ln = dev_put(jnp.ones((d,), dtype=jnp.float32), jax, dev)
+    ls = dev_put(jnp.ones((1,), dtype=jnp.float32), jax, dev)
+    qw = dev_put(jnp.ones((q_dim, d), dtype=jnp.float32), jax, dev)
+    kw = dev_put(jnp.ones((kv_dim, d), dtype=jnp.float32), jax, dev)
+    vw = dev_put(jnp.ones((kv_dim, d), dtype=jnp.float32), jax, dev)
+    ow = dev_put(jnp.ones((d, q_dim), dtype=jnp.float32), jax, dev)
+    qn = dev_put(jnp.ones((head_dim,), dtype=jnp.float32), jax, dev)
+    kn = dev_put(jnp.ones((head_dim,), dtype=jnp.float32), jax, dev)
+    post_attn = dev_put(jnp.ones((d,), dtype=jnp.float32), jax, dev)
+    pre_mlp = dev_put(jnp.ones((d,), dtype=jnp.float32), jax, dev)
+    post_mlp = dev_put(jnp.ones((d,), dtype=jnp.float32), jax, dev)
+    gw = dev_put(jnp.ones((mlp_dim, d), dtype=jnp.float32), jax, dev)
+    uw = dev_put(jnp.ones((mlp_dim, d), dtype=jnp.float32), jax, dev)
+    dw = dev_put(jnp.ones((d, mlp_dim), dtype=jnp.float32), jax, dev)
+    plg = dev_put(jnp.ones((pl_dim, d), dtype=jnp.float32), jax, dev)
+    plp = dev_put(jnp.ones((d, pl_dim), dtype=jnp.float32), jax, dev)
+    pln = dev_put(jnp.ones((d,), dtype=jnp.float32), jax, dev)
+    pl_in = dev_put(jnp.ones((b, s, d), dtype=jnp.float32), jax, dev)
+
     flops = 2 * (b * s * d * 2048 + b * s * d * 256 + b * s * d * 256 + b * s * 2048 * d + 2 * b * s * d * 6144 + b * s * 6144 * d)
+
     @jax.jit
-    def run(x_t, qw, kw, vw, ow, gw, uw, dw):
+    def run(x_t, in_ln_w, ls_w, q_w, k_w, v_w, o_w, q_n, k_n, post_attn_w, pre_mlp_w, post_mlp_w, g_w, u_w, d_w, plg_w, plp_w, pln_w, plin):
+        # 1. Input RMSNorm (1+w)
         ms1 = jnp.mean(x_t ** 2, axis=-1, keepdims=True)
-        ln1 = x_t / jnp.sqrt(ms1 + 1e-6)
-        q = jnp.matmul(ln1, qw)
-        k = jnp.matmul(ln1, kw)
-        v = jnp.matmul(ln1, vw)
-        attn_out = jnp.matmul(q, ow)
-        res1 = x_t + attn_out
-        ms2 = jnp.mean(res1 ** 2, axis=-1, keepdims=True)
-        ln2 = res1 / jnp.sqrt(ms2 + 1e-6)
-        gate = jax.nn.silu(jnp.matmul(ln2, gw))
-        up = jnp.matmul(ln2, uw)
-        mlp_out = jnp.matmul(gate * up, dw)
-        return res1 + mlp_out
-    return "gemma4-block", run, (x, q_w, k_w, v_w, o_w, gate_w, up_w, down_w), flops
+        norm1 = (x_t / jnp.sqrt(ms1 + 1e-6)) * (1.0 + in_ln_w)
+        # 2. Multi-Head GQA Attention
+        q_proj = jnp.matmul(norm1, q_w.T).reshape(b, s, num_heads, head_dim)
+        k_proj = jnp.matmul(norm1, k_w.T).reshape(b, s, num_kv_heads, head_dim)
+        v_proj = jnp.matmul(norm1, v_w.T).reshape(b, s, num_kv_heads, head_dim)
+        # Per-head RMSNorm (1+w)
+        q_ms = jnp.mean(q_proj ** 2, axis=-1, keepdims=True)
+        k_ms = jnp.mean(k_proj ** 2, axis=-1, keepdims=True)
+        q_norm = (q_proj / jnp.sqrt(q_ms + 1e-6)) * (1.0 + q_n)
+        k_norm = (k_proj / jnp.sqrt(k_ms + 1e-6)) * (1.0 + k_n)
+        # Repeat KV heads for GQA
+        k_exp = jnp.repeat(k_norm, num_heads // num_kv_heads, axis=2).transpose(0, 2, 3, 1)
+        v_exp = jnp.repeat(v_proj, num_heads // num_kv_heads, axis=2).transpose(0, 2, 1, 3)
+        q_trans = q_norm.transpose(0, 2, 1, 3)
+        # Multi-Head Attention
+        scores = jnp.matmul(q_trans, k_exp) / (head_dim ** 0.5)
+        probs = jax.nn.softmax(scores, axis=-1)
+        context = jnp.matmul(probs, v_exp).transpose(0, 2, 1, 3).reshape(b, s, q_dim)
+        attn_out = jnp.matmul(context, o_w.T)
+        post_attn_ms = jnp.mean(attn_out ** 2, axis=-1, keepdims=True)
+        post_attn_res = (attn_out / jnp.sqrt(post_attn_ms + 1e-6)) * (1.0 + post_attn_w)
+        res1 = x_t + post_attn_res * ls_w
+        # 3. Pre-MLP RMSNorm & SwiGLU Gated MLP
+        pre_mlp_ms = jnp.mean(res1 ** 2, axis=-1, keepdims=True)
+        pre_mlp_norm = (res1 / jnp.sqrt(pre_mlp_ms + 1e-6)) * (1.0 + pre_mlp_w)
+        gate = jax.nn.silu(jnp.matmul(pre_mlp_norm, g_w.T))
+        up = jnp.matmul(pre_mlp_norm, u_w.T)
+        mlp_out = jnp.matmul(gate * up, d_w.T)
+        post_mlp_ms = jnp.mean(mlp_out ** 2, axis=-1, keepdims=True)
+        post_mlp_res = (mlp_out / jnp.sqrt(post_mlp_ms + 1e-6)) * (1.0 + post_mlp_w)
+        res2 = res1 + post_mlp_res
+        # 4. Gemma 4 Per-Layer Projection
+        pl_gate = jax.nn.silu(jnp.matmul(plin, plg_w.T))
+        pl_out = jnp.matmul(pl_gate, plp_w.T)
+        pl_ms = jnp.mean(pl_out ** 2, axis=-1, keepdims=True)
+        pl_norm = (pl_out / jnp.sqrt(pl_ms + 1e-6)) * (1.0 + pln_w)
+        return res2 + pl_norm
+
+    args = (x, in_ln, ls, qw, kw, vw, ow, qn, kn, post_attn, pre_mlp, post_mlp, gw, uw, dw, plg, plp, pln, pl_in)
+    return "gemma4-block", run, args, flops
 
 def run_benchmarks_for_backend(backend_name):
     print(f"\n==========================================================================", flush=True)
