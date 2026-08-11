@@ -1,14 +1,14 @@
 # Gemma 2 Model Architecture Specification & StableHLO Graph
 
 - **Status**: **Fully Supported** (Gemma 2B, Gemma 2 9B, Gemma 2 27B)
-- **Clojure Source**: [`src/clj_xla/models/gemma.clj`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/models/gemma.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/models/gemma.clj))
-- **Test Suite**: [`test/clj_xla/models/gemma_test.clj`](file:///home/simonpure/src/alpeware/clj-xla/test/clj_xla/models/gemma_test.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/test/clj_xla/models/gemma_test.clj))
+- **Clojure Source**: [`src/clj_xla/models/gemma.clj`](../../src/clj_xla/models/gemma.clj)
+- **Test Suite**: [`test/clj_xla/models/gemma_test.clj`](../../test/clj_xla/models/gemma_test.clj)
 
 ---
 
 ## 1. Visual Trace Graph (Pure Clojure $\to$ StableHLO MLIR)
 
-The following Mermaid diagram represents the exact StableHLO execution graph formed by [`gemma-block`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/models/gemma.clj#L140) in `clj-xla`:
+The following Mermaid diagram represents the exact StableHLO execution graph formed by [`gemma-block`](../../src/clj_xla/models/gemma.clj#L140) in `clj-xla`:
 
 ```mermaid
 flowchart TD

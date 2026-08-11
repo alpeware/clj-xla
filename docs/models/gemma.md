@@ -1,9 +1,9 @@
-# Gemma 2 / 3 / 4 Model Architecture Specification & Verification
+# Gemma Model Architecture Specification & Verification
 
 - **Status**: **Fully Supported** (Gemma 2B, Gemma 3 1B/4B/12B/27B, Gemma 4 E2B/E4B/12B/26B-A4B/31B)
-- **Clojure Source**: [`src/clj_xla/models/gemma.clj`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/models/gemma.clj)
-- **CLI Runner**: [`scripts/gemma4_inference.clj`](file:///home/simonpure/src/alpeware/clj-xla/scripts/gemma4_inference.clj)
-- **Test Suite**: [`test/clj_xla/models/gemma_test.clj`](file:///home/simonpure/src/alpeware/clj-xla/test/clj_xla/models/gemma_test.clj)
+- **Clojure Source**: [`src/clj_xla/models/gemma.clj`](../../src/clj_xla/models/gemma.clj)
+- **CLI Runner**: [`scripts/gemma4_inference.clj`](../../scripts/gemma4_inference.clj)
+- **Test Suite**: [`test/clj_xla/models/gemma_test.clj`](../../test/clj_xla/models/gemma_test.clj)
 
 ---
 

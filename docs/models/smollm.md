@@ -1,13 +1,13 @@
 # SmolLM Architecture Specification & StableHLO Graph
 
 - **Status**: **Fully Supported** (SmolLM-135M, SmolLM-360M, SmolLM-1.7B)
-- **Clojure Source**: [`src/clj_xla/models/smollm.clj`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/models/smollm.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/models/smollm.clj))
+- **Clojure Source**: [`src/clj_xla/models/smollm.clj`](../../src/clj_xla/models/smollm.clj)
 
 ---
 
 ## 1. Visual Trace Graph (Pure Clojure $\to$ StableHLO MLIR)
 
-The following Mermaid diagram represents the exact StableHLO execution graph formed by [`smollm-block`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/models/smollm.clj#L15) in `clj-xla`:
+The following Mermaid diagram represents the exact StableHLO execution graph formed by [`smollm-block`](../../src/clj_xla/models/smollm.clj#L15) in `clj-xla`:
 
 ```mermaid
 flowchart TD

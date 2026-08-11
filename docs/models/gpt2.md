@@ -1,14 +1,14 @@
 # GPT-2 Model Architecture Specification & StableHLO Graph
 
 - **Status**: **Fully Supported**
-- **Clojure Source**: [`src/clj_xla/models/gpt2.clj`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/models/gpt2.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/models/gpt2.clj))
-- **Test Suite**: [`test/clj_xla/models/gpt2_test.clj`](file:///home/simonpure/src/alpeware/clj-xla/test/clj_xla/models/gpt2_test.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/test/clj_xla/models/gpt2_test.clj))
+- **Clojure Source**: [`src/clj_xla/models/gpt2.clj`](../../src/clj_xla/models/gpt2.clj)
+- **Test Suite**: [`test/clj_xla/models/gpt2_test.clj`](../../test/clj_xla/models/gpt2_test.clj)
 
 ---
 
 ## 1. Visual Trace Graph (Pure Clojure $\to$ StableHLO MLIR)
 
-The following Mermaid diagram represents the exact StableHLO execution graph formed by [`gpt2-block`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/models/gpt2.clj#L10) in `clj-xla`:
+The following Mermaid diagram represents the exact StableHLO execution graph formed by [`gpt2-block`](../../src/clj_xla/models/gpt2.clj#L10) in `clj-xla`:
 
 ```mermaid
 flowchart TD
@@ -88,4 +88,4 @@ flowchart TD
   ```bash
   clojure -M:test -e "(require '[clj-xla.models.gpt2-test]) (clojure.test/run-tests 'clj-xla.models.gpt2-test)"
   ```
-* **Benchmark Execution**: Measured in [`scripts.benchmark`](file:///home/simonpure/src/alpeware/clj-xla/scripts/benchmark.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/scripts/benchmark.clj)) as `gpt2-block`.
+* **Benchmark Execution**: Measured in [`scripts/benchmark.clj`](../../scripts/benchmark.clj) as `gpt2-block`.

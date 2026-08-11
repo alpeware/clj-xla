@@ -33,4 +33,4 @@ Inside the trace graph, de-quantization is fused directly before the matrix mult
 
 When compiled to PJRT via OpenXLA, the integer de-quantization and matrix multiplication compile into fused hardware tensor core kernels (XMX on Intel Arc, Tensor Cores on NVIDIA CUDA, Matrix Accelerators on AMD ROCm).
 
-* **Clojure Reference**: [`clj-xla.safetensors`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/safetensors.clj).
+* **Clojure Reference**: [`clj-xla.safetensors`](../../src/clj_xla/safetensors.clj).

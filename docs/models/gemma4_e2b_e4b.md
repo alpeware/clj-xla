@@ -1,15 +1,15 @@
 # Gemma 4 (E2B / E4B) Model Architecture Specification & StableHLO Graph
 
 - **Status**: **Fully Supported** (Gemma 4 E2B, Gemma 4 E4B)
-- **Clojure Source**: [`src/clj_xla/models/gemma.clj`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/models/gemma.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/models/gemma.clj))
-- **CLI Hardware Runner**: [`scripts/gemma4_inference.clj`](file:///home/simonpure/src/alpeware/clj-xla/scripts/gemma4_inference.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/scripts/gemma4_inference.clj))
-- **Test Suite**: [`test/clj_xla/models/gemma_test.clj`](file:///home/simonpure/src/alpeware/clj-xla/test/clj_xla/models/gemma_test.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/test/clj_xla/models/gemma_test.clj))
+- **Clojure Source**: [`src/clj_xla/models/gemma.clj`](../../src/clj_xla/models/gemma.clj)
+- **CLI Hardware Runner**: [`scripts/gemma4_inference.clj`](../../scripts/gemma4_inference.clj)
+- **Test Suite**: [`test/clj_xla/models/gemma_test.clj`](../../test/clj_xla/models/gemma_test.clj)
 
 ---
 
 ## 1. Visual Trace Graph (Pure Clojure $\to$ StableHLO MLIR)
 
-The following Mermaid diagram represents the exact StableHLO execution graph formed by [`gemma4-block`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/models/gemma.clj#L210) in `clj-xla`:
+The following Mermaid diagram represents the exact StableHLO execution graph formed by [`gemma4-block`](../../src/clj_xla/models/gemma.clj#L210) in `clj-xla`:
 
 ```mermaid
 flowchart TD

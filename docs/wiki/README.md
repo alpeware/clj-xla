@@ -6,47 +6,47 @@ This Wiki serves as an open, educational reference for state-of-the-art LLM arch
 
 ## 📖 Wiki Topics
 
-### 1. ⚡ [Inference: Prefill Phase vs. Decoding Phase ($B=1$)](file:///home/simonpure/src/alpeware/clj-xla/docs/wiki/inference.md) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/docs/wiki/inference.md))
+### 1. ⚡ [Inference: Prefill Phase vs. Decoding Phase ($B=1$)](inference.md)
 - Theoretical breakdown of the **Compute-Bound Prompt Prefill Phase** ($L$ tokens in 1 matrix pass) vs. the **Memory-Bandwidth Bound Autoregressive Decoding Phase** ($B=1$ single token steps).
 - Impact on arithmetic intensity and GPU tensor core utilization.
 
-### 2. 🔤 [Tokenization & Special Tokens](file:///home/simonpure/src/alpeware/clj-xla/docs/wiki/tokenization.md) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/docs/wiki/tokenization.md))
+### 2. 🔤 [Tokenization & Special Tokens](tokenization.md)
 - **Byte-Pair Encoding (BPE)** (GPT-2, SmolLM) vs **SentencePiece / Unigram** (Gemma).
 - Vocabulary embedding lookups and special tokens (`<bos>`, `<eos>`, `<turn|>` context control tokens).
-- Reference Implementation: [`clj-xla.tokenizer`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/tokenizer.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/tokenizer.clj)).
+- Reference Implementation: [`clj-xla.tokenizer`](../../src/clj_xla/tokenizer.clj).
 
-### 3. 🎲 [Autoregressive Sampling & KV Cache Management](file:///home/simonpure/src/alpeware/clj-xla/docs/wiki/sampling.md) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/docs/wiki/sampling.md))
+### 3. 🎲 [Autoregressive Sampling & KV Cache Management](sampling.md)
 - **Sampling Algorithms**: Temperature scaling, Top-K filtering, Top-P (Nucleus) cumulative thresholding.
 - **KV Cache Updates**: Mutating and appending $K_t, V_t$ slices to historical KV cache tensors.
-- Reference Implementations: [`clj-xla.sampling`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/sampling.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/sampling.clj)) and [`clj-xla.generation`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/generation.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/generation.clj)).
+- Reference Implementations: [`clj-xla.sampling`](../../src/clj_xla/sampling.clj) and [`clj-xla.generation`](../../src/clj_xla/generation.clj).
 
-### 4. 👁️ [Attention Mechanisms](file:///home/simonpure/src/alpeware/clj-xla/docs/wiki/attention.md) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/docs/wiki/attention.md))
+### 4. 👁️ [Attention Mechanisms](attention.md)
 - **Multi-Head Attention (MHA)**: Standard query-key-value self-attention.
 - **Grouped-Query Attention (GQA)**: Shared KV heads for reduced memory bandwidth overhead.
 - **Rotary Position Embeddings (RoPE)**: Relative position encoding via complex plane rotations.
 - **Gemma 4 Hybrid Sliding Window**: Local window attention eviction combined with global layers.
 - **DeepSeek Multi-Head Latent Attention (MLA)**: Low-rank KV cache vector compression.
 - **FlashDecoding & Split-K**: Parallel single-query ($B=1$) KV reduction on GPU.
-- Reference Implementation: [`clj-xla.nn.attention`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/nn/attention.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/nn/attention.clj)).
+- Reference Implementation: [`clj-xla.nn.attention`](../../src/clj_xla/nn/attention.clj).
 
-### 5. ⚖️ [Normalization Variants](file:///home/simonpure/src/alpeware/clj-xla/docs/wiki/normalization.md) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/docs/wiki/normalization.md))
+### 5. ⚖️ [Normalization Variants](normalization.md)
 - **Standard LayerNorm**: Mean and variance scaling with gain ($\gamma$) and bias ($\beta$).
 - **Root Mean Square Normalization (RMSNorm)**: Mean-square variance scaling without mean subtraction.
 - **Gemma RMSNorm**: $+1.0$ weight offset variant: $y = \frac{x}{\text{RMS}(x)} \times (1.0 + w)$.
-- Reference Implementation: [`clj-xla.nn.norm`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/nn/norm.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/nn/norm.clj)).
+- Reference Implementation: [`clj-xla.nn.norm`](../../src/clj_xla/nn/norm.clj).
 
-### 6. ⚡ [Activation Functions & Gated MLPs](file:///home/simonpure/src/alpeware/clj-xla/docs/wiki/activations.md) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/docs/wiki/activations.md))
+### 6. ⚡ [Activation Functions & Gated MLPs](activations.md)
 - **GELU / SiLU / ReLU**: Standard non-linearities.
 - **SwiGLU & GeGLU**: Gated Linear Unit feed-forward sub-blocks.
-- Reference Implementation: [`clj-xla.nn.activations`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/nn/activations.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/nn/activations.clj)).
+- Reference Implementation: [`clj-xla.nn.activations`](../../src/clj_xla/nn/activations.clj).
 
-### 7. 🔮 [Speculative Decoding Algorithms](file:///home/simonpure/src/alpeware/clj-xla/docs/wiki/speculative_decoding.md) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/docs/wiki/speculative_decoding.md))
+### 7. 🔮 [Speculative Decoding Algorithms](speculative_decoding.md)
 - **Draft-Model Speculative Decoding**: Autoregressive candidate proposal with target verification.
 - **EAGLE / EAGLE-2 & Medusa**: Multi-head / feature-level speculation without separate draft models.
 - **Meta DFlash Block Speculation**: 16-token parallel block prediction.
 - **Prompt-Lookup / N-gram Speculation**: Contextual string matching for zero-overhead candidate draft proposals.
 
-### 8. 📦 [Low-Bit Quantization](file:///home/simonpure/src/alpeware/clj-xla/docs/wiki/quantization.md) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/docs/wiki/quantization.md))
+### 8. 📦 [Low-Bit Quantization](quantization.md)
 - **Post-Training Quantization (PTQ)**: INT8, INT4, AWQ, and GPTQ.
 - **In-Graph De-quantization**: Fusing integer-to-float weight conversion with GEMM matrix multiplication in StableHLO MLIR.
-- Reference Implementation: [`clj-xla.safetensors`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/safetensors.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/safetensors.clj)).
+- Reference Implementation: [`clj-xla.safetensors`](../../src/clj_xla/safetensors.clj).

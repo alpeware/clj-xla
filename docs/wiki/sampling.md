@@ -35,7 +35,7 @@ Step t:    Compute [K_t, V_t] for new token x_t
 
 ## 3. Clojure Implementation in `clj-xla`
 
-- **Temperature Scaling**: [`clj-xla.sampling/apply-temperature`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/sampling.clj#L10) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/sampling.clj#L10)).
-- **Top-K Filtering**: [`clj-xla.sampling/apply-top-k`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/sampling.clj#L25) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/sampling.clj#L25)).
-- **Autoregressive Loop**: [`clj-xla.generation/autoregressive-generate`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/generation.clj#L15) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/generation.clj#L15)).
-- **KV Cache Invariants**: Tested in [`test/clj_xla/generation_test.clj`](file:///home/simonpure/src/alpeware/clj-xla/test/clj_xla/generation_test.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/test/clj_xla/generation_test.clj)).
+- **Temperature Scaling**: [`clj-xla.sampling/apply-temperature`](../../src/clj_xla/sampling.clj#L10) in [`clj-xla.sampling`](../../src/clj_xla/sampling.clj).
+- **Top-K Filtering**: [`clj-xla.sampling/apply-top-k`](../../src/clj_xla/sampling.clj#L25) in [`clj-xla.sampling`](../../src/clj_xla/sampling.clj).
+- **Autoregressive Loop**: [`clj-xla.generation/autoregressive-generate`](../../src/clj_xla/generation.clj#L15) in [`clj-xla.generation`](../../src/clj_xla/generation.clj).
+- **KV Cache Invariants**: Tested in [`test/clj_xla/generation_test.clj`](../../test/clj_xla/generation_test.clj).

@@ -21,6 +21,6 @@ Tokenization converts natural language text into numerical token ID sequences us
 ## 2. Clojure Implementation in `clj-xla`
 
 Tokenization in `clj-xla` is managed via pure Clojure wrapper modules interfacing with SentencePiece / Hugging Face tokenizers:
-- **Encoding**: [`clj-xla.tokenizer/encode`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/tokenizer.clj#L15) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/tokenizer.clj#L15)).
-- **Decoding**: [`clj-xla.tokenizer/decode`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/tokenizer.clj#L30) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/tokenizer.clj#L30)).
-- **Unit & Property Tests**: [`test/clj_xla/tokenizer_test.clj`](file:///home/simonpure/src/alpeware/clj-xla/test/clj_xla/tokenizer_test.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/test/clj_xla/tokenizer_test.clj)).
+- **Encoding**: [`clj-xla.tokenizer/encode`](../../src/clj_xla/tokenizer.clj#L15) in [`clj-xla.tokenizer`](../../src/clj_xla/tokenizer.clj).
+- **Decoding**: [`clj-xla.tokenizer/decode`](../../src/clj_xla/tokenizer.clj#L30) in [`clj-xla.tokenizer`](../../src/clj_xla/tokenizer.clj).
+- **Unit & Property Tests**: [`test/clj_xla/tokenizer_test.clj`](../../test/clj_xla/tokenizer_test.clj).

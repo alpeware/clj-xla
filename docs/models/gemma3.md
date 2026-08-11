@@ -1,8 +1,8 @@
 # Gemma 3 Model Architecture Specification & StableHLO Graph
 
 - **Status**: **Fully Supported** (Gemma 3 1B, Gemma 3 4B, Gemma 3 12B, Gemma 3 27B)
-- **Clojure Source**: [`src/clj_xla/models/gemma.clj`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/models/gemma.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/models/gemma.clj))
-- **Test Suite**: [`test/clj_xla/models/gemma_test.clj`](file:///home/simonpure/src/alpeware/clj-xla/test/clj_xla/models/gemma_test.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/test/clj_xla/models/gemma_test.clj))
+- **Clojure Source**: [`src/clj_xla/models/gemma.clj`](../../src/clj_xla/models/gemma.clj)
+- **Test Suite**: [`test/clj_xla/models/gemma_test.clj`](../../test/clj_xla/models/gemma_test.clj)
 
 ---
 
