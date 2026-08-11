@@ -1,7 +1,10 @@
 (ns clj-xla.core
   "High-level Public Clojure API for OpenXLA PJRT backend initialization, compilation, and execution."
   (:require [clj-xla.compile :as compile]
-            [clj-xla.pjrt :as pjrt]))
+            [clj-xla.pjrt :as pjrt]
+            [clj-xla.pjrt.version :as v]
+            [clojure.java.io :as io]
+            [clojure.string :as str]))
 
 (def ^:dynamic *default-context* nil)
 
@@ -30,6 +33,87 @@
               (.invokeWithArguments handle [k-seg v-seg (int 1)]))))))
     (catch Exception _ nil)))
 
+(defn determine-optimal-xla-flags
+  "Pure function computing optimal XLA compiler flags and environment variables based on hardware target and user options."
+  ([target] (determine-optimal-xla-flags target {} {}))
+  ([target probe-info] (determine-optimal-xla-flags target probe-info {}))
+  ([target _probe-info opts]
+   (let [disable-defaults? (boolean (:disable-defaults? opts))
+         user-xla-flags (or (:xla-flags opts) "")
+         autotune-level (or (:autotune-level opts) 4)
+         triton? (get opts :triton? true)
+         sdpa? (get opts :sdpa? true)
+         latency-hiding? (get opts :latency-hiding? true)
+         async-stream? (get opts :async-stream? true)
+         cpus (.availableProcessors (Runtime/getRuntime))
+
+         target-kw (if (string? target)
+                     (cond
+                       (str/includes? target "cpu") :cpu
+                       (str/includes? target "rocm") :rocm
+                       (str/includes? target "cuda") :cuda12
+                       (str/includes? target "sycl") :sycl
+                       :else :cpu)
+                     target)]
+     (if disable-defaults?
+       {:xla-flags user-xla-flags
+        :env-vars {}
+        :autotune-level autotune-level
+        :cache-dir (:cache-dir opts)}
+       (let [existing-xla-flags (or (System/getenv "XLA_FLAGS") "")
+             base-flags (cond-> []
+                          (= target-kw :rocm)
+                          (conj "--xla_gpu_enable_hipblaslt=true")
+
+                          (= target-kw :cuda12)
+                          (conj "--xla_gpu_enable_cublaslt=true")
+
+                          (contains? #{:rocm :cuda12 :sycl} target-kw)
+                          (conj (str "--xla_gpu_autotune_level=" autotune-level))
+
+                          (and triton? (contains? #{:rocm :cuda12} target-kw))
+                          (conj "--xla_gpu_triton_gemm_any=true")
+
+                          (and sdpa? (= target-kw :cuda12))
+                          (conj "--xla_gpu_enable_sdpa=true")
+
+                          (and latency-hiding? (contains? #{:rocm :cuda12} target-kw))
+                          (conj "--xla_gpu_enable_latency_hiding_scheduler=true")
+
+                          (and async-stream? (contains? #{:rocm :cuda12 :sycl} target-kw))
+                          (conj "--xla_gpu_enable_highest_priority_async_stream=true")
+
+                          (contains? #{:rocm :cuda12 :sycl} target-kw)
+                          (conj (str "--xla_gpu_force_compilation_parallelism=" cpus))
+
+                          (= target-kw :cpu)
+                          (into ["--xla_cpu_multi_thread_eigen=true"
+                                 (str "--xla_gpu_force_compilation_parallelism=" cpus)]))
+
+             all-flags-str (str/join " " (distinct (remove str/blank? (concat (str/split existing-xla-flags #"\s+")
+                                                                              base-flags
+                                                                              (str/split user-xla-flags #"\s+")))))
+             cache-dir (or (:cache-dir opts)
+                           (when (= target-kw :rocm)
+                             (try
+                               (let [dir (io/file (System/getProperty "user.home") ".cache" "hsa_cache")]
+                                 (.mkdirs dir)
+                                 (.getAbsolutePath dir))
+                               (catch Exception _ nil))))
+
+             env-vars (cond-> {"TF_CPP_MIN_LOG_LEVEL" "3"
+                               "GLOG_minloglevel" "3"}
+                        (= target-kw :rocm)
+                        (assoc "HSA_OVERRIDE_GFX_VERSION" (or (System/getenv "HSA_OVERRIDE_GFX_VERSION") "11.0.0")
+                               "ROCR_VISIBLE_DEVICES" (or (System/getenv "ROCR_VISIBLE_DEVICES") "0")
+                               "HIP_VISIBLE_DEVICES" (or (System/getenv "HIP_VISIBLE_DEVICES") "0"))
+                        (some? cache-dir)
+                        (assoc "TF_XLA_HSACO_CACHE_DIR" cache-dir))]
+         {:xla-flags all-flags-str
+          :env-vars env-vars
+          :autotune-level autotune-level
+          :cache-dir cache-dir})))))
+
 (defn init-backend!
   "Initializes PJRT C API client runtime for specified target (:cpu, :sycl, :rocm, :cuda12, or a custom string path).
    Accepts optional `client-opts` map (defaults to `{:allocator \"platform\"}`).
@@ -46,35 +130,40 @@
          (doseq [p paths]
            (when (.exists (java.io.File. ^String p))
              (try (System/load p) (catch Throwable _ nil)))))
-       (catch Throwable _ nil))
-     (when-not (System/getenv "HSA_OVERRIDE_GFX_VERSION")
-       (System/setProperty "HSA_OVERRIDE_GFX_VERSION" "11.0.0")
-       (setenv-native "HSA_OVERRIDE_GFX_VERSION" "11.0.0"))
-     (when-not (System/getenv "ROCR_VISIBLE_DEVICES")
-       (System/setProperty "ROCR_VISIBLE_DEVICES" "0")
-       (setenv-native "ROCR_VISIBLE_DEVICES" "0"))
-     (when-not (System/getenv "HIP_VISIBLE_DEVICES")
-       (System/setProperty "HIP_VISIBLE_DEVICES" "0")
-       (setenv-native "HIP_VISIBLE_DEVICES" "0"))
-     (when-not (System/getenv "TF_CPP_MIN_LOG_LEVEL")
-       (setenv-native "TF_CPP_MIN_LOG_LEVEL" "3"))
-     (when-not (System/getenv "GLOG_minloglevel")
-       (setenv-native "GLOG_minloglevel" "3")))
-   (let [lib-path (cond
-                    (string? target) target
-                    (keyword? target) (let [{:keys [default env]} (get BACKEND-LIBRARY-MAP target)]
-                                        (or (when env (System/getenv env))
-                                            default
-                                            (throw (ex-info "Unknown backend target" {:target target}))))
-                    :else (throw (ex-info "Invalid backend target specifier" {:target target})))
-         api-ctx (pjrt/load-plugin! lib-path)
-         client (pjrt/create-client api-ctx (or client-opts {}))
-         pname (pjrt/platform-name api-ctx client)
-         ctx (assoc api-ctx :client client :platform pname :target target)]
-     (alter-var-root #'*default-context* (constantly ctx))
-     (when-not (Boolean/getBoolean "clj-xla.quiet")
-       (println (format "clj-xla initialized PJRT Backend: [%s] via plugin [%s]" pname lib-path)))
-     ctx)))
+       (catch Throwable _ nil)))
+
+   (let [probe-info (try (v/probe-system-driver) (catch Exception _ {}))
+         flag-config (determine-optimal-xla-flags target probe-info client-opts)
+         {:keys [xla-flags env-vars]} flag-config]
+     (doseq [[k v] env-vars]
+       (System/setProperty k v)
+       (setenv-native k v))
+     (when-not (str/blank? xla-flags)
+       (System/setProperty "XLA_FLAGS" xla-flags)
+       (setenv-native "XLA_FLAGS" xla-flags))
+
+     (let [lib-path (cond
+                      (string? target) target
+                      (keyword? target) (let [{:keys [default env]} (get BACKEND-LIBRARY-MAP target)]
+                                          (or (when env (System/getenv env))
+                                              default
+                                              (throw (ex-info "Unknown backend target" {:target target}))))
+                      :else (throw (ex-info "Invalid backend target specifier" {:target target})))
+           api-ctx (pjrt/load-plugin! lib-path)
+           client (pjrt/create-client api-ctx (or client-opts {}))
+           pname (pjrt/platform-name api-ctx client)
+           ctx (assoc api-ctx
+                      :client client
+                      :platform pname
+                      :target target
+                      :probe probe-info
+                      :xla-flags flag-config)]
+       (alter-var-root #'*default-context* (constantly ctx))
+       (when-not (or (Boolean/getBoolean "clj-xla.quiet") (:quiet? client-opts))
+         (println (format "clj-xla initialized PJRT Backend: [%s] via plugin [%s]" pname lib-path))
+         (when-not (str/blank? xla-flags)
+           (println (format "  ↳ Autotuned XLA_FLAGS: %s" xla-flags))))
+       ctx))))
 
 (defn init-cpu! [] (init-backend! :cpu))
 (defn init-sycl! [] (init-backend! :sycl))

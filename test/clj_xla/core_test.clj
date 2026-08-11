@@ -1,6 +1,7 @@
 (ns clj-xla.core-test
   "Unit and generative property tests for dynamic multi-backend PJRT plugin initialization in clj-xla.core."
   (:require [clj-xla.core :as xla]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
@@ -28,3 +29,33 @@
                   (and (some? config)
                        (string? (:default config))
                        (string? (:env config))))))
+
+(defspec prop-flag-generation-invariants
+  50
+  (prop/for-all [target gen-target-keyword
+                 autotune-level (gen/choose 1 4)]
+                (let [res (xla/determine-optimal-xla-flags target {} {:autotune-level autotune-level})
+                      {:keys [xla-flags env-vars cache-dir]} res]
+                  (and (map? res)
+                       (string? xla-flags)
+                       (map? env-vars)
+                       (or (nil? cache-dir) (string? cache-dir))
+                       (case target
+                         :rocm (re-find #"xla_gpu_enable_hipblaslt=true" xla-flags)
+                         :cuda12 (re-find #"xla_gpu_enable_cublaslt=true" xla-flags)
+                         :sycl (re-find #"xla_gpu_enable_highest_priority_async_stream=true" xla-flags)
+                         :cpu (re-find #"xla_cpu_multi_thread_eigen=true" xla-flags))))))
+
+(deftest test-determine-optimal-xla-flags-overrides
+  (testing "User explicit options override auto-detected XLA flags"
+    (let [res (xla/determine-optimal-xla-flags :rocm {} {:xla-flags "--custom_flag=1" :autotune-level 2})
+          {:keys [xla-flags autotune-level]} res]
+      (is (= 2 autotune-level))
+      (is (str/includes? xla-flags "--custom_flag=1"))
+      (is (str/includes? xla-flags "--xla_gpu_autotune_level=2"))))
+
+  (testing "Disabling auto defaults preserves user flags only"
+    (let [res (xla/determine-optimal-xla-flags :rocm {} {:disable-defaults? true :xla-flags "--custom_only"})
+          {:keys [xla-flags]} res]
+      (is (= "--custom_only" xla-flags)))))
+
