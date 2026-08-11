@@ -203,8 +203,12 @@ def main():
         results[name] = stats
         print(f"{name:<18} | {stats['mean_ms']:<10.3f} | {stats['p99_ms']:<10.3f} | {stats['tflops']:<8.3f} | {stats['cold_jit_ms']:<12.3f}")
 
-    with open("verification/jax_benchmark_results.json", "w") as f:
+    import os
+    os.makedirs("target/benchmark-reports", exist_ok=True)
+    report_path = "target/benchmark-reports/jax_benchmark_results.json"
+    with open(report_path, "w") as f:
         json.dump(results, f, indent=2)
+    print(f"\nJAX benchmark report saved to: {report_path}")
 
 if __name__ == "__main__":
     main()
