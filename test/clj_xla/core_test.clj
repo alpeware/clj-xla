@@ -41,7 +41,7 @@
                        (map? env-vars)
                        (or (nil? cache-dir) (string? cache-dir))
                        (case target
-                         :rocm (re-find #"xla_gpu_enable_hipblaslt=true" xla-flags)
+                         :rocm (re-find #"xla_gpu_autotune_level=" xla-flags)
                          :cuda12 (re-find #"xla_gpu_enable_cublaslt=true" xla-flags)
                          :sycl (re-find #"xla_gpu_enable_highest_priority_async_stream=true" xla-flags)
                          :cpu (re-find #"xla_cpu_multi_thread_eigen=true" xla-flags))))))

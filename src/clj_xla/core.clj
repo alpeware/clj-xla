@@ -62,9 +62,6 @@
         :cache-dir (:cache-dir opts)}
        (let [existing-xla-flags (or (System/getenv "XLA_FLAGS") "")
              base-flags (cond-> []
-                          (= target-kw :rocm)
-                          (conj "--xla_gpu_enable_hipblaslt=true")
-
                           (= target-kw :cuda12)
                           (conj "--xla_gpu_enable_cublaslt=true")
 
