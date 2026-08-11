@@ -91,7 +91,10 @@
   ([graph]
    (compile-graph (get-context) graph))
   ([ctx graph]
-   (compile/compile-graph ctx (:client ctx) graph)))
+   (let [exec (compile/compile-graph ctx (:client ctx) graph)]
+     (if (map? exec)
+       (assoc exec :ctx ctx)
+       exec))))
 
 (defn buffer-from-host-buffer
   "Transfers host primitive array/buffer into native PJRT device memory buffer."
@@ -107,7 +110,7 @@
   (let [flat-inputs (if (and (= 1 (count inputs)) (vector? (first inputs)))
                       (first inputs)
                       inputs)
-        ctx (get-context)
+        ctx (or (when (map? exec) (:ctx exec)) (get-context))
         exec-handle (cond
                       (map? exec) (or (:handle exec) exec)
                       :else exec)

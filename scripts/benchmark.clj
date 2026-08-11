@@ -1,47 +1,90 @@
 (ns scripts.benchmark
-  "Latency and compilation throughput benchmarks."
-  (:require [clj-xla.core :as xla]
-            [clj-xla.models.gpt2 :as gpt2]
-            [clj-xla.trace :refer [trace-graph]]))
+  "State-of-the-Art (SOTA) Multi-Backend Kernel & Transformer Block Benchmark Suite."
+  (:require [clj-xla.benchmark.core :as bcore]
+            [clj-xla.benchmark.runner :as runner]
+            [clj-xla.pjrt.version :as v]
+            [clojure.java.io :as io]
+            [clojure.string :as str]))
+
+(defn parse-cli-opts
+  "Parses command line arguments into benchmark configuration map."
+  [args]
+  (loop [remaining args
+         opts {:backend :auto
+               :warmup-iters 5
+               :measure-iters 25}]
+    (if (empty? remaining)
+      opts
+      (let [arg (first remaining)]
+        (cond
+          (or (= arg "--backend") (= arg "-b"))
+          (recur (drop 2 remaining) (assoc opts :backend (keyword (second remaining))))
+
+          (str/starts-with? arg "--backend=")
+          (recur (rest remaining) (assoc opts :backend (keyword (subs arg (count "--backend=")))))
+
+          (or (= arg "--warmup") (= arg "-w"))
+          (recur (drop 2 remaining) (assoc opts :warmup-iters (Long/parseLong (second remaining))))
+
+          (or (= arg "--iters") (= arg "-i") (= arg "--measure"))
+          (recur (drop 2 remaining) (assoc opts :measure-iters (Long/parseLong (second remaining))))
+
+          :else
+          (recur (rest remaining) opts))))))
+
+(defn save-benchmark-report!
+  "Writes structured EDN report to target/benchmark-reports/benchmark_matrix.edn."
+  [report-data]
+  (let [dir (io/file "target/benchmark-reports")
+        file (io/file dir "benchmark_matrix.edn")]
+    (.mkdirs dir)
+    (spit file (pr-str report-data))
+    (println (format "\nBenchmark matrix EDN report saved to: %s" (.getAbsolutePath file)))))
 
 (defn -main
-  "Runs compilation benchmark."
-  [& _args]
-  (println "=== clj-xla Benchmark Suite ===")
-  (let [ctx (xla/init-cpu!)
-        graph (trace-graph "benchmark_block"
-                           [[:x [:tensor [1 128 768] :f32]]
-                            [:ln1_g [:tensor [768] :f32]]
-                            [:ln1_b [:tensor [768] :f32]]
-                            [:c_attn_w [:tensor [768 2304] :f32]]
-                            [:c_attn_b [:tensor [2304] :f32]]
-                            [:c_proj_w [:tensor [768 768] :f32]]
-                            [:c_proj_b [:tensor [768] :f32]]
-                            [:ln2_g [:tensor [768] :f32]]
-                            [:ln2_b [:tensor [768] :f32]]
-                            [:mlp_fc_w [:tensor [768 3072] :f32]]
-                            [:mlp_fc_b [:tensor [3072] :f32]]
-                            [:mlp_proj_w [:tensor [3072 768] :f32]]
-                            [:mlp_proj_b [:tensor [768] :f32]]]
-                           (fn [x ln1g ln1b cw cb pw pb ln2g ln2b fcw fcb pw2 pb2]
-                             (gpt2/gpt2-block x {:ln1-g ln1g :ln1-b ln1b
-                                                 :c-attn-w cw :c-attn-b cb
-                                                 :c-proj-w pw :c-proj-b pb
-                                                 :ln2-g ln2g :ln2-b ln2b
-                                                 :mlp-fc-w fcw :mlp-fc-b fcb
-                                                 :mlp-proj-w pw2 :mlp-proj-b pb2} 12)))
-        t0 (System/nanoTime)
-        exec1 (xla/compile-graph ctx graph)
-        t1 (System/nanoTime)
-        cold-ms (/ (- t1 t0) 1000000.0)
-        t2 (System/nanoTime)
-        exec2 (xla/compile-graph ctx graph)
-        t3 (System/nanoTime)
-        warm-us (/ (- t3 t2) 1000.0)]
-    (println (format "Cold JIT Compilation: %.2f ms" cold-ms))
-    (println (format "Warm Cached JIT Compilation: %.3f us" warm-us))
-    (assert (= exec1 exec2) "Cached handle match"))
-  (println "=== Benchmark Complete ==="))
+  "Main benchmark suite entry point."
+  [& args]
+  (let [opts (parse-cli-opts args)
+        probe (v/probe-system-driver)
+        detected (:detected-backends probe)
+        target-backend (:backend opts)
+        backends-to-run (cond
+                          (= target-backend :auto) detected
+                          (contains? detected target-backend) #{target-backend}
+                          :else (do
+                                  (println (format "Warning: Target backend %s not detected on host. Falling back to CPU." target-backend))
+                                  #{:cpu}))]
+    (println "==========================================================================")
+    (println "                clj-xla SOTA Kernel Benchmark Suite                       ")
+    (println "==========================================================================")
+    (println (format "Host System: %s (%s, %s)"
+                     (get-in probe [:details :cpu :java-version] "JVM")
+                     (System/getProperty "os.name")
+                     (System/getProperty "os.arch")))
+    (println (format "Detected Backends: %s" (str/join ", " (map name detected))))
+    (println (format "Benchmarking Backends: %s" (str/join ", " (map name backends-to-run))))
+    (println "--------------------------------------------------------------------------\n")
+
+    (let [all-results (atom [])]
+      (doseq [b (sort (vec backends-to-run))]
+        (println (format ">>> Running benchmarks for backend: [%s]..." (name b)))
+        (try
+          (let [b-results (runner/run-backend-benchmarks b opts)]
+            (swap! all-results concat b-results))
+          (catch Exception e
+            (println (format "Error running benchmark for [%s]: %s" (name b) (.getMessage e))))))
+
+      (let [final-results @all-results
+            report-map {:telemetry probe
+                        :opts opts
+                        :timestamp (str (java.time.Instant/now))
+                        :results final-results}]
+        (save-benchmark-report! report-map)
+        (println "\n==========================================================================")
+        (println "                    Benchmark Comparative Results Matrix                    ")
+        (println "==========================================================================")
+        (println (bcore/render-markdown-table final-results))
+        (println "==========================================================================\n")))))
 
 (when (= *file* (System/getProperty "clojure.script.filename"))
   (apply -main *command-line-args*))

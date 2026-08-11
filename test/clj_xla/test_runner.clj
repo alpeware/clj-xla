@@ -1,6 +1,9 @@
 (ns clj-xla.test-runner
   "Main CLI entrypoint for running the complete test suite."
   (:require [clj-xla.autodiff-test]
+            [clj-xla.benchmark.core-test]
+            [clj-xla.benchmark.runner-test]
+            [clj-xla.benchmark.workloads-test]
             [clj-xla.compile-test]
             [clj-xla.core-test]
             [clj-xla.download-hf-test]
@@ -42,6 +45,9 @@
                            'clj-xla.test.isolated-runner-test
                            'clj-xla.test.parity-test
                            'clj-xla.test.telemetry-test
+                           'clj-xla.benchmark.core-test
+                           'clj-xla.benchmark.workloads-test
+                           'clj-xla.benchmark.runner-test
                            'clj-xla.compile-test
                            'clj-xla.tensor-test
                            'clj-xla.trace-test

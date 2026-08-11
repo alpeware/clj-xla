@@ -15,7 +15,7 @@
    and returns the compiled PjRtLoadedExecutable handle map."
   [api-ctx client graph]
   (let [mlir-text (shlo/graph->mlir-text graph)
-        hash-key (sha256-hash mlir-text)]
+        hash-key [(or client (:client api-ctx)) (sha256-hash mlir-text)]]
     (if-let [cached-exec (get @exec-cache hash-key)]
       (assoc cached-exec :f (:f graph) :graph graph)
       (let [exec (pjrt/compile-mlir api-ctx client mlir-text)
