@@ -42,21 +42,19 @@
   (let [inter (* 4 dim)]
     (trace-graph (str "swiglu_" batch "_" seq-len "_" dim)
                  [[:x [:tensor [batch seq-len dim] dtype]]
-                  [:gate_w [:tensor [inter dim] dtype]]
-                  [:up_w [:tensor [inter dim] dtype]]]
+                  [:gate_w [:tensor [dim inter] dtype]]
+                  [:up_w [:tensor [dim inter] dtype]]]
                  (fn [x gw uw]
-                   (let [gt (t/transpose gw [1 0])
-                         ut (t/transpose uw [1 0])
-                         gate (gemma/linear x gt nil)
-                         up (gemma/linear x ut nil)]
+                   (let [gate (gemma/linear x gw nil)
+                         up (gemma/linear x uw nil)]
                      (swiglu gate up))))))
 
 (defn make-swiglu-inputs
   [batch seq-len dim _dtype]
   (let [inter (* 4 dim)]
     {:x (float-array (repeat (* batch seq-len dim) 1.0))
-     :gate_w (float-array (repeat (* inter dim) 0.01))
-     :up_w (float-array (repeat (* inter dim) 0.01))}))
+     :gate_w (float-array (repeat (* dim inter) 0.01))
+     :up_w (float-array (repeat (* dim inter) 0.01))}))
 
 (defn build-gqa-attn-graph
   [batch seq-len num-heads num-kv-heads head-dim dtype]

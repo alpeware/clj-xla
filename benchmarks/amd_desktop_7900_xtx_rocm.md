@@ -17,13 +17,13 @@
 
 | Workload Kernel | `clj-xla` CPU Mean (ms) | `clj-xla` ROCm GPU Mean (ms) | ROCm GPU P99 (ms) | ROCm GPU TFLOPS / Bandwidth | GPU Speedup Factor |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **GEMM FP32 ($1024^3$)** | 1.30 ms | **0.46 ms** | 0.60 ms | 4.63 TFLOPS | **2.80x** |
-| **GEMM BF16 ($1024^3$)** | 1.74 ms | **0.12 ms** | 0.15 ms | 17.47 TFLOPS | **14.15x** |
-| **RMSNorm ($1 \times 2048 \times 4096$)** | 7.50 ms | **0.18 ms** | 0.27 ms | 365.88 GB/s | **40.99x** |
-| **SwiGLU Activation ($1 \times 2048 \times 4096$)** | 262.47 ms | **97.67 ms** | 101.51 ms | 2.81 TFLOPS | **2.69x** |
-| **GQA Causal Attention ($1 \times 128 \times 8 \times 256$)** | 8.53 ms | **0.72 ms** | 0.88 ms | 1.48 TFLOPS | **11.78x** |
-| **GPT-2 Layer Block ($1 \times 128 \times 768$)** | 5.61 ms | **0.49 ms** | 0.54 ms | 3.71 TFLOPS | **11.50x** |
-| **Gemma 4 Layer Block ($1 \times 128 \times 1536$)** | 16.20 ms | **2.99 ms** | 3.82 ms | 3.23 TFLOPS | **5.42x** |
+| **GEMM FP32 ($1024^3$)** | 1.19 ms | **0.45 ms** | 0.67 ms | 4.80 TFLOPS | **2.64x** |
+| **GEMM BF16 ($1024^3$)** | 1.58 ms | **0.15 ms** | 0.18 ms | 14.47 TFLOPS | **10.53x** |
+| **RMSNorm ($1 \times 2048 \times 4096$)** | 4.04 ms | **0.21 ms** | 0.47 ms | 323.22 GB/s | **19.24x** |
+| **SwiGLU Activation ($1 \times 2048 \times 4096$)** | 240.49 ms | **103.34 ms** | 105.44 ms | 2.66 TFLOPS | **2.33x** |
+| **GQA Causal Attention ($1 \times 128 \times 8 \times 256$)** | 4.56 ms | **0.77 ms** | 2.95 ms | 1.39 TFLOPS | **5.92x** |
+| **GPT-2 Layer Block ($1 \times 128 \times 768$)** | 3.61 ms | **0.51 ms** | 0.59 ms | 3.58 TFLOPS | **7.08x** |
+| **Gemma 4 Layer Block ($1 \times 128 \times 1536$)** | 15.49 ms | **2.66 ms** | 2.73 ms | 3.63 TFLOPS | **5.82x** |
 
 ---
 
@@ -33,13 +33,13 @@
 
 | Workload Kernel | Official AMD JAX `rocm/jax` Mean | `clj-xla` ROCm GPU Mean | `clj-xla` ROCm GPU P50 | Official JAX TFLOPS | `clj-xla` ROCm TFLOPS |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **GEMM FP32 ($1024^3$)** | **0.146 ms** | 0.464 ms | 0.468 ms | **14.71 TFLOPS** | 4.63 TFLOPS |
-| **GEMM BF16 ($1024^3$)** | **0.078 ms** | 0.123 ms | 0.122 ms | **27.53 TFLOPS** | 17.47 TFLOPS |
-| **RMSNorm ($1 \times 2048 \times 4096$)** | **0.092 ms** | 0.183 ms | 0.191 ms | **$727.8\text{ GB/s}$** | $365.88\text{ GB/s}$ |
-| **SwiGLU Activation ($1 \times 2048 \times 4096$)** | **19.138 ms** | 97.669 ms | 97.396 ms | **28.73 TFLOPS** | 2.81 TFLOPS |
-| **GQA Causal Attention ($1 \times 128 \times 8 \times 256$)** | **0.332 ms** | 0.724 ms | 0.704 ms | **7.28 TFLOPS** | 1.48 TFLOPS |
-| **GPT-2 Layer Block ($1 \times 128 \times 768$)** | **0.288 ms** | 0.488 ms | 0.485 ms | **6.29 TFLOPS** | 3.71 TFLOPS |
-| **Gemma 4 Layer Block ($1 \times 128 \times 1536$)** | **0.881 ms** | 2.989 ms | 2.805 ms | **10.28 TFLOPS** | 3.23 TFLOPS |
+| **GEMM FP32 ($1024^3$)** | **0.146 ms** | 0.447 ms | 0.437 ms | **14.71 TFLOPS** | 4.80 TFLOPS |
+| **GEMM BF16 ($1024^3$)** | **0.078 ms** | 0.148 ms | 0.145 ms | **27.53 TFLOPS** | 14.47 TFLOPS |
+| **RMSNorm ($1 \times 2048 \times 4096$)** | **0.092 ms** | 0.208 ms | 0.185 ms | **$727.8\text{ GB/s}$** | $323.22\text{ GB/s}$ |
+| **SwiGLU Activation ($1 \times 2048 \times 4096$)** | **19.138 ms** | 103.342 ms | 103.371 ms | **28.73 TFLOPS** | 2.66 TFLOPS |
+| **GQA Causal Attention ($1 \times 128 \times 8 \times 256$)** | **0.332 ms** | 0.774 ms | 0.725 ms | **7.28 TFLOPS** | 1.39 TFLOPS |
+| **GPT-2 Layer Block ($1 \times 128 \times 768$)** | **0.288 ms** | 0.506 ms | 0.503 ms | **6.29 TFLOPS** | 3.58 TFLOPS |
+| **Gemma 4 Layer Block ($1 \times 128 \times 1536$)** | **0.881 ms** | **2.662 ms** | 2.667 ms | **10.28 TFLOPS** | **3.63 TFLOPS** |
 
 ---
 
