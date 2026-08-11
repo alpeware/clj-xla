@@ -45,14 +45,20 @@
 (defn- extract-client [ctx client]
   (or client (:client ctx)))
 
+(def ^:private downcall-cache (atom {}))
+
 (defn- downcall-ptr
-  "Creates a downcall MethodHandle for function pointer at `offset` inside `api-ptr`."
+  "Creates or retrieves a cached downcall MethodHandle for function pointer at `offset` inside `api-ptr`."
   [^Linker linker ^MemorySegment api-ptr offset return-layout arg-layouts]
-  (let [^MemorySegment fn-ptr (.get ^MemorySegment api-ptr ValueLayout/ADDRESS (long offset))
-        ^FunctionDescriptor fd (if (some? return-layout)
-                                 (FunctionDescriptor/of return-layout (into-array MemoryLayout arg-layouts))
-                                 (FunctionDescriptor/ofVoid (into-array MemoryLayout arg-layouts)))]
-    (.downcallHandle linker fn-ptr fd NO_OPTIONS)))
+  (let [cache-key [api-ptr offset return-layout arg-layouts]]
+    (or (get @downcall-cache cache-key)
+        (let [^MemorySegment fn-ptr (.get ^MemorySegment api-ptr ValueLayout/ADDRESS (long offset))
+              ^FunctionDescriptor fd (if (some? return-layout)
+                                       (FunctionDescriptor/of return-layout (into-array MemoryLayout arg-layouts))
+                                       (FunctionDescriptor/ofVoid (into-array MemoryLayout arg-layouts)))
+              handle (.downcallHandle linker fn-ptr fd NO_OPTIONS)]
+          (swap! downcall-cache assoc cache-key handle)
+          handle))))
 
 (defn check-error!
   "Checks if `err-ptr` is non-null. If so, extracts error message, frees error, and throws Exception."

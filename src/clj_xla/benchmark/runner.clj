@@ -53,11 +53,12 @@
            latencies (mapv (fn [_]
                              (let [start (System/nanoTime)
                                    out (xla/execute exec1 device-args)
-                                   end (System/nanoTime)]
+                                   end (System/nanoTime)
+                                   lat (/ (- end start) 1000000.0)]
                                (if (vector? out)
                                  (doseq [b out] (pjrt/destroy-buffer! ctx b))
                                  (pjrt/destroy-buffer! ctx out))
-                               (/ (- end start) 1000000.0)))
+                               lat))
                            (range measure-iters))
 
            _ (doseq [b device-args] (pjrt/destroy-buffer! ctx b))

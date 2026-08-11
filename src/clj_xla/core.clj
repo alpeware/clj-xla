@@ -204,14 +204,17 @@
     (if-not exec-handle
       (throw (ex-info "Invalid executable handle" {:exec exec}))
       (let [invars (or (get-in exec [:graph :invars]) [])
-            device-buffers (mapv (fn [idx input-data]
-                                   (if (instance? java.lang.foreign.MemorySegment input-data)
-                                     input-data
-                                     (let [[_var-name [_kw shape dtype]] (nth invars idx)
-                                           dtype-enum (case dtype :i8 2 :i32 4 :f32 11 :bf16 13 :f16 10 11)]
-                                       (pjrt/buffer-from-host-buffer ctx (:client ctx) input-data shape dtype-enum))))
-                                 (range (count flat-inputs))
-                                 flat-inputs)
+            all-segs? (every? #(instance? java.lang.foreign.MemorySegment %) flat-inputs)
+            device-buffers (if all-segs?
+                             flat-inputs
+                             (mapv (fn [idx input-data]
+                                     (if (instance? java.lang.foreign.MemorySegment input-data)
+                                       input-data
+                                       (let [[_var-name [_kw shape dtype]] (nth invars idx)
+                                             dtype-enum (case dtype :i8 2 :i32 4 :f32 11 :bf16 13 :f16 10 11)]
+                                         (pjrt/buffer-from-host-buffer ctx (:client ctx) input-data shape dtype-enum))))
+                                   (range (count flat-inputs))
+                                   flat-inputs))
             out-buf (pjrt/execute-executable ctx exec-handle device-buffers num-outputs)]
         out-buf))))
 
