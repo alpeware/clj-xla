@@ -23,6 +23,9 @@
   :gemma4
   {:main-opts ["-m" "scripts.gemma4-inference"]
    :jvm-opts ["--enable-native-access=ALL-UNNAMED" "-Xmx12g"]}
+  :benchmark
+  {:main-opts ["-m" "scripts.benchmark"]
+   :jvm-opts ["--enable-native-access=ALL-UNNAMED" "-Xmx8g"]}
   :download-hf
   {:main-opts ["-m" "scripts.download-hf"]
    :jvm-opts ["--enable-native-access=ALL-UNNAMED" "-Xmx4g"]}
