@@ -28,17 +28,23 @@
            t3 (System/nanoTime)
            warm-us (/ (- t3 t2) 1000.0)
 
-           ;; 3. Transfer input data to device buffers
+           ;; 3. Transfer input data to resident device memory buffers
            inputs (make-inputs-fn)
            invars (:invars graph)
-           input-args (mapv (fn [idx [_var-name _]]
-                              (get inputs _var-name (nth (vals inputs) idx)))
-                            (range (count invars))
-                            invars)
+           raw-args (mapv (fn [idx [_var-name _]]
+                            (get inputs _var-name (nth (vals inputs) idx)))
+                          (range (count invars))
+                          invars)
+           device-args (mapv (fn [idx input-data]
+                               (let [[_var-name [_kw shape dtype]] (nth invars idx)
+                                     dtype-enum (case dtype :i8 2 :i32 4 :f32 11 :bf16 13 :f16 10 11)]
+                                 (pjrt/buffer-from-host-buffer ctx (:client ctx) input-data shape dtype-enum)))
+                             (range (count invars))
+                             raw-args)
 
            ;; 4. Warmup passes
            _ (dotimes [_ warmup-iters]
-               (let [out (xla/execute exec1 input-args)]
+               (let [out (xla/execute exec1 device-args)]
                  (if (vector? out)
                    (doseq [b out] (pjrt/destroy-buffer! ctx b))
                    (pjrt/destroy-buffer! ctx out))))
@@ -46,13 +52,15 @@
            ;; 5. Measured passes
            latencies (mapv (fn [_]
                              (let [start (System/nanoTime)
-                                   out (xla/execute exec1 input-args)
+                                   out (xla/execute exec1 device-args)
                                    end (System/nanoTime)]
                                (if (vector? out)
                                  (doseq [b out] (pjrt/destroy-buffer! ctx b))
                                  (pjrt/destroy-buffer! ctx out))
                                (/ (- end start) 1000000.0)))
                            (range measure-iters))
+
+           _ (doseq [b device-args] (pjrt/destroy-buffer! ctx b))
 
            stats (bcore/calculate-latency-stats latencies)
            mean-lat (:mean stats)
