@@ -25,7 +25,7 @@ GQA (8:1 Query-to-KV ratio):
   └──┴──┴──┼──┴──┴──┴──┘
            K0 (Shared Key/Value Head)
 ```
-* **Clojure Reference**: [`gqa-causal-attention`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/nn/attention.clj#L45) in `clj-xla.nn.attention`.
+* **Clojure Reference**: [`gqa-causal-attention`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/nn/attention.clj#L45) in [`clj-xla.nn.attention`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/nn/attention.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/nn/attention.clj#L45)).
 
 ---
 
@@ -36,7 +36,7 @@ Gemma 4 combines local sliding-window attention with global full-attention layer
 2. **Global Layers**: Every $N$-th layer maintains full context attention across all tokens.
 3. **Per-Layer Shared KV Cache**: Adjacent layers share Key and Value projections, reducing KV cache bytes by $2\times$.
 
-* **Clojure Reference**: [`gemma-attention`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/models/gemma.clj#L120) in `clj-xla.models.gemma`.
+* **Clojure Reference**: [`gemma-attention`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/models/gemma.clj#L120) in [`clj-xla.models.gemma`](file:///home/simonpure/src/alpeware/clj-xla/src/clj_xla/models/gemma.clj) ([GitHub](https://github.com/alpeware/clj-xla/blob/main/src/clj_xla/models/gemma.clj#L120)).
 
 ---
 
