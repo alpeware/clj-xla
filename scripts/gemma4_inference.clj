@@ -3,6 +3,7 @@
   (:require [clj-xla.core :as xla]
             [clj-xla.models.gemma :as gemma]
             [clj-xla.nn.norm :as norm]
+            [clj-xla.pjrt :as pjrt]
             [clj-xla.safetensors :as st]
             [clj-xla.sampling :as sampling]
             [clj-xla.tensor :as t]
@@ -11,7 +12,6 @@
             [clj-xla.trace :refer [trace-graph]]
             [clojure.data.json :as json]
             [clojure.java.io :as io]
-            [clojure.pprint :as pprint]
             [clojure.string :as str])
   (:import [java.lang.foreign Arena]))
 
@@ -340,70 +340,50 @@
                                      (let [bf-bits (short (bit-shift-right (Float/floatToRawIntBits default-f) 16))]
                                        (java.util.Arrays/fill ^shorts arr offset (+ offset num-el) bf-bits))
                                      (java.util.Arrays/fill ^floats arr offset (+ offset num-el) default-f))))))
-        layer-bufs (mapcat (fn [{:keys [q-dim kv-dim head-dim mlp-dim qkv-rows gate-up-rows norms-base-el norms-total-el pl-total-el keys]}]
-                             (let [qkv-el (* qkv-rows hidden-dim)
-                                   qkv-arr (if is-bf16-format (short-array qkv-el) (float-array qkv-el))
-                                   _ (copy-tensor-to-arr qkv-arr (:q-w keys) [q-dim hidden-dim] 0 0.0)
-                                   _ (copy-tensor-to-arr qkv-arr (:k-w keys) [kv-dim hidden-dim] (* q-dim hidden-dim) 0.0)
-                                   _ (copy-tensor-to-arr qkv-arr (:v-w keys) [kv-dim hidden-dim] (* (+ q-dim kv-dim) hidden-dim) 0.0)
-                                   [qkv-buf qkv-scale] (if is-int8
-                                                         (let [q (quantize-bf16-to-int8 qkv-arr)]
-                                                           [(xla/buffer-from-host-buffer ctx client (:data q) [qkv-rows hidden-dim] weight-enum)
-                                                            (xla/buffer-from-host-buffer ctx client (float-array [(:scale q)]) [1] 11)])
-                                                         [(xla/buffer-from-host-buffer ctx client qkv-arr [qkv-rows hidden-dim] weight-enum) nil])
+        layer-bufs (mapv (fn [{:keys [q-dim kv-dim head-dim mlp-dim qkv-rows gate-up-rows norms-base-el norms-total-el pl-total-el keys]}]
+                           (let [qkv-el (* qkv-rows hidden-dim)
+                                 o-el (* hidden-dim q-dim)
+                                 gate-up-el (* gate-up-rows hidden-dim)
+                                 down-el (* hidden-dim mlp-dim)
+                                 layer-total-el (+ qkv-el o-el gate-up-el down-el norms-total-el)
+                                 layer-arr (if is-bf16-format (short-array layer-total-el) (float-array layer-total-el))
 
-                                   o-el (* hidden-dim q-dim)
-                                   o-arr (if is-bf16-format (short-array o-el) (float-array o-el))
-                                   _ (copy-tensor-to-arr o-arr (:o-w keys) [hidden-dim q-dim] 0 0.0)
-                                   [o-buf o-scale] (if is-int8
-                                                     (let [q (quantize-bf16-to-int8 o-arr)]
-                                                       [(xla/buffer-from-host-buffer ctx client (:data q) [hidden-dim q-dim] weight-enum)
-                                                        (xla/buffer-from-host-buffer ctx client (float-array [(:scale q)]) [1] 11)])
-                                                     [(xla/buffer-from-host-buffer ctx client o-arr [hidden-dim q-dim] weight-enum) nil])
+                                 _ (copy-tensor-to-arr layer-arr (:q-w keys) [q-dim hidden-dim] 0 0.0)
+                                 _ (copy-tensor-to-arr layer-arr (:k-w keys) [kv-dim hidden-dim] (* q-dim hidden-dim) 0.0)
+                                 _ (copy-tensor-to-arr layer-arr (:v-w keys) [kv-dim hidden-dim] (* (+ q-dim kv-dim) hidden-dim) 0.0)
 
-                                   gate-up-el (* gate-up-rows hidden-dim)
-                                   gate-up-arr (if is-bf16-format (short-array gate-up-el) (float-array gate-up-el))
-                                   _ (copy-tensor-to-arr gate-up-arr (:gate-w keys) [mlp-dim hidden-dim] 0 0.0)
-                                   _ (copy-tensor-to-arr gate-up-arr (:up-w keys) [mlp-dim hidden-dim] (* mlp-dim hidden-dim) 0.0)
-                                   [gate-up-buf gate-up-scale] (if is-int8
-                                                                 (let [q (quantize-bf16-to-int8 gate-up-arr)]
-                                                                   [(xla/buffer-from-host-buffer ctx client (:data q) [gate-up-rows hidden-dim] weight-enum)
-                                                                    (xla/buffer-from-host-buffer ctx client (float-array [(:scale q)]) [1] 11)])
-                                                                 [(xla/buffer-from-host-buffer ctx client gate-up-arr [gate-up-rows hidden-dim] weight-enum) nil])
+                                 o-off qkv-el
+                                 _ (copy-tensor-to-arr layer-arr (:o-w keys) [hidden-dim q-dim] o-off 0.0)
 
-                                   down-el (* hidden-dim mlp-dim)
-                                   down-arr (if is-bf16-format (short-array down-el) (float-array down-el))
-                                   _ (copy-tensor-to-arr down-arr (:down-w keys) [hidden-dim mlp-dim] 0 0.0)
-                                   [down-buf down-scale] (if is-int8
-                                                           (let [q (quantize-bf16-to-int8 down-arr)]
-                                                             [(xla/buffer-from-host-buffer ctx client (:data q) [hidden-dim mlp-dim] weight-enum)
-                                                              (xla/buffer-from-host-buffer ctx client (float-array [(:scale q)]) [1] 11)])
-                                                           [(xla/buffer-from-host-buffer ctx client down-arr [hidden-dim mlp-dim] weight-enum) nil])
+                                 gu-off (+ o-off o-el)
+                                 _ (copy-tensor-to-arr layer-arr (:gate-w keys) [mlp-dim hidden-dim] gu-off 0.0)
+                                 _ (copy-tensor-to-arr layer-arr (:up-w keys) [mlp-dim hidden-dim] (+ gu-off (* mlp-dim hidden-dim)) 0.0)
 
-                                   norms-arr (if is-bf16-format (short-array norms-total-el) (float-array norms-total-el))
-                                   _ (copy-tensor-to-arr norms-arr (:input-ln-w keys) [hidden-dim] 0 0.0)
-                                   _ (copy-tensor-to-arr norms-arr (:layer-scalar-w keys) [1] hidden-dim 1.0)
-                                   _ (copy-tensor-to-arr norms-arr (:q-norm-w keys) [head-dim] (+ hidden-dim 1) 0.0)
-                                   _ (copy-tensor-to-arr norms-arr (:k-norm-w keys) [head-dim] (+ hidden-dim 1 head-dim) 0.0)
-                                   _ (copy-tensor-to-arr norms-arr (:post-attn-ln-w keys) [hidden-dim] (+ hidden-dim 1 head-dim head-dim) 0.0)
-                                   _ (copy-tensor-to-arr norms-arr (:pre-mlp-ln-w keys) [hidden-dim] (+ (* 2 hidden-dim) 1 head-dim head-dim) 0.0)
-                                   _ (copy-tensor-to-arr norms-arr (:post-mlp-ln-w keys) [hidden-dim] (+ (* 3 hidden-dim) 1 head-dim head-dim) 0.0)
-                                   _ (when (pos? pl-total-el)
-                                       (copy-tensor-to-arr norms-arr (:per-layer-gate-w keys) [pl-dim hidden-dim] norms-base-el 0.0)
-                                       (copy-tensor-to-arr norms-arr (:per-layer-proj-w keys) [hidden-dim pl-dim] (+ norms-base-el (* pl-dim hidden-dim)) 0.0)
-                                       (copy-tensor-to-arr norms-arr (:post-per-layer-norm-w keys) [hidden-dim] (+ norms-base-el (* pl-dim hidden-dim) (* hidden-dim pl-dim)) 0.0))
-                                   norms-buf (xla/buffer-from-host-buffer ctx client norms-arr [norms-total-el] norm-enum)]
-                               (if is-int8
-                                 [qkv-buf qkv-scale o-buf o-scale gate-up-buf gate-up-scale down-buf down-scale norms-buf]
-                                 [qkv-buf o-buf gate-up-buf down-buf norms-buf])))
-                           layer-grouped-specs)]
+                                 dw-off (+ gu-off gate-up-el)
+                                 _ (copy-tensor-to-arr layer-arr (:down-w keys) [hidden-dim mlp-dim] dw-off 0.0)
+
+                                 n-off (+ dw-off down-el)
+                                 _ (copy-tensor-to-arr layer-arr (:input-ln-w keys) [hidden-dim] n-off 0.0)
+                                 _ (copy-tensor-to-arr layer-arr (:layer-scalar-w keys) [1] (+ n-off hidden-dim) 1.0)
+                                 _ (copy-tensor-to-arr layer-arr (:q-norm-w keys) [head-dim] (+ n-off hidden-dim 1) 0.0)
+                                 _ (copy-tensor-to-arr layer-arr (:k-norm-w keys) [head-dim] (+ n-off hidden-dim 1 head-dim) 0.0)
+                                 _ (copy-tensor-to-arr layer-arr (:post-attn-ln-w keys) [hidden-dim] (+ n-off hidden-dim 1 head-dim head-dim) 0.0)
+                                 _ (copy-tensor-to-arr layer-arr (:pre-mlp-ln-w keys) [hidden-dim] (+ n-off (* 2 hidden-dim) 1 head-dim head-dim) 0.0)
+                                 _ (copy-tensor-to-arr layer-arr (:post-mlp-ln-w keys) [hidden-dim] (+ n-off (* 3 hidden-dim) 1 head-dim head-dim) 0.0)
+                                 _ (when (pos? pl-total-el)
+                                     (copy-tensor-to-arr layer-arr (:per-layer-gate-w keys) [pl-dim hidden-dim] (+ n-off norms-base-el) 0.0)
+                                     (copy-tensor-to-arr layer-arr (:per-layer-proj-w keys) [hidden-dim pl-dim] (+ n-off norms-base-el (* pl-dim hidden-dim)) 0.0)
+                                     (copy-tensor-to-arr layer-arr (:post-per-layer-norm-w keys) [hidden-dim] (+ n-off norms-base-el (* pl-dim hidden-dim) (* hidden-dim pl-dim)) 0.0))]
+                             (xla/buffer-from-host-buffer ctx client layer-arr [layer-total-el] weight-enum)))
+                         layer-grouped-specs)]
     (vec (concat (into [embed-buf] ple-global-bufs) [final-norm-buf] layer-bufs))))
 
 (defn compile-inference-executables
-  "Traces and JIT-compiles a Single Fused Gemma 4 StableHLO Graph into a native PJRT Executable."
-  [{:keys [ctx config opts]}]
+  "Traces and JIT-compiles Dual-Graph Gemma 4 StableHLO Executables (Prefill Graph & Decode Graph)."
+  [{:keys [ctx config opts]} prompt-len]
   (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim max-seq-len num-layers weight-dtype is-int8 layer-configs num-heads num-kv-heads num-kv-shared-layers layer-grouped-specs]} config
-        {:keys [verbose quiet]} opts
+        {:keys [quiet]} opts
+        prompt-len (long (or prompt-len 16))
         num-unshared (- num-layers num-kv-shared-layers)
         norm-dtype (if is-int8 :bf16 weight-dtype)
         has-ple? (pos? total-pl-dim)
@@ -411,174 +391,210 @@
                             [[:embed_tokens_per_layer [:tensor [vocab-size total-pl-dim] norm-dtype]]
                              [:per_layer_model_projection [:tensor [total-pl-dim hidden-dim] norm-dtype]]
                              [:per_layer_projection_norm [:tensor [pl-dim] norm-dtype]]])
-        layer-invars (mapcat (fn [i]
-                               (let [{:keys [q-dim qkv-rows gate-up-rows mlp-dim norms-total-el]} (nth layer-grouped-specs i)]
-                                 (if is-int8
-                                   [[(keyword (str "l" i "_qkv")) [:tensor [qkv-rows hidden-dim] :i8]]
-                                    [(keyword (str "l" i "_qkv_s")) [:tensor [1] :f32]]
-                                    [(keyword (str "l" i "_o")) [:tensor [hidden-dim q-dim] :i8]]
-                                    [(keyword (str "l" i "_o_s")) [:tensor [1] :f32]]
-                                    [(keyword (str "l" i "_gate_up")) [:tensor [gate-up-rows hidden-dim] :i8]]
-                                    [(keyword (str "l" i "_gate_up_s")) [:tensor [1] :f32]]
-                                    [(keyword (str "l" i "_down")) [:tensor [hidden-dim mlp-dim] :i8]]
-                                    [(keyword (str "l" i "_down_s")) [:tensor [1] :f32]]
-                                    [(keyword (str "l" i "_norms")) [:tensor [norms-total-el] :bf16]]]
-                                   [[(keyword (str "l" i "_qkv")) [:tensor [qkv-rows hidden-dim] weight-dtype]]
-                                    [(keyword (str "l" i "_o")) [:tensor [hidden-dim q-dim] weight-dtype]]
-                                    [(keyword (str "l" i "_gate_up")) [:tensor [gate-up-rows hidden-dim] weight-dtype]]
-                                    [(keyword (str "l" i "_down")) [:tensor [hidden-dim mlp-dim] weight-dtype]]
-                                    [(keyword (str "l" i "_norms")) [:tensor [norms-total-el] weight-dtype]]])))
-                             (range num-layers))
-        invars (vec (concat
-                     [[:x [:tensor [1 max-seq-len] :i32]]
-                      [:pos [:tensor [max-seq-len] :i32]]
-                      [:embed_tokens [:tensor [vocab-size hidden-dim] norm-dtype]]]
-                     ple-global-invars
-                     [[:final_norm_w [:tensor [hidden-dim] norm-dtype]]]
-                     layer-invars))
+        layer-invars (mapv (fn [i]
+                             (let [{:keys [q-dim qkv-rows gate-up-rows mlp-dim norms-total-el]} (nth layer-grouped-specs i)
+                                   qkv-el (* qkv-rows hidden-dim)
+                                   o-el (* hidden-dim q-dim)
+                                   gate-up-el (* gate-up-rows hidden-dim)
+                                   down-el (* hidden-dim mlp-dim)
+                                   layer-total-el (+ qkv-el o-el gate-up-el down-el norms-total-el)]
+                               [(keyword (str "l" i "_weights")) [:tensor [layer-total-el] weight-dtype]]))
+                           (range num-layers))
+        kv-invars (mapcat (fn [i]
+                            (let [cfg (nth layer-configs i)
+                                  l-nkv (:num-kv-heads cfg)
+                                  h-dim (:head-dim cfg)]
+                              [[(keyword (str "kc_" i)) [:tensor [1 l-nkv max-seq-len h-dim] :f32]]
+                               [(keyword (str "vc_" i)) [:tensor [1 l-nkv max-seq-len h-dim] :f32]]]))
+                          (range num-layers))
 
-        trace-fn (if has-ple?
-                   (fn [x pos-tracer emb emb-pl pl-model-proj pl-proj-norm fn-norm & all-layer-tracers]
-                     (let [group-size (if is-int8 9 5)
-                           tr-partitioned (mapv vec (partition group-size all-layer-tracers))
-                           deq (fn [w s] (t/* (t/convert w :bf16) (t/convert s :bf16)))
-                           lw-seq (mapv (fn [i trs]
-                                          (let [[qkv-tr qkv-s-tr o-tr o-s-tr gate-up-tr gate-up-s-tr down-tr down-s-tr norms-tr]
-                                                (if is-int8 trs [(nth trs 0) nil (nth trs 1) nil (nth trs 2) nil (nth trs 3) nil (nth trs 4)])
-                                                qkv-tr (if is-int8 (deq qkv-tr qkv-s-tr) qkv-tr)
-                                                o-tr (if is-int8 (deq o-tr o-s-tr) o-tr)
-                                                gate-up-tr (if is-int8 (deq gate-up-tr gate-up-s-tr) gate-up-tr)
-                                                down-tr (if is-int8 (deq down-tr down-s-tr) down-tr)
-                                                {:keys [q-dim kv-dim head-dim mlp-dim norms-base-el]} (nth layer-grouped-specs i)
-                                                cfg (nth layer-configs i)
-                                                qw (t/slice qkv-tr [0 0] [q-dim hidden-dim] [1 1])
-                                                kw (t/slice qkv-tr [q-dim 0] [(+ q-dim kv-dim) hidden-dim] [1 1])
-                                                vw (t/slice qkv-tr [(+ q-dim kv-dim) 0] [(+ q-dim kv-dim kv-dim) hidden-dim] [1 1])
-                                                gw (t/slice gate-up-tr [0 0] [mlp-dim hidden-dim] [1 1])
-                                                uw (t/slice gate-up-tr [mlp-dim 0] [(* 2 mlp-dim) hidden-dim] [1 1])
-                                                in-ln (t/slice norms-tr [0] [hidden-dim] [1])
-                                                ls (t/slice norms-tr [hidden-dim] [(+ hidden-dim 1)] [1])
-                                                qn (t/slice norms-tr [(+ hidden-dim 1)] [(+ hidden-dim 1 head-dim)] [1])
-                                                kn (t/slice norms-tr [(+ hidden-dim 1 head-dim)] [(+ hidden-dim 1 head-dim head-dim)] [1])
-                                                post-attn-ln (t/slice norms-tr [(+ hidden-dim 1 head-dim head-dim)] [(+ (* 2 hidden-dim) 1 head-dim head-dim)] [1])
-                                                pre-mlp-ln (t/slice norms-tr [(+ (* 2 hidden-dim) 1 head-dim head-dim)] [(+ (* 3 hidden-dim) 1 head-dim head-dim)] [1])
-                                                post-mlp-ln (t/slice norms-tr [(+ (* 3 hidden-dim) 1 head-dim head-dim)] [(+ (* 4 hidden-dim) 1 head-dim head-dim)] [1])
-                                                plg-1d (t/slice norms-tr [norms-base-el] [(+ norms-base-el (* pl-dim hidden-dim))] [1])
-                                                plg (t/reshape plg-1d [pl-dim hidden-dim])
-                                                plp-1d (t/slice norms-tr [(+ norms-base-el (* pl-dim hidden-dim))] [(+ norms-base-el (* pl-dim hidden-dim) (* hidden-dim pl-dim))] [1])
-                                                plp (t/reshape plp-1d [hidden-dim pl-dim])
-                                                pln (t/slice norms-tr [(+ norms-base-el (* pl-dim hidden-dim) (* hidden-dim pl-dim))] [(+ norms-base-el (* pl-dim hidden-dim) (* hidden-dim pl-dim) hidden-dim)] [1])]
-                                            {:input-ln-w in-ln :layer-scalar-w ls
-                                             :q-w qw :k-w kw :v-w vw :o-w o-tr
-                                             :q-norm-w qn :k-norm-w kn
-                                             :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
-                                             :gate-w gw :up-w uw :down-w down-tr
-                                             :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
-                                             :num-heads num-heads :num-kv-heads (:num-kv-heads cfg) :head-dim (:head-dim cfg)
-                                             :theta-base (:theta-base cfg)
-                                             :rope-proportion (:rope-proportion cfg)
-                                             :norm-fn norm/rms-norm
-                                             :attn-softcap nil
-                                             :layer-type (:layer-type cfg)
-                                             :is-shared? (>= i num-unshared)}))
-                                        (range num-layers)
-                                        tr-partitioned)
-                           logits (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads nil 0 {:final-logit-softcap 30.0 :num-kv-shared-layers num-kv-shared-layers})]
-                       (t/convert logits :f32)))
-                   (fn [x pos-tracer emb fn-norm & all-layer-tracers]
-                     (let [group-size (if is-int8 9 5)
-                           tr-partitioned (mapv vec (partition group-size all-layer-tracers))
-                           deq (fn [w s] (t/* (t/convert w :bf16) (t/convert s :bf16)))
-                           lw-seq (mapv (fn [i trs]
-                                          (let [[qkv-tr qkv-s-tr o-tr o-s-tr gate-up-tr gate-up-s-tr down-tr down-s-tr norms-tr]
-                                                (if is-int8 trs [(nth trs 0) nil (nth trs 1) nil (nth trs 2) nil (nth trs 3) nil (nth trs 4)])
-                                                qkv-tr (if is-int8 (deq qkv-tr qkv-s-tr) qkv-tr)
-                                                o-tr (if is-int8 (deq o-tr o-s-tr) o-tr)
-                                                gate-up-tr (if is-int8 (deq gate-up-tr gate-up-s-tr) gate-up-tr)
-                                                down-tr (if is-int8 (deq down-tr down-s-tr) down-tr)
-                                                {:keys [q-dim kv-dim head-dim mlp-dim]} (nth layer-grouped-specs i)
-                                                cfg (nth layer-configs i)
-                                                qw (t/slice qkv-tr [0 0] [q-dim hidden-dim] [1 1])
-                                                kw (t/slice qkv-tr [q-dim 0] [(+ q-dim kv-dim) hidden-dim] [1 1])
-                                                vw (t/slice qkv-tr [(+ q-dim kv-dim) 0] [(+ q-dim kv-dim kv-dim) hidden-dim] [1 1])
-                                                gw (t/slice gate-up-tr [0 0] [mlp-dim hidden-dim] [1 1])
-                                                uw (t/slice gate-up-tr [mlp-dim 0] [(* 2 mlp-dim) hidden-dim] [1 1])
-                                                in-ln (t/slice norms-tr [0] [hidden-dim] [1])
-                                                ls (t/slice norms-tr [hidden-dim] [(+ hidden-dim 1)] [1])
-                                                qn (t/slice norms-tr [(+ hidden-dim 1)] [(+ hidden-dim 1 head-dim)] [1])
-                                                kn (t/slice norms-tr [(+ hidden-dim 1 head-dim)] [(+ hidden-dim 1 head-dim head-dim)] [1])
-                                                post-attn-ln (t/slice norms-tr [(+ hidden-dim 1 head-dim head-dim)] [(+ (* 2 hidden-dim) 1 head-dim head-dim)] [1])
-                                                pre-mlp-ln (t/slice norms-tr [(+ (* 2 hidden-dim) 1 head-dim head-dim)] [(+ (* 3 hidden-dim) 1 head-dim head-dim)] [1])
-                                                post-mlp-ln (t/slice norms-tr [(+ (* 3 hidden-dim) 1 head-dim head-dim)] [(+ (* 4 hidden-dim) 1 head-dim head-dim)] [1])]
-                                            {:input-ln-w in-ln :layer-scalar-w ls
-                                             :q-w qw :k-w kw :v-w vw :o-w o-tr
-                                             :q-norm-w qn :k-norm-w kn
-                                             :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
-                                             :gate-w gw :up-w uw :down-w down-tr
-                                             :num-heads num-heads :num-kv-heads (:num-kv-heads cfg) :head-dim (:head-dim cfg)
-                                             :theta-base (:theta-base cfg)
-                                             :rope-proportion (:rope-proportion cfg)
-                                             :norm-fn norm/rms-norm
-                                             :attn-softcap nil
-                                             :layer-type (:layer-type cfg)
-                                             :is-shared? (>= i num-unshared)}))
-                                        (range num-layers)
-                                        tr-partitioned)
-                           logits (gemma/full-gemma4-forward x emb nil nil nil lw-seq fn-norm pos-tracer num-heads num-kv-heads nil 0 {:final-logit-softcap 30.0 :num-kv-shared-layers num-kv-shared-layers})]
-                       (t/convert logits :f32))))
+        make-invars (fn [seq-l]
+                      (vec (concat
+                            [[:x [:tensor [1 seq-l] :i32]]
+                             [:pos [:tensor [seq-l] :i32]]
+                             [:embed_tokens [:tensor [vocab-size hidden-dim] norm-dtype]]]
+                            ple-global-invars
+                            [[:final_norm_w [:tensor [hidden-dim] norm-dtype]]]
+                            layer-invars
+                            kv-invars)))
 
-        _ (when-not quiet (println "Tracing & JIT Compiling Single Fused Gemma 4 StableHLO Graph..."))
-        fused-graph (trace-graph "gemma4_fused_forward" invars trace-fn)
-        exec (xla/compile-graph ctx fused-graph)
-        _ (when-not quiet (println "Successfully compiled StableHLO fused forward graph to native XLA PjRtLoadedExecutable handle."))]
+        make-trace-fn (fn [opts-extra kv-pos-override]
+                        (fn [x pos-tracer emb & rest-args]
+                          (let [n-ple (if has-ple? 3 0)
+                                emb-pl (when has-ple? (nth rest-args 0))
+                                pl-model-proj (when has-ple? (nth rest-args 1))
+                                pl-proj-norm (when has-ple? (nth rest-args 2))
+                                fn-norm (nth rest-args n-ple)
+                                after-fn-norm (subvec (vec rest-args) (inc n-ple))
+                                n-layer-weights (count layer-invars)
+                                all-layer-tracers (subvec after-fn-norm 0 n-layer-weights)
+                                kv-tracers (subvec after-fn-norm n-layer-weights)
+                                kv-caches (mapv vector (take-nth 2 kv-tracers) (take-nth 2 (rest kv-tracers)))
+                                lw-seq (mapv (fn [i tr]
+                                               (let [{:keys [q-dim kv-dim head-dim mlp-dim qkv-rows gate-up-rows norms-base-el norms-total-el]} (nth layer-grouped-specs i)
+                                                     cfg (nth layer-configs i)
+                                                     qkv-el (* qkv-rows hidden-dim)
+                                                     o-el (* hidden-dim q-dim)
+                                                     gate-up-el (* gate-up-rows hidden-dim)
+                                                     down-el (* hidden-dim mlp-dim)
 
-    (when verbose
-      (println "\n==================================================================")
-      (println "--- Single Fused Forward EDN SSA Graph ---")
-      (pprint/pprint fused-graph)
-      (println "==================================================================\n"))
+                                                     qkv-1d (t/slice tr [0] [qkv-el] [1])
+                                                     qkv-tr (t/reshape qkv-1d [qkv-rows hidden-dim])
 
-    exec))
+                                                     o-off qkv-el
+                                                     o-1d (t/slice tr [o-off] [(+ o-off o-el)] [1])
+                                                     o-tr (t/reshape o-1d [hidden-dim q-dim])
+
+                                                     gu-off (+ o-off o-el)
+                                                     gu-1d (t/slice tr [gu-off] [(+ gu-off gate-up-el)] [1])
+                                                     gate-up-tr (t/reshape gu-1d [gate-up-rows hidden-dim])
+
+                                                     dw-off (+ gu-off gate-up-el)
+                                                     dw-1d (t/slice tr [dw-off] [(+ dw-off down-el)] [1])
+                                                     down-tr (t/reshape dw-1d [hidden-dim mlp-dim])
+
+                                                     n-off (+ dw-off down-el)
+                                                     norms-tr (t/slice tr [n-off] [(+ n-off norms-total-el)] [1])
+
+                                                     qw (t/slice qkv-tr [0 0] [q-dim hidden-dim] [1 1])
+                                                     kw (t/slice qkv-tr [q-dim 0] [(+ q-dim kv-dim) hidden-dim] [1 1])
+                                                     vw (t/slice qkv-tr [(+ q-dim kv-dim) 0] [(+ q-dim kv-dim kv-dim) hidden-dim] [1 1])
+                                                     gw (t/slice gate-up-tr [0 0] [mlp-dim hidden-dim] [1 1])
+                                                     uw (t/slice gate-up-tr [mlp-dim 0] [(* 2 mlp-dim) hidden-dim] [1 1])
+                                                     in-ln (t/slice norms-tr [0] [hidden-dim] [1])
+                                                     ls (t/slice norms-tr [hidden-dim] [(+ hidden-dim 1)] [1])
+                                                     qn (t/slice norms-tr [(+ hidden-dim 1)] [(+ hidden-dim 1 head-dim)] [1])
+                                                     kn (t/slice norms-tr [(+ hidden-dim 1 head-dim)] [(+ hidden-dim 1 head-dim head-dim)] [1])
+                                                     post-attn-ln (t/slice norms-tr [(+ hidden-dim 1 head-dim head-dim)] [(+ (* 2 hidden-dim) 1 head-dim head-dim)] [1])
+                                                     pre-mlp-ln (t/slice norms-tr [(+ (* 2 hidden-dim) 1 head-dim head-dim)] [(+ (* 3 hidden-dim) 1 head-dim head-dim)] [1])
+                                                     post-mlp-ln (t/slice norms-tr [(+ (* 3 hidden-dim) 1 head-dim head-dim)] [(+ (* 4 hidden-dim) 1 head-dim head-dim)] [1])
+                                                     plg-1d (when has-ple? (t/slice norms-tr [norms-base-el] [(+ norms-base-el (* pl-dim hidden-dim))] [1]))
+                                                     plg (when has-ple? (t/reshape plg-1d [pl-dim hidden-dim]))
+                                                     plp-1d (when has-ple? (t/slice norms-tr [(+ norms-base-el (* pl-dim hidden-dim))] [(+ norms-base-el (* pl-dim hidden-dim) (* hidden-dim pl-dim))] [1]))
+                                                     plp (when has-ple? (t/reshape plp-1d [hidden-dim pl-dim]))
+                                                     pln (when has-ple? (t/slice norms-tr [(+ norms-base-el (* pl-dim hidden-dim) (* hidden-dim pl-dim))] [(+ norms-base-el (* pl-dim hidden-dim) (* hidden-dim pl-dim) hidden-dim)] [1]))]
+                                                 {:input-ln-w in-ln :layer-scalar-w ls
+                                                  :q-w qw :k-w kw :v-w vw :o-w o-tr
+                                                  :q-norm-w qn :k-norm-w kn
+                                                  :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
+                                                  :gate-w gw :up-w uw :down-w down-tr
+                                                  :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
+                                                  :num-heads num-heads :num-kv-heads (:num-kv-heads cfg) :head-dim (:head-dim cfg)
+                                                  :theta-base (:theta-base cfg)
+                                                  :rope-proportion (:rope-proportion cfg)
+                                                  :norm-fn norm/rms-norm
+                                                  :attn-softcap nil
+                                                  :layer-type (:layer-type cfg)
+                                                  :is-shared? (>= i num-unshared)}))
+                                             (range num-layers)
+                                             all-layer-tracers)
+                                f-opts (merge {:final-logit-softcap 30.0 :num-kv-shared-layers num-kv-shared-layers} opts-extra)
+                                kv-pos (or kv-pos-override pos-tracer)
+                                [logits updated-kv-caches] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads kv-caches kv-pos f-opts)
+                                logits-f32 (t/convert logits :f32)
+                                flat-updated (mapcat identity updated-kv-caches)]
+                            (into [logits-f32] flat-updated))))
+
+        _ (when-not quiet (println "Tracing & JIT Compiling Gemma 4 Prefill StableHLO Graph (Length:" prompt-len ")..."))
+        prefill-invars (make-invars prompt-len)
+        prefill-fn (make-trace-fn {:slice-last-token? true} 0)
+        prefill-graph (trace-graph "gemma4_prefill" prefill-invars prefill-fn)
+        _ (when-not quiet (println "  ↳ Prefill SSA equations:" (count (:eqns prefill-graph))))
+        prefill-exec (xla/compile-graph ctx prefill-graph)
+
+        _ (when-not quiet (println "Tracing & JIT Compiling Gemma 4 Decode StableHLO Graph (Length: 1)..."))
+        decode-invars (make-invars 1)
+        decode-fn (make-trace-fn {} nil)
+        decode-graph (trace-graph "gemma4_decode" decode-invars decode-fn)
+        _ (when-not quiet (println "  ↳ Decode SSA equations:" (count (:eqns decode-graph))))
+        decode-exec (xla/compile-graph ctx decode-graph)
+        _ (when-not quiet (println "Successfully compiled Dual-Graph Gemma 4 StableHLO Executables (Prefill & Decode)!"))]
+
+    {:prefill prefill-exec
+     :decode decode-exec}))
 
 (defn run-autoregressive-generation
-  "Runs autoregressive text generation using single fused XLA GPU execution graph."
-  [{:keys [ctx tokenizer config opts]} exec device-weights prompt-ids]
-  (let [{:keys [max-new-tokens temperature top-k]} opts
-        {:keys [max-seq-len vocab-size]} config
+  "Runs autoregressive text generation using Dual-Graph XLA GPU execution with KV-caching."
+  [{:keys [ctx tokenizer config opts]} execs device-weights prompt-ids]
+  (let [{:keys [max-new-tokens temperature top-k quiet]} opts
+        {:keys [max-seq-len vocab-size num-layers layer-configs]} config
+        {:keys [prefill decode]} execs
         primary-eos (eos-id tokenizer)
-        ;; Hard EOS tokens that always terminate generation immediately
         hard-eos (set (remove nil? [1 primary-eos]))
-        ;; Token 107 (<turn|>) only terminates when repeated consecutively
-        ;; (the first 107 may just end a thought channel in 12B-it models)
         turn-end-token 107
-        pos-array (int-array (range max-seq-len))
-        pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) pos-array [max-seq-len] 4)
-        ;; Accumulate intermediate device buffers for deferred cleanup.
-        ;; Destroying buffers mid-loop crashes ROCm PJRT (the plugin retains
-        ;; internal references even after the completion event is awaited).
-        intermediate-bufs (atom [])]
+        num-outputs (+ 1 (* 2 num-layers))
+        prompt-len (count prompt-ids)
+        init-kv-bufs (vec (mapcat (fn [i]
+                                    (let [cfg (nth layer-configs i)
+                                          l-nkv (:num-kv-heads cfg)
+                                          h-dim (:head-dim cfg)
+                                          arr (float-array (* 1 l-nkv max-seq-len h-dim))]
+                                      [(xla/buffer-from-host-buffer ctx (:client ctx) arr [1 l-nkv max-seq-len h-dim] 11)
+                                       (xla/buffer-from-host-buffer ctx (:client ctx) arr [1 l-nkv max-seq-len h-dim] 11)]))
+                                  (range num-layers)))
+        intermediate-bufs (atom [])
+        prefill-ms (atom 0.0)
+        decode-ms (atom 0.0)
+        gen-tok-count (atom 0)]
     (try
-      (loop [cur-tokens (vec prompt-ids)
-             step 0
-             consecutive-turn-ends 0]
-        (let [last-tok (when (pos? step) (last cur-tokens))
-              hit-hard-eos (and (pos? step) (contains? hard-eos last-tok))
-              ;; Stop on consecutive <turn|> tokens (model is truly done)
-              new-consecutive (if (= last-tok turn-end-token) (inc consecutive-turn-ends) 0)
-              hit-turn-end (>= new-consecutive 2)]
-          (if (or (>= step max-new-tokens) hit-hard-eos hit-turn-end)
-            cur-tokens
-            (let [seq-len (count cur-tokens)
-                  padded-tokens (int-array (concat cur-tokens (repeat (- max-seq-len seq-len) 0)))
-                  tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) padded-tokens [1 max-seq-len] 4)
-                  input-args (into [tok-buf pos-buf] device-weights)
-                  logits-buf (xla/execute exec input-args)
-                  step-logits (xla/to-host-slice logits-buf (dec seq-len) vocab-size (* max-seq-len vocab-size))
-                  next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})]
-              (swap! intermediate-bufs into [tok-buf logits-buf])
-              (recur (conj cur-tokens next-tok) (inc step) new-consecutive)))))
+      ;; Phase 1: Prefill Pass (1 launch for all prompt tokens)
+      (let [p-t0 (System/nanoTime)
+            tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array prompt-ids) [1 prompt-len] 4)
+            pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array (range prompt-len)) [prompt-len] 4)
+            prefill-args (vec (concat [tok-buf pos-buf] device-weights init-kv-bufs))
+            exec-res (pjrt/execute-executable ctx (:handle prefill) prefill-args num-outputs)
+            logits-buf (first exec-res)
+            prefill-kv-bufs (vec (rest exec-res))
+            step-logits (xla/to-host-slice logits-buf 0 vocab-size vocab-size)
+            first-next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})
+            p-t1 (System/nanoTime)
+            _ (reset! prefill-ms (/ (- p-t1 p-t0) 1e6))
+            _ (swap! intermediate-bufs into (concat [tok-buf pos-buf logits-buf] prefill-kv-bufs))
+
+            ;; Phase 2: Decoding Pass (autoregressive 1-token launches with KV-cache)
+            result-tokens
+            (loop [cur-tokens (conj (vec prompt-ids) first-next-tok)
+                   pos-idx prompt-len
+                   kv-bufs prefill-kv-bufs
+                   consecutive-turn-ends (if (= first-next-tok turn-end-token) 1 0)]
+              (let [last-tok (last cur-tokens)
+                    step (- (count cur-tokens) prompt-len)
+                    hit-hard-eos (and (pos? step) (contains? hard-eos last-tok))
+                    new-consecutive (if (= last-tok turn-end-token) (inc consecutive-turn-ends) 0)
+                    hit-turn-end (>= new-consecutive 2)]
+                (if (or (>= step max-new-tokens) hit-hard-eos hit-turn-end)
+                  cur-tokens
+                  (let [step-t0 (System/nanoTime)
+                        tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [last-tok]) [1 1] 4)
+                        pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [pos-idx]) [1] 4)
+                        input-args (vec (concat [tok-buf pos-buf] device-weights kv-bufs))
+                        exec-res (pjrt/execute-executable ctx (:handle decode) input-args num-outputs)
+                        logits-buf (first exec-res)
+                        new-kv-bufs (vec (rest exec-res))
+                        step-logits (xla/to-host-slice logits-buf 0 vocab-size vocab-size)
+                        next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})
+                        step-t1 (System/nanoTime)
+                        elapsed-ms (/ (- step-t1 step-t0) 1e6)]
+                    (swap! decode-ms + elapsed-ms)
+                    (swap! gen-tok-count inc)
+                    (swap! intermediate-bufs into (concat [tok-buf pos-buf logits-buf] new-kv-bufs))
+                    (recur (conj cur-tokens next-tok) (inc pos-idx) new-kv-bufs new-consecutive)))))]
+        (when-not quiet
+          (let [p-ms @prefill-ms
+                d-ms @decode-ms
+                gen-n @gen-tok-count
+                tok-per-sec (if (pos? d-ms) (/ (* gen-n 1000.0) d-ms) 0.0)]
+            (println "\n------------------------------------------------------------------")
+            (println (format "  Telemetry Benchmark Metrics:"))
+            (println (format "    • Prefill Latency  : %8.2f ms (Prompt: %d tokens)" p-ms prompt-len))
+            (println (format "    • Decode Latency   : %8.2f ms (%d tokens generated)" d-ms gen-n))
+            (println (format "    • Decode Speed     : %8.2f tok/s (%8.2f ms/tok)" tok-per-sec (if (pos? gen-n) (/ d-ms (double gen-n)) 0.0)))
+            (println "------------------------------------------------------------------\n")))
+        result-tokens)
       (finally
         (doseq [buf @intermediate-bufs]
+          (xla/destroy-buffer! ctx buf))
+        (doseq [buf init-kv-bufs]
           (xla/destroy-buffer! ctx buf))))))
 
 (defn generate-text
@@ -609,10 +625,10 @@
 
     (when-not quiet (println "Transferring Gemma 4 model weights to PJRT Device Memory..."))
     (let [device-weights (allocate-device-weights session)
-          exec (compile-inference-executables session)]
+          execs (compile-inference-executables session prompt-len)]
       (when-not quiet
         (println "\nGenerating tokens autoregressively with Single Fused XLA GPU Kernel..."))
-      (let [final-context (run-autoregressive-generation session exec device-weights prompt-ids)
+      (let [final-context (run-autoregressive-generation session execs device-weights prompt-ids)
             generated-str (decode tokenizer final-context)]
         (println generated-str)
         (when-not quiet

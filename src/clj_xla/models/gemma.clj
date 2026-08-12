@@ -339,9 +339,19 @@
                  (map vector (range num-layers) layers-with-ple (or kv-caches (repeat num-layers nil))))
 
          normed (rms-norm x-out final-norm-w 1e-6)
-         normed-last (if-let [idx (:last-token-idx opts)]
-                       (let [[_ [_ _ h-dim] _] (:type normed)]
+         normed-last (cond
+                       (some? (:last-token-idx opts))
+                       (let [idx (:last-token-idx opts)
+                             [_ [_ _ h-dim] _] (:type normed)]
                          (reshape (slice normed [0 idx 0] [1 (inc idx) h-dim] [1 1 1]) [1 1 h-dim]))
+
+                       (:slice-last-token? opts)
+                       (let [[_ [_ s h-dim] _] (:type normed)]
+                         (if (number? s)
+                           (reshape (slice normed [0 (dec s) 0] [1 s h-dim] [1 1 1]) [1 1 h-dim])
+                           normed))
+
+                       :else
                        normed)
          embed-t (transpose embed-tokens [1 0])
          raw-logits (linear normed-last embed-t nil)

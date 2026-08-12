@@ -61,7 +61,17 @@
         :autotune-level autotune-level
         :cache-dir (:cache-dir opts)}
        (let [existing-xla-flags (or (System/getenv "XLA_FLAGS") "")
+             xla-cache-dir (try
+                             (let [dir (io/file (System/getProperty "user.home") ".cache" "xla")]
+                               (.mkdirs dir)
+                               (.getAbsolutePath dir))
+                             (catch Exception _ nil))
              base-flags (cond-> []
+                          (and (some? xla-cache-dir) (contains? #{:rocm :cuda12 :sycl} target-kw))
+                          (into [(str "--xla_gpu_per_fusion_autotune_cache_dir=" xla-cache-dir)
+                                 (str "--xla_gpu_experimental_autotuner_cache_dir=" xla-cache-dir)
+                                 (str "--xla_gpu_kernel_cache_file=" xla-cache-dir "/kernel.cache")])
+
                           (= target-kw :cuda12)
                           (conj "--xla_gpu_enable_cublaslt=true")
 
@@ -105,7 +115,9 @@
                                "ROCR_VISIBLE_DEVICES" (or (System/getenv "ROCR_VISIBLE_DEVICES") "0")
                                "HIP_VISIBLE_DEVICES" (or (System/getenv "HIP_VISIBLE_DEVICES") "0"))
                         (some? cache-dir)
-                        (assoc "TF_XLA_HSACO_CACHE_DIR" cache-dir))]
+                        (assoc "TF_XLA_HSACO_CACHE_DIR" cache-dir)
+                        (some? xla-cache-dir)
+                        (assoc "XLA_PERSISTENT_COMPILATION_CACHE_DIR" xla-cache-dir))]
          {:xla-flags all-flags-str
           :env-vars env-vars
           :autotune-level autotune-level

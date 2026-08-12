@@ -260,8 +260,10 @@
          num-kv-heads (or num-kv-heads 4)
          head-dim (quot q-dim num-heads)
 
-         k-4d (if is-k-4d k (transpose (reshape k [batch q-len num-kv-heads head-dim]) [0 2 1 3]))
-         v-4d (if is-k-4d v (transpose (reshape v [batch q-len num-kv-heads head-dim]) [0 2 1 3]))
+         k-dim (if is-k-4d (clojure.core/* (nth (second k-type) 1) (nth (second k-type) 3)) (nth (second k-type) 2))
+         actual-nkv (if (pos? head-dim) (quot k-dim head-dim) num-kv-heads)
+         k-4d (if is-k-4d k (transpose (reshape k [batch q-len actual-nkv head-dim]) [0 2 1 3]))
+         v-4d (if is-k-4d v (transpose (reshape v [batch q-len actual-nkv head-dim]) [0 2 1 3]))
 
          [updated-kv [k-act v-act]]
          (if (some? past-kv)
