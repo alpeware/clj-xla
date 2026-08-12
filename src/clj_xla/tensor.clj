@@ -52,29 +52,32 @@
         pad-b (vec (clojure.core/concat (repeat (clojure.core/- max-rank rank-b) 1) shape-b))]
     (mapv clojure.core/max pad-a pad-b)))
 
-(defn- binary-elementwise-op [op-kw prefix a b]
-  (let [ta (emit-constant! a nil)
-        tb (emit-constant! b (:type ta))
-        [t-kw shape-a dtype-a] (:type ta)
-        [_ shape-b _] (:type tb)
-        out-shape (broadcast-shapes shape-a shape-b)
-        rank-out (count out-shape)
-        ta-bcast (if (= shape-a out-shape)
-                   ta
-                   (let [rank-a (count shape-a)
-                         bcast-dims (vec (map int (range (clojure.core/- rank-out rank-a) rank-out)))]
-                     (broadcast-in-dim ta out-shape bcast-dims)))
-        tb-bcast (if (= shape-b out-shape)
-                   tb
-                   (let [rank-b (count shape-b)
-                         bcast-dims (vec (map int (range (clojure.core/- rank-out rank-b) rank-out)))]
-                     (broadcast-in-dim tb out-shape bcast-dims)))
-        out-type [t-kw out-shape dtype-a]
-        out-id (gen-var-id! prefix)
-        eqn {:op op-kw :invars [(:id ta-bcast) (:id tb-bcast)] :outvars [out-id]}]
-    (when *trace-ctx*
-      (swap! (:eqns *trace-ctx*) conj eqn))
-    (->Tracer out-id out-type)))
+(defn- binary-elementwise-op
+  ([op-kw prefix a b] (binary-elementwise-op op-kw prefix a b nil nil))
+  ([op-kw prefix a b attrs out-dtype-override]
+   (let [ta (emit-constant! a nil)
+         tb (emit-constant! b (:type ta))
+         [t-kw shape-a dtype-a] (:type ta)
+         [_ shape-b _] (:type tb)
+         out-shape (broadcast-shapes shape-a shape-b)
+         rank-out (count out-shape)
+         ta-bcast (if (= shape-a out-shape)
+                    ta
+                    (let [rank-a (count shape-a)
+                          bcast-dims (vec (map int (range (clojure.core/- rank-out rank-a) rank-out)))]
+                      (broadcast-in-dim ta out-shape bcast-dims)))
+         tb-bcast (if (= shape-b out-shape)
+                    tb
+                    (let [rank-b (count shape-b)
+                          bcast-dims (vec (map int (range (clojure.core/- rank-out rank-b) rank-out)))]
+                      (broadcast-in-dim tb out-shape bcast-dims)))
+         out-type [t-kw out-shape (or out-dtype-override dtype-a)]
+         out-id (gen-var-id! prefix)
+         eqn (cond-> {:op op-kw :invars [(:id ta-bcast) (:id tb-bcast)] :outvars [out-id]}
+               attrs (assoc :attrs attrs))]
+     (when *trace-ctx*
+       (swap! (:eqns *trace-ctx*) conj eqn))
+     (->Tracer out-id out-type))))
 
 (defn +
   "Elementwise tensor addition."
@@ -434,3 +437,25 @@
         red-count (double (reduce clojure.core/* (map #(nth shape %) norm-axes)))
         sum-tracer (reduce-sum tx :axes norm-axes :keep-dims keep-dims)]
     (/ sum-tracer red-count)))
+
+(defn compare-t
+  "Compares elements of `a` and `b` with specified direction (\"EQ\", \"NE\", \"GE\", \"GT\", \"LE\", \"LT\")."
+  [a b direction]
+  (binary-elementwise-op :stablehlo/compare "t_cmp" a b {:comparison_direction (str direction)} :i1))
+
+(defn eq [a b] (compare-t a b "EQ"))
+
+(defn argmax
+  "Computes tensor argmax along specified axis (defaults to -1) using pure StableHLO tracer operators."
+  [x & {:keys [axis] :or {axis -1}}]
+  (let [tx (emit-constant! x nil)
+        [_kw shape _dtype] (:type tx)
+        rank (clojure.core/count shape)
+        norm-axis (if (clojure.core/neg? axis) (clojure.core/+ rank axis) axis)
+        dim-size (nth shape norm-axis)
+        max-val (reduce-max tx :axes [norm-axis] :keep-dims true)
+        is-max (eq tx max-val)
+        idx-shape (assoc (vec (repeat rank 1)) norm-axis dim-size)
+        idx-const (emit-constant! (vec (range dim-size)) [:tensor idx-shape :i32])
+        masked-idx (* (convert is-max :i32) idx-const)]
+    (reduce-max masked-idx :axes [norm-axis] :keep-dims false)))

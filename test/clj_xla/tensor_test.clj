@@ -59,3 +59,11 @@
       (is (t/tracer? (t/pow x 2.0)))
       (is (t/tracer? (t/tanh x)))
       (is (t/tracer? (t/sqrt x))))))
+
+(deftest argmax-tracing-test
+  (testing "Argmax tracer produces correct tensor shape and int32 type"
+    (binding [t/*trace-ctx* {:var-counter (atom 0) :eqns (atom [])}]
+      (let [logits (t/->Tracer :logits [:tensor [1 1 262144] :f32])
+            tok-id (t/argmax logits :axis -1)]
+        (is (t/tracer? tok-id))
+        (is (= [:tensor [1 1] :i32] (:type tok-id)))))))

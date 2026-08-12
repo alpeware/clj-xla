@@ -432,6 +432,44 @@
       (is (tracer? logits))
       (is (= 1 (count updated-kv))))))
 
+(deftest gemma4-in-vram-fused-generation-test
+  (testing "In-VRAM multi-step generation graph tracing produces token IDs tensor"
+    (let [layer-w {:input-ln-w (t/->Tracer :in_ln [:tensor [2048] :f32])
+                   :layer-scalar-w (t/->Tracer :ls [:tensor [1] :f32])
+                   :q-w (t/->Tracer :qw [:tensor [2048 2048] :f32])
+                   :k-w (t/->Tracer :kw [:tensor [256 2048] :f32])
+                   :v-w (t/->Tracer :vw [:tensor [256 2048] :f32])
+                   :o-w (t/->Tracer :ow [:tensor [2048 2048] :f32])
+                   :q-norm-w (t/->Tracer :qn [:tensor [256] :f32])
+                   :k-norm-w (t/->Tracer :kn [:tensor [256] :f32])
+                   :post-attn-ln-w (t/->Tracer :post_attn_ln [:tensor [2048] :f32])
+                   :pre-mlp-ln-w (t/->Tracer :pre_mlp_ln [:tensor [2048] :f32])
+                   :post-mlp-ln-w (t/->Tracer :post_mlp_ln [:tensor [2048] :f32])
+                   :gate-w (t/->Tracer :gw [:tensor [8192 2048] :f32])
+                   :up-w (t/->Tracer :uw [:tensor [8192 2048] :f32])
+                   :down-w (t/->Tracer :dw [:tensor [2048 8192] :f32])
+                   :per-layer-gate-w (t/->Tracer :plg [:tensor [256 2048] :f32])
+                   :per-layer-proj-w (t/->Tracer :plp [:tensor [2048 256] :f32])
+                   :post-per-layer-norm-w (t/->Tracer :pln [:tensor [2048] :f32])}
+          kv-caches [[(t/->Tracer :kc [:tensor [1 1 128 256] :f32])
+                      (t/->Tracer :vc [:tensor [1 1 128 256] :f32])]]
+          x (t/->Tracer :x [:tensor [1 4] :i32])
+          emb (t/->Tracer :emb [:tensor [262144 2048] :f32])
+          emb-pl (t/->Tracer :emb_pl [:tensor [262144 256] :f32])
+          pl-proj (t/->Tracer :pl_proj [:tensor [256 2048] :f32])
+          pl-norm (t/->Tracer :pl_norm [:tensor [256] :f32])
+          fn-norm (t/->Tracer :fn_norm [:tensor [2048] :f32])
+          pos-tracer (t/->Tracer :pos [:tensor [4] :i32])
+          ;; Step 1: Prefill
+          [p-logits kv1] (full-gemma4-forward x emb emb-pl pl-proj pl-norm [layer-w] fn-norm pos-tracer 8 1 kv-caches 0 {:slice-last-token? true})
+          tok1 (t/reshape (t/argmax p-logits :axis -1) [1 1])
+          ;; Step 2: Decode step 1 in-VRAM
+          [d-logits _kv2] (full-gemma4-forward tok1 emb emb-pl pl-proj pl-norm [layer-w] fn-norm (t/emit-constant! [4] [:tensor [1] :i32]) 8 1 kv1 4 {})
+          tok2 (t/reshape (t/argmax d-logits :axis -1) [1 1])
+          gen-tokens (t/concatenate [tok1 tok2] 1)]
+      (is (tracer? gen-tokens))
+      (is (= [:tensor [1 2] :i32] (:type gen-tokens))))))
+
 
 
 

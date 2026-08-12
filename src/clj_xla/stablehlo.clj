@@ -103,6 +103,15 @@
                         out-t (str "tensor<" (str/join "x" in-dims) "x" target-dtype ">")]
                     (assoc acc (first outvars) out-t))
 
+                  (= op :stablehlo/compare)
+                  (let [in-var (first in-vars)
+                        in-type (get acc in-var "tensor<1x128x768xf32>")
+                        [in-dims _] (or (parse-tensor-dims in-type) [[1] "f32"])
+                        out-type (if (seq in-dims)
+                                   (str "tensor<" (str/join "x" in-dims) "xi1>")
+                                   "tensor<i1>")]
+                    (assoc acc (first outvars) out-type))
+
                   (= op :stablehlo/reshape)
                   (let [new-shape (get attrs :shape [1 128 1])
                         [_in-dims in-dtype] (or (parse-tensor-dims in-type) [[1 128] "f32"])
@@ -210,17 +219,22 @@
         target-name (or (:call_target_name attrs) (:call_target_name eqn) call_target_name "rope")]
     (cond
       (= op :stablehlo/constant)
-      (let [out-type (get var-types out-var "tensor<f32>")]
+      (let [out-type (get var-types out-var "tensor<f32>")
+            [_ dtype-extracted] (parse-tensor-dims out-type)
+            dtype-str (or dtype-extracted "f32")
+            is-int? (boolean (re-find #"^(?:i32|i64|i8|i1|ui8|ui32|si32)$" dtype-str))]
         (if (vector? value)
           (let [flat-vals (flatten value)
-                val-strs (map #(format "%.6e" (double %)) flat-vals)
+                val-strs (if is-int?
+                           (map #(str (long %)) flat-vals)
+                           (map #(format "%.6e" (double %)) flat-vals))
                 val-str (str/join ", " val-strs)
-                n (count flat-vals)]
-            (str "    %" (name out-var) "_1d = " mlir-op " dense<[" val-str "]> : tensor<" n "xf32>\n"
-                 "    %" (name out-var) " = stablehlo.reshape %" (name out-var) "_1d : (tensor<" n "xf32>) -> " out-type))
-          (let [num (if (number? value) (double value) 0.0)
-                val-str (format "%.6e" num)]
-            (str "    %" (name out-var) " = " mlir-op " dense<" val-str "> : " out-type))))
+                n (count flat-vals)
+                type-1d (str "tensor<" n "x" dtype-str ">")]
+            (str "    %" (name out-var) "_1d = " mlir-op " dense<[" val-str "]> : " type-1d "\n"
+                 "    %" (name out-var) " = stablehlo.reshape %" (name out-var) "_1d : (" type-1d ") -> " out-type))
+          (let [num-str (if is-int? (str (long (or value 0))) (format "%.6e" (double (or value 0.0))))]
+            (str "    %" (name out-var) " = " mlir-op " dense<" num-str "> : " out-type))))
 
       (= op :stablehlo/convert)
       (let [in-var (first invars)
@@ -229,6 +243,14 @@
             [in-dims _] (or (parse-tensor-dims in-type) [[1] "i32"])
             out-type (str "tensor<" (str/join "x" in-dims) "x" target-dtype ">")]
         (str "    %" (name out-var) " = \"stablehlo.convert\"(%" (name in-var) ") : (" in-type ") -> " out-type))
+
+      (= op :stablehlo/compare)
+      (let [[in0 in1] invars
+            in0-t (get var-types in0 "tensor<1x128x768xf32>")
+            in1-t (get var-types in1 in0-t)
+            out-type (get var-types out-var "tensor<1x128x768xi1>")
+            dir (get attrs :comparison_direction "EQ")]
+        (str "    %" (name out-var) " = \"stablehlo.compare\"(%" (name in0) ", %" (name in1) ") {comparison_direction = #stablehlo<comparison_direction " dir ">} : (" in0-t ", " in1-t ") -> " out-type))
 
       (= op :stablehlo/gather)
       (let [[operand start-indices] invars
@@ -337,9 +359,10 @@
                           :stablehlo/reduce_sum "stablehlo.add"
                           :stablehlo/reduce_max "stablehlo.maximum"
                           :stablehlo/reduce_mean "stablehlo.add")
-            init-const (if (= op :stablehlo/reduce_max)
-                         "-1.000000e+30"
-                         "0.000000e+00")
+            is-int-dtype? (boolean (re-find #"^(?:i32|i64|i8|i1|ui8|ui32|si32)$" (str in-dtype)))
+            init-const (cond
+                         (= op :stablehlo/reduce_max) (if is-int-dtype? "-2147483648" "-1.000000e+30")
+                         :else (if is-int-dtype? "0" "0.000000e+00"))
             norm-axes-set (set norm-axes)
             reduced-dims (mapv #(nth in-dims %) (filter #(not (norm-axes-set %)) (range rank)))
             red-type (if (seq reduced-dims)
