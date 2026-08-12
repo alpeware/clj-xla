@@ -378,9 +378,7 @@
                           (when (seq rhs-b) (str "rhs_batching_dimensions = [" (str/join ", " rhs-b) "], "))
                           "lhs_contracting_dimensions = [" (str/join ", " lhs-c) "], "
                           "rhs_contracting_dimensions = [" (str/join ", " rhs-c) "]>")]
-        (str "    %" (name out-var) " = \"stablehlo.dot_general\"(%" (name lhs) ", %" (name rhs) ") {"
-             "dot_dimension_numbers = " dot-attr "} : "
-             "(" lhs-type ", " rhs-type ") -> " out-type))
+        (str "    %" (name out-var) " = \"stablehlo.dot_general\"(%" (name lhs) ", %" (name rhs) ") {dot_dimension_numbers = " dot-attr ", precision = [#stablehlo<precision DEFAULT>, #stablehlo<precision DEFAULT>]} : (" lhs-type ", " rhs-type ") -> " out-type))
 
       :else
       (let [in-types (map #(get var-types % "tensor<1x128x768xf32>") invars)
