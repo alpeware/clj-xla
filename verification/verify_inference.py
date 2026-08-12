@@ -1,5 +1,15 @@
 import os
 import sys
+import types
+import importlib.machinery
+
+tf = types.ModuleType('tensorflow')
+tf.Tensor = object
+tf.dtypes = types.ModuleType('dtypes')
+tf.dtypes.DType = type('DType', (), {})
+tf.__spec__ = importlib.machinery.ModuleSpec('tensorflow', None)
+sys.modules['tensorflow'] = tf
+
 import jax
 import jax.numpy as jnp
 from safetensors import safe_open
@@ -63,28 +73,41 @@ def load_safetensors_flax_params(model_dir):
     return {"params": params}
 
 def main():
-    model_dir = "../.models/gemma-4-E2B"
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    model_dir = os.path.abspath(os.path.join(script_dir, "..", ".models", "gemma-4-E2B-it"))
+    if not os.path.exists(model_dir):
+        model_dir = os.path.abspath(os.path.join(script_dir, "..", ".models", "gemma-4-E2B"))
     print(f"Loading Flax params from safetensors in {model_dir}...")
     variables = load_safetensors_flax_params(model_dir)
     model = gm.nn.Gemma4_E2B()
     
     tok = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
-    encoded = tok.encode("The capital of France is")
-    prompt_ids = encoded.ids
+    encoded = tok.encode("What is the capital of France?")
+    clean_ids = encoded.ids
+    if clean_ids[0] == 2:
+        clean_ids = clean_ids[1:]
+    prompt_ids = [2, 105, 2364, 107] + clean_ids + [106, 107, 105, 4368, 107]
         
     print(f"Prompt IDs ({len(prompt_ids)} tokens): {prompt_ids}")
-    tokens = jnp.array([prompt_ids], dtype=jnp.int32)
-    positions = jnp.arange(len(prompt_ids), dtype=jnp.int32)[None, :]
+    cur_tokens = list(prompt_ids)
     
-    print("Running reference forward pass...")
-    out = model.apply(variables, tokens, positions=positions)
-    logits = out.logits[0, -1] # last token logits
-    
-    top_10 = jnp.argsort(logits)[::-1][:10]
-    print("\n=== Top 10 Base Reference Predicted Tokens ===")
-    for tid in top_10:
-        t_str = tok.decode([int(tid)])
-        print(f"  token {int(tid):6d} | logit: {float(logits[tid]):8.4f} | text: {repr(t_str)}")
+    print("\nGenerating tokens autoregressively with Flax Gemma 4 model...")
+    for step in range(20):
+        seq_len = len(cur_tokens)
+        tokens = jnp.array([cur_tokens], dtype=jnp.int32)
+        positions = jnp.arange(seq_len, dtype=jnp.int32)[None, :]
+        out = model.apply(variables, tokens, positions=positions)
+        logits = out.logits[0, -1] # last token logits
+        next_id = int(jnp.argmax(logits))
+        next_str = tok.decode([next_id])
+        cur_tokens.append(next_id)
+        print(f"Step {step+1:2d} | Token ID: {next_id:6d} | logit: {float(logits[next_id]):8.4f} | text: {repr(next_str)}")
+        if next_id == 1 or next_id == 106:
+            break
+            
+    full_text = tok.decode(cur_tokens)
+    print("\n=== Reference Autoregressive Generated Text ===")
+    print(full_text)
 
 if __name__ == "__main__":
     main()

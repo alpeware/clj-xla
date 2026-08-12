@@ -118,17 +118,6 @@
   ([] (init-backend! :cpu))
   ([target] (init-backend! target {:allocator "platform"}))
   ([target client-opts]
-   (when (= target :rocm)
-     (try
-       (let [jh (System/getProperty "java.home")
-             paths [(str jh "/lib/server/libjsig.so")
-                    (str jh "/lib/libjsig.so")
-                    "/usr/lib64/openjdk-25/lib/server/libjsig.so"]]
-         (doseq [p paths]
-           (when (.exists (java.io.File. ^String p))
-             (try (System/load p) (catch Throwable _ nil)))))
-       (catch Throwable _ nil)))
-
    (let [probe-info (try (v/probe-system-driver) (catch Exception _ {}))
          flag-config (determine-optimal-xla-flags target probe-info client-opts)
          {:keys [xla-flags env-vars]} flag-config]

@@ -76,13 +76,6 @@
           (do
             (when (= (keyword val) :rocm)
               (try
-                (let [jh (System/getProperty "java.home")
-                      paths [(str jh "/lib/server/libjsig.so")
-                             (str jh "/lib/libjsig.so")
-                             "/usr/lib64/openjdk-25/lib/server/libjsig.so"]]
-                  (doseq [p paths]
-                    (when (.exists (java.io.File. ^String p))
-                      (try (System/load p) (catch Throwable _ nil)))))
                 (let [linker (java.lang.foreign.Linker/nativeLinker)
                       lookup (.defaultLookup linker)
                       setenv-opt (.find lookup "setenv")]
