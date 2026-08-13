@@ -510,13 +510,7 @@
                    (.set ^MemorySegment await-args ValueLayout/ADDRESS (long 16) event-ptr)
                    (let [await-handle (downcall-ptr linker api-ptr OFFSET_EVENT_AWAIT ValueLayout/ADDRESS [ValueLayout/ADDRESS])
                          await-err (.invokeWithArguments ^MethodHandle await-handle [await-args])]
-                     (check-error! api-ctx await-err)))
-                 (let [destroy-args (.allocate arena (long 24))]
-                   (.fill destroy-args (byte 0))
-                   (.set ^MemorySegment destroy-args ValueLayout/JAVA_LONG (long 0) (long 24))
-                   (.set ^MemorySegment destroy-args ValueLayout/ADDRESS (long 16) event-ptr)
-                   (let [destroy-handle (downcall-ptr linker api-ptr OFFSET_EVENT_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-                         _ (.invokeWithArguments ^MethodHandle destroy-handle [destroy-args])]))))
+                     (check-error! api-ctx await-err)))))
              (if (= num-outs 1)
                (.get ^MemorySegment out-ptrs ValueLayout/ADDRESS (long 0))
                (mapv (fn [i] (.getAtIndex ^MemorySegment out-ptrs ValueLayout/ADDRESS (long i))) (range num-outs))))))))))

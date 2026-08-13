@@ -87,7 +87,7 @@
                           (and latency-hiding? (contains? #{:rocm :cuda12} target-kw))
                           (conj "--xla_gpu_enable_latency_hiding_scheduler=true")
 
-                          (and async-stream? (contains? #{:rocm :cuda12 :sycl} target-kw))
+                          (and async-stream? (contains? #{:cuda12 :sycl} target-kw))
                           (conj "--xla_gpu_enable_highest_priority_async_stream=true")
 
                           (contains? #{:rocm :cuda12 :sycl} target-kw)

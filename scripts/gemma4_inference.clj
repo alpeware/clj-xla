@@ -388,7 +388,7 @@
   (let [total (+ (long (or prompt-len 16)) (long (or max-new-tokens 10)) 32)
         blocks (long (Math/ceil (/ (double total) 1024.0)))
         needed (* (max 1 blocks) 1024)]
-    (min 4096 needed)))
+    (min 16384 needed)))
 
 (defn compile-inference-executables
   "Traces and JIT-compiles Dual Gemma 4 Execution Graphs (1 Prefill Graph + 1 Decode Step Graph)."
@@ -513,7 +513,10 @@
         _ (when-not quiet (println "Tracing & Compiling Gemma 4 Decode 1-Token Execution Graph..."))
         decode-graph (trace-graph "gemma4_decode" decode-invars (build-fn false))
         decode-exec (xla/compile-graph ctx decode-graph)
-        _ (when-not quiet (println "Successfully compiled Gemma 4 Dual-Graph Executables!"))]
+        _ (when-not quiet (println "Successfully compiled Gemma 4 Dual-Graph Executables!"))
+        dummy-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [0]) [1] 4)
+        _ (pjrt/buffer-to-host-int-buffer ctx dummy-buf 1)
+        _ (xla/destroy-buffer! ctx dummy-buf)]
     {:prefill prefill-exec
      :decode decode-exec}))
 
@@ -531,10 +534,12 @@
                                        l-nkv (:num-kv-heads cfg)
                                        h-dim (:head-dim cfg)
                                        n-bytes (long (* 1 l-nkv max-seq-len h-dim 2))
-                                       off-heap-seg (.allocate arena n-bytes)]
-                                   (.fill off-heap-seg (byte 0))
-                                   [(xla/buffer-from-host-buffer ctx (:client ctx) off-heap-seg [1 l-nkv max-seq-len h-dim] norm-enum)
-                                    (xla/buffer-from-host-buffer ctx (:client ctx) off-heap-seg [1 l-nkv max-seq-len h-dim] norm-enum)]))
+                                       off-heap-k (.allocate arena n-bytes)
+                                       off-heap-v (.allocate arena n-bytes)]
+                                   (.fill off-heap-k (byte 0))
+                                   (.fill off-heap-v (byte 0))
+                                   [(xla/buffer-from-host-buffer ctx (:client ctx) off-heap-k [1 l-nkv max-seq-len h-dim] norm-enum)
+                                    (xla/buffer-from-host-buffer ctx (:client ctx) off-heap-v [1 l-nkv max-seq-len h-dim] norm-enum)]))
                                (range num-layers))))
         tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array prompt-ids) [1 prompt-len] 4)
         pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array (range prompt-len)) [prompt-len] 4)
@@ -554,9 +559,8 @@
         first-tok (int (first first-tok-ints))]
     (xla/destroy-buffer! ctx tok-buf)
     (xla/destroy-buffer! ctx pos-buf)
-    (xla/destroy-buffer! ctx prefill-tok-buf)
     (when-not quiet
-      (println (format "\n  ↳ GPU Prefill Latency: %8.2f ms (%d prompt tokens)", prefill-ms prompt-len)))
+      (println (format "  ↳ GPU Prefill Latency: %8.2f ms (%d prompt tokens)", prefill-ms prompt-len)))
 
     (loop [step 1
            cur-tok-id first-tok
@@ -600,8 +604,9 @@
         clean-prompt (or prompt "The capital of France is")
         model-str (or model (get-in session [:config :model-dir]) "")
         is-it-model (str/includes? (str/lower-case model-str) "-it")
+        is-already-templated (or (str/includes? clean-prompt "<|turn|>user") (str/includes? clean-prompt "<|turn|>model"))
         prompt-ids (cond
-                     is-it-model
+                     (and is-it-model (not is-already-templated))
                      (let [raw-ids (encode tokenizer clean-prompt)
                            clean-ids (if (= (first raw-ids) (bos-id tokenizer)) (rest raw-ids) raw-ids)]
                        (vec (concat [(bos-id tokenizer) 105 2364 107] clean-ids [106 107 105 4368 107])))
