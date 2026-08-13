@@ -534,8 +534,8 @@
                                        l-nkv (:num-kv-heads cfg)
                                        h-dim (:head-dim cfg)
                                        n-bytes (long (* 1 l-nkv max-seq-len h-dim 2))
-                                       off-heap-k (.allocate arena n-bytes)
-                                       off-heap-v (.allocate arena n-bytes)]
+                                       off-heap-k (.allocate arena n-bytes 128)
+                                       off-heap-v (.allocate arena n-bytes 128)]
                                    (.fill off-heap-k (byte 0))
                                    (.fill off-heap-v (byte 0))
                                    [(xla/buffer-from-host-buffer ctx (:client ctx) off-heap-k [1 l-nkv max-seq-len h-dim] norm-enum)

@@ -173,8 +173,7 @@
   ([q-len kv-len pos] (generate-causal-mask q-len kv-len pos nil))
   ([q-len kv-len pos sliding-window]
    (if (or (clj-xla.tensor/tracer? pos) (clj-xla.tensor/tracer? q-len) (clj-xla.tensor/tracer? kv-len)
-           (not (number? q-len)) (not (number? kv-len))
-           (> (clojure.core/* (long q-len) (long kv-len)) 1000000))
+           (not (number? q-len)) (not (number? kv-len)))
      (let [i-iota (convert (clj-xla.tensor/iota q-len :i32) :f32)
            j-iota (convert (clj-xla.tensor/iota kv-len :i32) :f32)
            i-const (reshape i-iota [1 1 q-len 1])
