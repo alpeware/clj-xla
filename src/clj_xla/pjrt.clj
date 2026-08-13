@@ -482,11 +482,8 @@
                ;; The original 144 was too large and caused SEGFAULT by exposing uninitialized
                ;; fields that the plugin dereferenced.
                _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 0) (long 112))
-               non-donatable-arr (.allocate arena ValueLayout/JAVA_LONG (long num-args))
-               _ (dotimes [i num-args]
-                   (.setAtIndex ^MemorySegment non-donatable-arr ValueLayout/JAVA_LONG (long i) (long i)))
-               _ (.set ^MemorySegment opts ValueLayout/ADDRESS (long 56) non-donatable-arr)
-               _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 64) (long num-args))
+               _ (.set ^MemorySegment opts ValueLayout/ADDRESS (long 56) MemorySegment/NULL)
+               _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 64) (long 0))
                args (.allocate arena (long 80))]
            (.fill args (byte 0))
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 80))

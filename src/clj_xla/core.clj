@@ -78,7 +78,7 @@
                           (contains? #{:rocm :cuda12 :sycl} target-kw)
                           (conj (str "--xla_gpu_autotune_level=" autotune-level))
 
-                          (and triton? (contains? #{:rocm :cuda12} target-kw))
+                          (and triton? (= target-kw :cuda12))
                           (conj "--xla_gpu_triton_gemm_any=true")
 
                           (and sdpa? (= target-kw :cuda12))

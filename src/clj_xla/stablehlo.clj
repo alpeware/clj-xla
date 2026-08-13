@@ -131,6 +131,17 @@
                         out-t (str "tensor<" (str/join "x" target-shape) "x" in-dtype ">")]
                     (assoc acc (first outvars) out-t))
 
+                  (= op :stablehlo/dynamic_update_slice)
+                  (let [[op-var _up-var] in-vars
+                        op-t (get acc op-var "tensor<1x1x4096x256xbf16>")]
+                    (assoc acc (first outvars) op-t))
+
+                  (= op :stablehlo/dynamic_slice)
+                  (let [slice-sizes (get attrs :slice_sizes [1 1 4096 256])
+                        [_in-dims in-dtype] (or (parse-tensor-dims in-type) [[1 1 4096 256] "f32"])
+                        out-t (str "tensor<" (str/join "x" slice-sizes) "x" in-dtype ">")]
+                    (assoc acc (first outvars) out-t))
+
                   (= op :stablehlo/slice)
                   (let [starts (get attrs :start_indices [0 0 0])
                         limits (get attrs :limit_indices [1 128 768])
@@ -140,8 +151,11 @@
                         out-dims (mapv (fn [i]
                                          (let [s (nth starts i 0)
                                                l (nth limits i (nth in-dims i))
-                                               st (nth strides i 1)]
-                                           (long (Math/ceil (/ (double (- l s)) (double st))))))
+                                               st (nth strides i 1)
+                                               s-val (if (number? s) (long s) 0)
+                                               l-val (if (number? l) (long l) (long (nth in-dims i)))
+                                               st-val (if (number? st) (long st) 1)]
+                                           (long (Math/ceil (/ (double (- l-val s-val)) (double st-val))))))
                                        (range rank))
                         out-t (str "tensor<" (str/join "x" out-dims) "x" in-dtype ">")]
                     (assoc acc (first outvars) out-t))
@@ -201,6 +215,12 @@
                         out-t (str "tensor<" (str/join "x" out-dims) "x" lhs-dtype ">")]
                     (assoc acc (first outvars) out-t))
 
+                  (= op :stablehlo/iota)
+                  (let [len (get attrs :len 128)
+                        dt (name (get attrs :dtype :i32))
+                        out-t (str "tensor<" len "x" dt ">")]
+                    (assoc acc (first outvars) out-t))
+
                   :else
                   (let [target-type (or in-type "tensor<1x128x768xf32>")]
                     (reduce (fn [a v]
@@ -226,8 +246,8 @@
         (if (vector? value)
           (let [flat-vals (flatten value)
                 val-strs (if is-int?
-                           (map #(str (long %)) flat-vals)
-                           (map #(format "%.6e" (double %)) flat-vals))
+                           (map #(if (number? %) (str (long %)) "0") flat-vals)
+                           (map #(if (number? %) (format "%.6e" (double %)) "0.000000e+00") flat-vals))
                 val-str (str/join ", " val-strs)
                 n (count flat-vals)
                 type-1d (str "tensor<" n "x" dtype-str ">")]
@@ -251,6 +271,14 @@
             out-type (get var-types out-var "tensor<1x128x768xi1>")
             dir (get attrs :comparison_direction "EQ")]
         (str "    %" (name out-var) " = \"stablehlo.compare\"(%" (name in0) ", %" (name in1) ") {comparison_direction = #stablehlo<comparison_direction " dir ">} : (" in0-t ", " in1-t ") -> " out-type))
+
+      (= op :stablehlo/select)
+      (let [[pred on-true on-false] invars
+            pred-t (get var-types pred "tensor<1x128x768xi1>")
+            true-t (get var-types on-true "tensor<1x128x768xf32>")
+            false-t (get var-types on-false true-t)
+            out-type (get var-types out-var true-t)]
+        (str "    %" (name out-var) " = \"stablehlo.select\"(%" (name pred) ", %" (name on-true) ", %" (name on-false) ") : (" pred-t ", " true-t ", " false-t ") -> " out-type))
 
       (= op :stablehlo/gather)
       (let [[operand start-indices] invars
@@ -301,12 +329,12 @@
             starts (get attrs :start_indices [0 0 0])
             limits (get attrs :limit_indices [1 128 768])
             strides (get attrs :strides [1 1 1])
-            starts-str (str/join ", " starts)
-            limits-str (str/join ", " limits)
-            strides-str (str/join ", " strides)]
+            starts-str (str/join ", " (map #(if (number? %) (long %) 0) starts))
+            limits-str (str/join ", " (map #(if (number? %) (long %) 1) limits))
+            strides-str (str/join ", " (map #(if (number? %) (long %) 1) strides))]
         (str "    %" (name out-var) " = \"stablehlo.slice\"(%" (name in-var) ") {"
-             "start_indices = array<i64: " starts-str ">, "
              "limit_indices = array<i64: " limits-str ">, "
+             "start_indices = array<i64: " starts-str ">, "
              "strides = array<i64: " strides-str ">} : (" in-type ") -> " out-type))
 
       (= op :stablehlo/dynamic_update_slice)
@@ -339,6 +367,44 @@
                          op-type ", " up-type ", " (str/join ", " (repeat rank "tensor<i64>")) ") -> " out-type)]
         (str/join "\n" (concat const-lines [op-line])))
 
+      (= op :stablehlo/dynamic_slice)
+      (let [[op-var _idx-var] invars
+            op-type (get var-types op-var "tensor<1x1x12288x256xf32>")
+            out-type (get var-types out-var op-type)
+            slice-sizes (get attrs :slice_sizes [1 1 12288 256])
+            sizes-attr (str "array<i64: " (str/join ", " slice-sizes) ">")
+            starts (get attrs :start_indices [0 0 0 0])
+            [in-dims _in-dtype] (or (parse-tensor-dims op-type) [[1 1 12288 256] "f32"])
+            rank (count in-dims)
+            prep-info (mapv (fn [i idx]
+                              (let [c-var (str (name out-var) "_s" i)]
+                                (cond
+                                  (or (and (map? idx) (:id idx)) (keyword? idx) (symbol? idx))
+                                  (let [v-id (if (map? idx) (:id idx) idx)
+                                        v-type (get var-types v-id "tensor<1xi32>")
+                                        [v-dims _] (or (parse-tensor-dims v-type) [[1] "i32"])
+                                        v-1d (str "tensor<" (str/join "x" v-dims) "xi64>")]
+                                    [(str "    %" c-var "_1d = \"stablehlo.convert\"(%" (name v-id) ") : (" v-type ") -> " v-1d "\n"
+                                          "    %" c-var " = stablehlo.reshape %" c-var "_1d : (" v-1d ") -> tensor<i64>")
+                                     (str "%" c-var)])
+
+                                  :else
+                                  [(str "    %" c-var " = stablehlo.constant dense<" (long idx) "> : tensor<i64>")
+                                   (str "%" c-var)])))
+                            (range rank) starts)
+            const-lines (vec (remove nil? (map first prep-info)))
+            idx-args (str/join ", " (map second prep-info))
+            op-line (str "    %" (name out-var) " = \"stablehlo.dynamic_slice\"(%" (name op-var) ", " idx-args ") {slice_sizes = " sizes-attr "} : ("
+                         op-type ", " (str/join ", " (repeat rank "tensor<i64>")) ") -> " out-type)]
+        (str/join "\n" (concat const-lines [op-line])))
+
+      (= op :stablehlo/iota)
+      (let [len (get attrs :len 128)
+            dt (name (get attrs :dtype :i32))
+            out-type (str "tensor<" len "x" dt ">")
+            dim (get attrs :iota_dimension 0)]
+        (str "    %" (name out-var) " = \"stablehlo.iota\"() {iota_dimension = " dim " : i64} : () -> " out-type))
+
       (= op :stablehlo/concatenate)
       (let [in-args (str/join ", " (map #(str "%" (name %)) invars))
             in-types (str/join ", " (map #(get var-types % "tensor<1x8x128x64xf32>") invars))
@@ -361,7 +427,7 @@
                           :stablehlo/reduce_mean "stablehlo.add")
             is-int-dtype? (boolean (re-find #"^(?:i32|i64|i8|i1|ui8|ui32|si32)$" (str in-dtype)))
             init-const (cond
-                         (= op :stablehlo/reduce_max) (if is-int-dtype? "-2147483648" "-1.000000e+30")
+                         (= op :stablehlo/reduce_max) (if is-int-dtype? "0" "-1.000000e+30")
                          :else (if is-int-dtype? "0" "0.000000e+00"))
             norm-axes-set (set norm-axes)
             reduced-dims (mapv #(nth in-dims %) (filter #(not (norm-axes-set %)) (range rank)))

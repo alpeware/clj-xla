@@ -270,6 +270,7 @@
         eqn {:op :stablehlo/reshape
              :invars [(:id tx)]
              :outvars [out-id]
+             :type out-type
              :attrs {:shape new-shape}}]
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))
@@ -286,6 +287,7 @@
         eqn {:op :stablehlo/transpose
              :invars [(:id tx)]
              :outvars [out-id]
+             :type out-type
              :attrs {:permutation permutation}}]
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))
@@ -301,6 +303,7 @@
         eqn {:op :stablehlo/broadcast_in_dim
              :invars [(:id tx)]
              :outvars [out-id]
+             :type out-type
              :attrs {:broadcast_dimensions bcast-dims :target_shape target-shape}}]
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))
@@ -315,14 +318,18 @@
         out-shape (mapv (fn [i]
                           (let [s (nth start-indices i 0)
                                 l (nth limit-indices i (nth in-shape i))
-                                st (nth strides i 1)]
-                            (long (Math/ceil (clojure.core// (double (clojure.core/- l s)) (double st))))))
+                                st (nth strides i 1)
+                                s-num (if (tracer? s) 0 (long s))
+                                l-num (if (tracer? l) (long (nth in-shape i)) (long l))
+                                st-num (if (tracer? st) 1 (long st))]
+                            (long (Math/ceil (clojure.core// (double (clojure.core/- l-num s-num)) (double st-num))))))
                         (range rank))
         out-type [t-kw out-shape dtype]
         out-id (gen-var-id! "t_slice")
         eqn {:op :stablehlo/slice
              :invars [(:id tx)]
              :outvars [out-id]
+             :type out-type
              :attrs {:start_indices start-indices
                      :limit_indices limit-indices
                      :strides strides}}]
@@ -342,6 +349,35 @@
              :invars [(:id t-op) (:id t-up)]
              :outvars [out-id]
              :attrs {:start_indices start-indices}}]
+    (when *trace-ctx*
+      (swap! (:eqns *trace-ctx*) conj eqn))
+    (->Tracer out-id out-type)))
+
+(defn dynamic-slice
+  "Extracts a dynamic slice from `operand` starting at `start-indices` with slice size `slice-sizes`."
+  [operand start-indices slice-sizes]
+  (let [t-op (emit-constant! operand nil)
+        [t-kw _ dtype] (:type t-op)
+        out-type [t-kw (vec slice-sizes) dtype]
+        out-id (gen-var-id! "t_ds")
+        eqn {:op :stablehlo/dynamic_slice
+             :invars [(:id t-op)]
+             :outvars [out-id]
+             :attrs {:start_indices start-indices :slice_sizes slice-sizes}}]
+    (when *trace-ctx*
+      (swap! (:eqns *trace-ctx*) conj eqn))
+    (->Tracer out-id out-type)))
+
+(defn iota
+  "Generates a 1D tensor of sequence indices [0 1 2 ... len-1] along dimension 0."
+  [len dtype]
+  (let [dt (or dtype :i32)
+        out-type [:tensor [(long len)] dt]
+        out-id (gen-var-id! "t_iota")
+        eqn {:op :stablehlo/iota
+             :invars []
+             :outvars [out-id]
+             :attrs {:iota_dimension 0 :len len :dtype dt}}]
     (when *trace-ctx*
       (swap! (:eqns *trace-ctx*) conj eqn))
     (->Tracer out-id out-type)))
@@ -442,6 +478,40 @@
   "Compares elements of `a` and `b` with specified direction (\"EQ\", \"NE\", \"GE\", \"GT\", \"LE\", \"LT\")."
   [a b direction]
   (binary-elementwise-op :stablehlo/compare "t_cmp" a b {:comparison_direction (str direction)} :i1))
+
+(defn select
+  "Elementwise selection: returns `on-true` where `pred` is true, else `on-false`."
+  [pred on-true on-false]
+  (let [t-pred (emit-constant! pred nil)
+        [_ pred-shape _] (:type t-pred)
+        t-true-raw (emit-constant! on-true nil)
+        t-false-raw (emit-constant! on-false (:type t-true-raw))
+        [t-kw true-shape dtype] (:type t-true-raw)
+        out-shape (broadcast-shapes pred-shape true-shape)
+        rank-out (clojure.core/count out-shape)
+        t-pred-b (if (= pred-shape out-shape)
+                   t-pred
+                   (let [rank (clojure.core/count pred-shape)
+                         bcast-dims (vec (map int (range (clojure.core/- rank-out rank) rank-out)))]
+                     (broadcast-in-dim t-pred out-shape bcast-dims)))
+        t-true-b (if (= true-shape out-shape)
+                   t-true-raw
+                   (let [rank (clojure.core/count true-shape)
+                         bcast-dims (vec (map int (range (clojure.core/- rank-out rank) rank-out)))]
+                     (broadcast-in-dim t-true-raw out-shape bcast-dims)))
+        t-false-b (if (= (second (:type t-false-raw)) out-shape)
+                    t-false-raw
+                    (let [rank (clojure.core/count (second (:type t-false-raw)))
+                          bcast-dims (vec (map int (range (clojure.core/- rank-out rank) rank-out)))]
+                      (broadcast-in-dim t-false-raw out-shape bcast-dims)))
+        out-type [t-kw out-shape dtype]
+        out-id (gen-var-id! "t_select")
+        eqn {:op :stablehlo/select
+             :invars [(:id t-pred-b) (:id t-true-b) (:id t-false-b)]
+             :outvars [out-id]}]
+    (when *trace-ctx*
+      (swap! (:eqns *trace-ctx*) conj eqn))
+    (->Tracer out-id out-type)))
 
 (defn eq [a b] (compare-t a b "EQ"))
 

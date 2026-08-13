@@ -1,7 +1,7 @@
 (ns clj-xla.nn.attention
   "Causal self-attention, GQA, and RoPE positioning mechanisms."
   (:refer-clojure :exclude [+ * - /])
-  (:require [clj-xla.tensor :refer [+ * - / broadcast-in-dim concatenate convert cos sin dynamic-update-slice exp dot-general matmul maximum reduce-max reduce-sum reshape slice tanh transpose]]))
+  (:require [clj-xla.tensor :refer [+ * - / broadcast-in-dim concatenate convert cos sin dynamic-update-slice exp dot-general matmul reduce-max reduce-sum reshape slice tanh transpose]]))
 
 (defn linear
   "Linear projection layer: x @ w + b."
@@ -131,10 +131,19 @@
           pos-val (if (clj-xla.tensor/tracer? pos) pos (extract-pos-int pos))
           starts (assoc (vec (repeat rank 0)) seq-dim pos-val)
           new-val-typed (if (= cache-dtype nv-dtype) new-val (convert new-val cache-dtype))
-          updated (dynamic-update-slice cache new-val-typed starts)
+          len-num (or (extract-pos-int len) (when (number? len) (long len)) 0)
+          max-len-num (or (extract-pos-int max-len) (when (number? max-len) (long max-len)) 0)
+          should-slice? (and (pos? len-num) (pos? max-len-num) (> len-num max-len-num))
+          sliced-new-val (if should-slice?
+                           (slice new-val-typed [0 0 (clojure.core/- (long len-num) (long max-len-num)) 0] (vec new-shape) [1 1 1 1])
+                           new-val-typed)
+          effective-starts (if should-slice?
+                             (vec (repeat rank 0))
+                             starts)
+          updated (dynamic-update-slice cache sliced-new-val effective-starts)
           active (if (clj-xla.tensor/tracer? pos)
                    updated
-                   (let [end-pos (clojure.core/+ pos-val len)
+                   (let [end-pos (min (clojure.core/+ pos-val len) max-len)
                          starts-1 (assoc (vec (repeat rank 0)) seq-dim 0)
                          active-limits (assoc (vec shape) seq-dim end-pos)
                          strides (vec (repeat rank 1))]
@@ -160,24 +169,45 @@
    (update-kv-cache [k-cache v-cache] new-k new-v pos)))
 
 (defn generate-causal-mask
-  ([seq-len] (generate-causal-mask seq-len seq-len 0))
-  ([q-len kv-len pos]
-   (if (clj-xla.tensor/tracer? pos)
-     (let [indices-vec (vec (for [j (range kv-len)] (double j)))
-           indices-const (clj-xla.tensor/emit-constant! [[[[indices-vec]]]] [:tensor [1 1 1 kv-len] :f32])
-           zero-const (clj-xla.tensor/emit-constant! 0.0 [:tensor [] :f32])
-           mask-scale (clj-xla.tensor/emit-constant! -10000.0 [:tensor [] :f32])
-           pos-f32 (convert pos :f32)
-           pos-4d (reshape pos-f32 [1 1 1 1])
-           diff (- indices-const pos-4d)
-           relu-diff (maximum diff zero-const)
-           causal-mask (* relu-diff mask-scale)]
-       causal-mask)
+  ([seq-len] (generate-causal-mask seq-len seq-len 0 nil))
+  ([q-len kv-len pos] (generate-causal-mask q-len kv-len pos nil))
+  ([q-len kv-len pos sliding-window]
+   (if (or (clj-xla.tensor/tracer? pos) (clj-xla.tensor/tracer? q-len) (clj-xla.tensor/tracer? kv-len)
+           (not (number? q-len)) (not (number? kv-len))
+           (> (clojure.core/* (long q-len) (long kv-len)) 1000000))
+     (let [i-iota (convert (clj-xla.tensor/iota q-len :i32) :f32)
+           j-iota (convert (clj-xla.tensor/iota kv-len :i32) :f32)
+           i-const (reshape i-iota [1 1 q-len 1])
+           j-const (reshape j-iota [1 1 1 kv-len])
+           p-const (cond
+                     (and (clj-xla.tensor/tracer? pos) (= (second (:type pos)) [1]))
+                     (reshape (convert pos :f32) [1 1 1 1])
+
+                     (number? pos)
+                     (clj-xla.tensor/emit-constant! (double pos) [:tensor [1 1 1 1] :f32])
+
+                     :else
+                     (clj-xla.tensor/emit-constant! 0.0 [:tensor [1 1 1 1] :f32]))
+           effective-i (+ i-const p-const)
+           diff (- j-const effective-i)
+           zero-4d (broadcast-in-dim (reshape (clj-xla.tensor/emit-constant! [0.0] [:tensor [1] :f32]) [1 1 1 1]) [1 1 q-len kv-len] [0 1 2 3])
+           gt-zero (clj-xla.tensor/compare-t diff zero-4d "GT")
+           mask-val (broadcast-in-dim (reshape (clj-xla.tensor/emit-constant! [-10000.0] [:tensor [1] :f32]) [1 1 1 1]) [1 1 q-len kv-len] [0 1 2 3])
+           zero-val (broadcast-in-dim (reshape (clj-xla.tensor/emit-constant! [0.0] [:tensor [1] :f32]) [1 1 1 1]) [1 1 q-len kv-len] [0 1 2 3])
+           masked-gt (clj-xla.tensor/select gt-zero mask-val zero-val)]
+       (if (and (number? sliding-window) (pos? sliding-window))
+         (let [sw-val (double (- (double sliding-window)))
+               sw-4d (broadcast-in-dim (reshape (clj-xla.tensor/emit-constant! [sw-val] [:tensor [1] :f32]) [1 1 1 1]) [1 1 q-len kv-len] [0 1 2 3])
+               lt-sw (clj-xla.tensor/compare-t diff sw-4d "LT")]
+           (clj-xla.tensor/select lt-sw mask-val masked-gt))
+         masked-gt))
      (let [p (extract-pos-int pos)]
        (clj-xla.tensor/emit-constant!
         [[(vec (for [i (range q-len)]
                  (vec (for [j (range kv-len)]
-                        (if (clojure.core/<= j (clojure.core/+ p i)) 0.0 -10000.0)))))]]
+                        (let [p-i (clojure.core/+ p i)
+                              too-far (and (number? sliding-window) (pos? sliding-window) (clojure.core/< j (clojure.core/- p-i sliding-window)))]
+                          (if (or (clojure.core/> j p-i) too-far) -10000.0 0.0))))))]]
         [:tensor [1 1 q-len kv-len] :f32])))))
 
 (defn causal-self-attention
@@ -308,7 +338,7 @@
                          scaled-scores)
 
          ;; 5. Causal Mask and Softmax
-         causal-mask (generate-causal-mask q-len kv-len (or pos 0))
+         causal-mask (generate-causal-mask q-len kv-len (or pos 0) (get opts :sliding-window nil))
          masked-scores (+ capped-scores causal-mask)
          max-s (reduce-max masked-scores :axes [-1] :keep-dims true)
          exp-s (exp (- masked-scores max-s))
