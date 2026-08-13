@@ -1,6 +1,7 @@
 (ns clj-xla.test-runner
   "Main CLI entrypoint for running the complete test suite."
-  (:require [clj-xla.autodiff-test]
+  (:require [clj-xla.agent-test]
+            [clj-xla.autodiff-test]
             [clj-xla.benchmark.core-test]
             [clj-xla.benchmark.runner-test]
             [clj-xla.benchmark.workloads-test]
@@ -70,6 +71,7 @@
                            'clj-xla.fetch-pjrt-binaries-test
                            'clj-xla.debug-test
                            'clj-xla.profile-test
+                           'clj-xla.agent-test
                            'clj-xla.core-test)
         rocm-res (isolated-runner/run-isolated-test 'clj-xla.integration.rocm-e2e-test {"HIP_VISIBLE_DEVICES" "0" "ROCR_VISIBLE_DEVICES" "0"})
         sycl-res (isolated-runner/run-isolated-test 'clj-xla.integration.sycl-e2e-test)

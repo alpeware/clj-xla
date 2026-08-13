@@ -8,7 +8,7 @@
             [clj-xla.safetensors :as st]
             [clj-xla.tensor :as t]
             [clj-xla.tokenizer.core :as tok]
-            [clj-xla.tokenizer.protocol :refer [bos-id decode encode]]
+            [clj-xla.tokenizer.protocol :refer [bos-id decode encode eos-id]]
             [clj-xla.trace :refer [trace-graph]]
             [clojure.data.json :as json]
             [clojure.java.io :as io]
@@ -526,8 +526,8 @@
      :decode decode-exec}))
 
 (defn run-autoregressive-generation
-  "Runs autoregressive text generation using Dual-Graph In-VRAM KV-Caching."
-  [{:keys [ctx opts config]} execs device-weights prompt-ids]
+  "Executes In-VRAM Autoregressive Loop using Dual Gemma 4 Executables."
+  [{:keys [ctx opts config tokenizer]} execs device-weights prompt-ids]
   (let [{:keys [max-new-tokens quiet]} opts
         {:keys [num-layers layer-configs norm-enum]} config
         {:keys [prefill decode]} execs
@@ -571,7 +571,7 @@
            cur-tok-id first-tok
            gen-ids [first-tok]
            cur-kv-bufs updated-kv-bufs]
-      (if (or (>= step max-new-tokens) (= cur-tok-id 1) (= cur-tok-id 107))
+      (if (or (>= step max-new-tokens) (= cur-tok-id 1) (= cur-tok-id (eos-id tokenizer)))
         (let [t2 (System/nanoTime)
               total-ms (/ (- t2 t0) 1e6)
               gen-count (count gen-ids)
@@ -667,6 +667,13 @@
           (println "=== Single Fused XLA GPU Forward Pass Verification Passed! ===")
           (println "=================================================================="))
         final-context))))
+
+(defn generate-text-string
+  "Generates text response using Gemma 4 model session and returns decoded text string."
+  [session prompt]
+  (let [{:keys [tokenizer]} session
+        final-context (generate-text session prompt)]
+    (decode tokenizer final-context)))
 
 (defn- find-libjsig
   "Searches standard JDK paths for libjsig.so."
