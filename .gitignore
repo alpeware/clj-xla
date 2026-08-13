@@ -39,6 +39,8 @@ verification/torch_dumps/
 
 core.[0-9]*
 
+scratch/
+
 # emacs
 .env
 *~
