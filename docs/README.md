@@ -39,6 +39,16 @@ Explore theoretical formulations paired with pure Clojure reference code:
 
 ---
 
+## ⚙️ OpenXLA & PJRT Hardware Knowledge Base ([`xla/`](xla/README.md))
+
+Technical specifications for long-running autonomous AI agent loops, OpenXLA hardware limits, and VRAM memory optimization algorithms:
+
+- ⚙️ **[OpenXLA & PJRT Hardware Limitations](xla/pjrt_limitations.md)**: FFM struct layout ABI (`PJRT_ExecuteOptions`), signal chaining (`libjsig.so`), 128-byte hardware memory alignment, and 32-bit `dynamic_update_slice` compiler lowerings.
+- 🔁 **[In-VRAM Autonomous Agent Execution Loop](xla/agent_vram_loop.md)**: Single-fused `stablehlo.while` execution graph, state tuple representation, in-graph sampling, and zero-copy direct device memory transfers.
+- 🧩 **[Paged KV-Cache & Long-Context VRAM Allocation](xla/paged_attention_vram.md)**: VRAM math for 256K contexts, PagedAttention block tables in StableHLO, sliding-window eviction, and FP8/INT8 in-graph quantized KV-caches.
+
+---
+
 ## 🏛️ Model Specifications Index & Visual Trace Graphs
 
 Every supported model family includes architectural details, hyperparameter specifications, and visual Mermaid diagrams of its StableHLO execution graph:

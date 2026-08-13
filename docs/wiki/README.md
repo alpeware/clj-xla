@@ -50,3 +50,8 @@ This Wiki serves as an open, educational reference for state-of-the-art LLM arch
 - **Post-Training Quantization (PTQ)**: INT8, INT4, AWQ, and GPTQ.
 - **In-Graph De-quantization**: Fusing integer-to-float weight conversion with GEMM matrix multiplication in StableHLO MLIR.
 - Reference Implementation: [`clj-xla.safetensors`](../../src/clj_xla/safetensors.clj).
+
+### 9. ⚙️ [OpenXLA PJRT Hardware & In-VRAM Agent Execution](../xla/README.md)
+- **Hardware Limitations**: Struct ABI alignment, signal interposition, 128-byte alignment, 32-bit compiler lowerings ([`pjrt_limitations.md`](../xla/pjrt_limitations.md)).
+- **In-VRAM Agent Loop**: Single-fused `stablehlo.while` execution graph, state tuple representation ([`agent_vram_loop.md`](../xla/agent_vram_loop.md)).
+- **Paged Attention & Memory Math**: StableHLO block tables, sliding-window eviction, and FP8/INT8 quantized KV-caches ([`paged_attention_vram.md`](../xla/paged_attention_vram.md)).
