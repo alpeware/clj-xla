@@ -6,6 +6,7 @@
             [clj-xla.benchmark.workloads-test]
             [clj-xla.compile-test]
             [clj-xla.core-test]
+            [clj-xla.debug-test]
             [clj-xla.download-hf-test]
             [clj-xla.fetch-pjrt-binaries-test]
             [clj-xla.generation-test]
@@ -21,6 +22,7 @@
             [clj-xla.opt-test]
             [clj-xla.pjrt-test]
             [clj-xla.pjrt.version-test]
+            [clj-xla.profile-test]
             [clj-xla.safetensors-test]
             [clj-xla.sampling-test]
             [clj-xla.stablehlo-test]
@@ -66,6 +68,8 @@
                            'clj-xla.generation-test
                            'clj-xla.download-hf-test
                            'clj-xla.fetch-pjrt-binaries-test
+                           'clj-xla.debug-test
+                           'clj-xla.profile-test
                            'clj-xla.core-test)
         rocm-res (isolated-runner/run-isolated-test 'clj-xla.integration.rocm-e2e-test {"HIP_VISIBLE_DEVICES" "0" "ROCR_VISIBLE_DEVICES" "0"})
         sycl-res (isolated-runner/run-isolated-test 'clj-xla.integration.sycl-e2e-test)

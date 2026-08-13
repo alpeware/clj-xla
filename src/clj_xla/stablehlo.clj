@@ -528,7 +528,27 @@
                           [(conj v-strs (str "%" inv-name)) p-lines-curr])))
                     [[] []]
                     (map vector invars in-types))
-            op-line (str "    %" (name out-var) " = " mlir-op " " (str/join ", " in-vars-str) " : " out-type)]
+            loc-str (when-let [opn (get-in eqn [:metadata :op-name])]
+                      (str " loc(\"" opn "\")"))
+            raw-op-line (cond
+                          (= op :debug/check-non-nan)
+                          (let [in-var (first invars)
+                                in-t (get var-types in-var "tensor<f32>")]
+                            (str "    %" (name out-var) " = \"stablehlo.custom_call\"(%" (name in-var) ") {call_target_name = \"check_non_nan\"} : (" in-t ") -> tensor<i1>"))
+
+                          (= op :debug/check-non-inf)
+                          (let [in-var (first invars)
+                                in-t (get var-types in-var "tensor<f32>")]
+                            (str "    %" (name out-var) " = \"stablehlo.custom_call\"(%" (name in-var) ") {call_target_name = \"check_non_inf\"} : (" in-t ") -> tensor<i1>"))
+
+                          (= op :debug/print)
+                          (let [in-var (first invars)
+                                in-t (get var-types in-var "tensor<f32>")]
+                            (str "    %" (name out-var) " = \"stablehlo.custom_call\"(%" (name in-var) ") {call_target_name = \"debug_print\"} : (" in-t ") -> tensor<i1>"))
+
+                          :else
+                          (str "    %" (name out-var) " = " mlir-op " " (str/join ", " in-vars-str) " : " out-type))
+            op-line (str raw-op-line (or loc-str ""))]
         (str/join "\n" (concat prep-lines [op-line]))))))
 
 (defn graph->mlir-text

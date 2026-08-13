@@ -4,6 +4,7 @@
             [clj-xla.models.gemma :as gemma]
             [clj-xla.nn.norm :as norm]
             [clj-xla.pjrt :as pjrt]
+            [clj-xla.profile :as profile]
             [clj-xla.safetensors :as st]
             [clj-xla.tensor :as t]
             [clj-xla.tokenizer.core :as tok]
@@ -11,6 +12,7 @@
             [clj-xla.trace :refer [trace-graph]]
             [clojure.data.json :as json]
             [clojure.java.io :as io]
+            [clojure.pprint :refer [pprint]]
             [clojure.string :as str])
   (:import [java.lang.foreign Arena]))
 
@@ -22,7 +24,10 @@
    :backend :cpu
    :precision :bf16
    :verbose false
-   :quiet false})
+   :quiet false
+   :profile true
+   :profile-out "scratch/gemma4_profile.edn"
+   :chrome-trace-out "scratch/gemma4_chrome_trace.json"})
 
 (def DEFAULT_MODEL_DIRS
   [".models/gemma-4-E4B-it"
@@ -630,17 +635,33 @@
         (println (format "Encoded Token IDs (%d tokens): %s" prompt-len tok-str))))
 
     (when-not quiet (println "Transferring Gemma 4 model weights to PJRT Device Memory..."))
-    (let [device-weights (allocate-device-weights session)
-          execs (compile-inference-executables session prompt-len)]
+    (let [metrics-atom (atom {})
+          trace-spans-atom (atom [])
+          device-weights (binding [profile/*active-trace-spans* trace-spans-atom]
+                           (profile/with-profile metrics-atom "weight_transfer"
+                             (allocate-device-weights session)))
+          execs (binding [profile/*active-trace-spans* trace-spans-atom]
+                  (profile/with-profile metrics-atom "graph_compilation"
+                    (compile-inference-executables session prompt-len)))]
       (when-not quiet
         (println "\nGenerating tokens autoregressively with Single Fused XLA GPU Kernel..."))
-      (let [final-context (run-autoregressive-generation session execs device-weights prompt-ids)
+      (let [final-context (binding [profile/*active-trace-spans* trace-spans-atom]
+                            (profile/with-profile metrics-atom "autoregressive_generation"
+                              (run-autoregressive-generation session execs device-weights prompt-ids)))
             generated-str (decode tokenizer final-context)]
         (println generated-str)
         (when-let [out-path (:out opts)]
           (spit out-path generated-str)
           (when-not quiet
             (println (format "\n  ↳ Written generated output to [%s]" out-path))))
+        (when-let [profile-path (:profile-out opts)]
+          (spit profile-path (with-out-str (pprint @metrics-atom)))
+          (when-not quiet
+            (println (format "  ↳ Saved telemetry profile report to [%s]" profile-path))))
+        (when-let [trace-path (:chrome-trace-out opts)]
+          (profile/save-chrome-trace! @trace-spans-atom trace-path)
+          (when-not quiet
+            (println (format "  ↳ Saved Chrome tracing JSON to [%s]" trace-path))))
         (when-not quiet
           (println "\n==================================================================")
           (println "=== Single Fused XLA GPU Forward Pass Verification Passed! ===")

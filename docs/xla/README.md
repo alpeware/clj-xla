@@ -36,6 +36,12 @@ Autonomous software agents require fast, low-latency, and continuous autoregress
 - **Chunked Sequence Updates**: Preventing 32-bit indexing overflows via block-padded slice mutations.
 - **In-Graph Quantized KV Cache**: FP8 and INT8 KV-cache quantization for 4x VRAM memory reduction.
 
+### 4. 🔍 [Debugging, Profiling, and Tracing](debugging_profiling_tracing.md)
+- **Debugging & Location Metadata**: Scoped `with-xla-metadata` annotations (`loc("gemma/layer_12/attn")`) and `checkify` NaN/Inf runtime assertions.
+- **Micro-second Telemetry Spans**: `with-profile` microsecond latency measurements for weight transfer, compilation, prefill, and decode.
+- **Chrome Trace & Perfetto Export**: Exporting profile spans to Chrome Tracing JSON format (`chrome://tracing` / `ui.perfetto.dev`).
+- **Empirical Optimization Analysis**: Observations and recommendations for Gemma 4 performance scaling.
+
 ---
 
 ## 🏛️ System Architecture Overview

@@ -11,7 +11,7 @@
   [val]
   (instance? Tracer val))
 
-(defn- gen-var-id! [prefix]
+(defn gen-var-id! [prefix]
   (if *trace-ctx*
     (keyword (str prefix "_" (swap! (:var-counter *trace-ctx*) inc)))
     (keyword (str prefix "_" (gensym)))))
