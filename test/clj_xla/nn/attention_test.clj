@@ -72,3 +72,10 @@
       (is (tracer? out))
       (is (= [:tensor [1 1 768] :f32] (:type out)))
       (is (vector? updated-kv)))))
+
+(defspec prop-partial-rotary-rope 50
+  (prop/for-all [rope-factor (gen/elements [0.25 0.5 1.0])]
+                (let [q (t/->Tracer :q [:tensor [1 8 16 256] :f32])
+                      q-rope (attn/apply-rope q nil [0] 256 1000000.0 nil nil rope-factor)]
+                  (and (tracer? q-rope)
+                       (= [:tensor [1 8 16 256] :f32] (:type q-rope))))))

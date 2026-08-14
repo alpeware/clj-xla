@@ -1,6 +1,21 @@
 (ns clj-xla.sampling
   "Model-agnostic logit sampling math (Temperature, Top-K, Top-P, Softmax sampling).")
 
+(defn apply-repetition-penalty
+  "Applies repetition penalty to float logits for tokens present in `seen-ids`.
+   For positive logits: logit / penalty. For negative logits: logit * penalty."
+  [logits seen-ids penalty]
+  (if (or (nil? penalty) (<= penalty 1.0) (empty? seen-ids))
+    logits
+    (let [seen-set (set seen-ids)]
+      (mapv (fn [[idx logit]]
+              (if (contains? seen-set idx)
+                (if (pos? logit)
+                  (/ logit penalty)
+                  (* logit penalty))
+                logit))
+            (map-indexed vector logits)))))
+
 (defn apply-temperature
   "Scales logits by temperature: logits / temp."
   [logits temp]
@@ -52,8 +67,10 @@
    Opts map supports {:temperature :top-k :top-p}."
   ([logits]
    (sample-logits logits {}))
-  ([logits {:keys [temperature top-k top-p] :or {temperature 1.0 top-k 0 top-p 1.0}}]
-   (let [filtered (-> logits
+  ([logits {:keys [temperature top-k top-p repetition-penalty seen-ids]
+            :or {temperature 1.0 top-k 0 top-p 1.0 repetition-penalty 1.0 seen-ids []}}]
+   (let [penalized (apply-repetition-penalty logits seen-ids repetition-penalty)
+         filtered (-> penalized
                       (apply-temperature temperature)
                       (apply-top-k top-k)
                       (apply-top-p top-p))

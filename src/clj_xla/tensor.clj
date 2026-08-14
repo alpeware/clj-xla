@@ -392,13 +392,14 @@
         idx-rank (clojure.core/count idx-shape)
         ;; Ensure start_indices is expanded so its last dimension is index_vector_dim (size 1)
         t-idx (cond
-                (= idx-rank 2) (reshape raw-idx [(nth idx-shape 0) (nth idx-shape 1) 1])
+                (= idx-rank 0) (reshape raw-idx [1])
                 (= idx-rank 1) (reshape raw-idx [(nth idx-shape 0) 1])
+                (= idx-rank 2) (reshape raw-idx [(nth idx-shape 0) (nth idx-shape 1) 1])
                 :else raw-idx)
         [_ final-idx-shape _] (:type t-idx)
         final-idx-rank (clojure.core/count final-idx-shape)
         hidden-dim (last op-shape)
-        out-shape (conj idx-shape hidden-dim)
+        out-shape (if (zero? idx-rank) [hidden-dim] (conj idx-shape hidden-dim))
         out-type [op-kw out-shape dtype]
         out-id (gen-var-id! "t_gather")
         eqn {:op :stablehlo/gather

@@ -4,7 +4,7 @@
   (:require [clj-xla.nn.activations :refer [gelu]]
             [clj-xla.nn.attention :refer [apply-rope gqa-causal-attention]]
             [clj-xla.nn.norm :refer [gemma-rms-norm rms-norm]]
-            [clj-xla.tensor :refer [* + / dot-general emit-constant! gather matmul reshape slice tanh transpose]]))
+            [clj-xla.tensor :refer [* + / dot-general emit-constant! gather matmul reshape sigmoid slice tanh transpose]]))
 (defn linear [x w b]
   (let [tx (emit-constant! x nil)
         tw (emit-constant! w nil)
@@ -14,9 +14,10 @@
         w-rank (count w-shape)
         x-in-dim (last x-shape)
         w-dim0 (first w-shape)
-        out (if (and (= w-rank 2) (= w-dim0 x-in-dim))
+        contract-rhs (if (= w-dim0 x-in-dim) 0 (dec w-rank))
+        out (if (and (= x-rank 2) (= w-rank 2) (= w-dim0 x-in-dim))
               (matmul tx tw)
-              (dot-general tx tw {:contracting_dims {:lhs [(dec x-rank)] :rhs [(dec w-rank)]}}))]
+              (dot-general tx tw {:contracting_dims {:lhs [(dec x-rank)] :rhs [contract-rhs]}}))]
     (if (some? b)
       (+ out b)
       out)))
@@ -147,7 +148,10 @@
          theta-base (or theta-base 10000.0)
          rope-proportion (or rope-proportion 1.0)
          q (linear x (transpose q-w [1 0]) nil)
-         [_ [batch seq-len q-proj-dim] _] (:type q)
+         q-shape (second (:type q))
+         batch (if (= (count q-shape) 3) (first q-shape) 1)
+         seq-len (if (= (count q-shape) 3) (second q-shape) 1)
+         q-proj-dim (last q-shape)
          h-dim (or (:head-dim opts) (quot q-proj-dim num-heads))
          q-4d (transpose (reshape q [batch seq-len num-heads h-dim]) [0 2 1 3])
          q-normed (if (some? q-norm-w) (norm-fn q-4d q-norm-w 1e-6) q-4d)
@@ -161,7 +165,8 @@
                  k (linear x k-w-t nil)
                  v-raw (linear x v-w-t nil)
                  v (if (some? q-norm-w) (rms-norm v-raw nil 1e-6) v-raw)
-                 [_ [_ _ kv-dim] _] (:type k)
+                 k-shape (second (:type k))
+                 kv-dim (last k-shape)
                  l-nkv (quot kv-dim h-dim)
                  k-4d (transpose (reshape k [batch seq-len l-nkv h-dim]) [0 2 1 3])
                  k-normed (if (some? k-norm-w) (norm-fn k-4d k-norm-w 1e-6) k-4d)
@@ -173,7 +178,8 @@
          q-rope-3d (reshape (transpose q-rope [0 2 1 3]) [batch seq-len q-proj-dim])
          attn-scale (get opts :scale (if (some? q-norm-w) 1.0 (/ 1.0 (Math/sqrt (double h-dim)))))
          attn-opts {:scale attn-scale}
-         [_ [_ _ kv-dim] _] (:type k-rope-3d)
+         kr-shape (second (:type k-rope-3d))
+         kv-dim (last kr-shape)
          l-nkv (quot kv-dim h-dim)
          attn-res (if (some? past-kv)
                     (gqa-causal-attention q-rope-3d k-rope-3d v o-w num-heads l-nkv attn-softcap past-kv pos attn-opts)
@@ -221,7 +227,7 @@
                    (let [pl-gate (transpose per-layer-gate-w [1 0])
                          pl-proj (transpose per-layer-proj-w [1 0])
                          gate-raw (linear mlp-out pl-gate nil)
-                         act-gate (gelu gate-raw)
+                         act-gate (sigmoid gate-raw)
                          gated (* act-gate per-layer-input)
                          proj-raw (linear gated pl-proj nil)
                          normed (if post-per-layer-norm-w (norm-fn proj-raw post-per-layer-norm-w 1e-6) proj-raw)]
@@ -282,7 +288,9 @@
   ([x embed-tokens embed-per-layer per-layer-model-proj-w per-layer-proj-norm-w layers-weights final-norm-w pos-ids num-heads num-kv-heads kv-caches pos]
    (full-gemma4-forward x embed-tokens embed-per-layer per-layer-model-proj-w per-layer-proj-norm-w layers-weights final-norm-w pos-ids num-heads num-kv-heads kv-caches pos {}))
   ([x embed-tokens embed-per-layer per-layer-model-proj-w per-layer-proj-norm-w layers-weights final-norm-w pos-ids num-heads num-kv-heads kv-caches pos opts]
-   (let [[_ [batch seq-len] _] (:type x)
+   (let [x-shape (second (:type x))
+         batch (if (= (count x-shape) 3) (first x-shape) 1)
+         seq-len (or (second x-shape) 1)
          [_ [_vocab-size hidden-dim] _] (:type embed-tokens)
          num-layers (count layers-weights)
          num-kv-shared (or (:num-kv-shared-layers opts) 0)

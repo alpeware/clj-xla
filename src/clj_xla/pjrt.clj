@@ -475,6 +475,9 @@
                out-lists (.allocate arena ValueLayout/ADDRESS (long 1))
                _ (.setAtIndex ^MemorySegment out-lists ValueLayout/ADDRESS (long 0) out-ptrs)
                events-ptrs (.allocate arena ValueLayout/ADDRESS (long 1))
+               non-donatable (.allocate arena ValueLayout/JAVA_LONG (long num-args))
+               _ (dotimes [i num-args]
+                   (.setAtIndex ^MemorySegment non-donatable ValueLayout/JAVA_LONG (long i) (long i)))
                opts (.allocate arena (long 144))
                _ (.fill opts (byte 0))
                ;; struct_size = 112: matches the PJRT_ExecuteOptions size expected by the ROCm
@@ -482,8 +485,8 @@
                ;; The original 144 was too large and caused SEGFAULT by exposing uninitialized
                ;; fields that the plugin dereferenced.
                _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 0) (long 112))
-               _ (.set ^MemorySegment opts ValueLayout/ADDRESS (long 56) MemorySegment/NULL)
-               _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 64) (long 0))
+               _ (.set ^MemorySegment opts ValueLayout/ADDRESS (long 56) non-donatable)
+               _ (.set ^MemorySegment opts ValueLayout/JAVA_LONG (long 64) (long num-args))
                args (.allocate arena (long 80))]
            (.fill args (byte 0))
            (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 80))
@@ -510,7 +513,13 @@
                    (.set ^MemorySegment await-args ValueLayout/ADDRESS (long 16) event-ptr)
                    (let [await-handle (downcall-ptr linker api-ptr OFFSET_EVENT_AWAIT ValueLayout/ADDRESS [ValueLayout/ADDRESS])
                          await-err (.invokeWithArguments ^MethodHandle await-handle [await-args])]
-                     (check-error! api-ctx await-err)))))
+                     (check-error! api-ctx await-err)))
+                 (let [destroy-args (.allocate arena (long 24))]
+                   (.fill destroy-args (byte 0))
+                   (.set ^MemorySegment destroy-args ValueLayout/JAVA_LONG (long 0) (long 24))
+                   (.set ^MemorySegment destroy-args ValueLayout/ADDRESS (long 16) event-ptr)
+                   (let [destroy-handle (downcall-ptr linker api-ptr OFFSET_EVENT_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                         _ (.invokeWithArguments ^MethodHandle destroy-handle [destroy-args])]))))
              (if (= num-outs 1)
                (.get ^MemorySegment out-ptrs ValueLayout/ADDRESS (long 0))
                (mapv (fn [i] (.getAtIndex ^MemorySegment out-ptrs ValueLayout/ADDRESS (long i))) (range num-outs))))))))))
@@ -552,6 +561,60 @@
                 (let [destroy-handle (downcall-ptr linker api-ptr OFFSET_EVENT_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
                       _ (.invokeWithArguments ^MethodHandle destroy-handle [destroy-args])])))))
         (.toArray dst-seg ValueLayout/JAVA_FLOAT)))))
+
+(defn create-host-float-buffer-transfer-context
+  "Pre-allocates off-heap MemorySegments for zero-allocation host float transfers."
+  [num-floats]
+  (let [arena (Arena/global)
+        num-floats (long num-floats)
+        byte-size (* num-floats 4)
+        dst-seg (.allocate arena ValueLayout/JAVA_FLOAT num-floats)
+        args (.allocate arena (long 56))]
+    (.fill args (byte 0))
+    (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 56))
+    (.set ^MemorySegment args ValueLayout/ADDRESS (long 24) MemorySegment/NULL) ;; host_layout
+    (.set ^MemorySegment args ValueLayout/ADDRESS (long 32) dst-seg)            ;; dst
+    (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long byte-size))  ;; dst_size
+    (.set ^MemorySegment args ValueLayout/ADDRESS (long 48) MemorySegment/NULL) ;; event out
+    {:dst-seg dst-seg :args args :num-floats num-floats}))
+
+(defn copy-buffer-to-float-array!
+  "Copies device PJRT_Buffer `buffer-handle` into pre-allocated `^floats dst-arr` using pre-allocated `transfer-ctx`."
+  [api-ctx buffer-handle transfer-ctx ^floats dst-arr]
+  (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)
+        {:keys [^MemorySegment dst-seg ^MemorySegment args num-floats]} transfer-ctx
+        ^MemorySegment buf-seg (cond
+                                 (instance? MemorySegment buffer-handle) buffer-handle
+                                 :else buffer-handle)]
+    (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) buf-seg)
+    (.set ^MemorySegment args ValueLayout/ADDRESS (long 48) MemorySegment/NULL)
+    (let [handle (downcall-ptr linker api-ptr OFFSET_BUFFER_TO_HOST_BUFFER ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+          err (.invokeWithArguments ^MethodHandle handle [args])]
+      (check-error! api-ctx err))
+    (let [arena (Arena/ofAuto)
+          evt (.get ^MemorySegment args ValueLayout/ADDRESS (long 48))]
+      (when (and (some? evt) (not= MemorySegment/NULL evt))
+        (let [await-args (.allocate arena (long 24))]
+          (.fill await-args (byte 0))
+          (.set ^MemorySegment await-args ValueLayout/JAVA_LONG (long 0) (long 24))
+          (.set ^MemorySegment await-args ValueLayout/ADDRESS (long 16) evt)
+          (let [await-handle (downcall-ptr linker api-ptr OFFSET_EVENT_AWAIT ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                await-err (.invokeWithArguments ^MethodHandle await-handle [await-args])]
+            (check-error! api-ctx await-err)))
+        (let [destroy-args (.allocate arena (long 24))]
+          (.fill destroy-args (byte 0))
+          (.set ^MemorySegment destroy-args ValueLayout/JAVA_LONG (long 0) (long 24))
+          (.set ^MemorySegment destroy-args ValueLayout/ADDRESS (long 16) evt)
+          (let [destroy-handle (downcall-ptr linker api-ptr OFFSET_EVENT_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                _ (.invokeWithArguments ^MethodHandle destroy-handle [destroy-args])]))))
+    (MemorySegment/copy dst-seg ValueLayout/JAVA_FLOAT (long 0) dst-arr 0 (int num-floats))
+    dst-arr))
+
+(defn buffer-to-host-float-array!
+  "Copies device PJRT_Buffer `buffer-handle` into pre-allocated host float array `dst-arr`."
+  [api-ctx buffer-handle ^floats dst-arr]
+  (let [ctx (create-host-float-buffer-transfer-context (alength dst-arr))]
+    (copy-buffer-to-float-array! api-ctx buffer-handle ctx dst-arr)))
 
 (defn buffer-to-host-int-buffer
   "Copies device PJRT_Buffer `buffer-handle` to host int array, awaiting asynchronous completion."

@@ -2,21 +2,30 @@
   "Autonomous software architecture agent loop powered by Gemma 4, XLA execution, and SCI Clojure tool calling."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
+            [clj-xla.core :as xla]
             [scripts.gemma4-inference :as gemma4-inf]
             [sci.core :as sci]))
 
 (def DEFAULT_SYSTEM_PROMPT
-  "You are an autonomous senior software architecture agent equipped with a live Clojure execution environment (`sci`).
-You can execute Clojure tool code by outputting code blocks wrapped in ```clojure ... ``` or ```clj ... ```.
-The return value and printed output of your Clojure code will be fed back to you in the next observation turn.
-Use Clojure tool code to inspect system information, list files, perform math calculations, and solve user tasks.")
+  "You are an autonomous software engineering agent equipped with a live Clojure execution environment (`sci`).
+You have access to the following built-in Clojure functions:
+- (list-files \".\") to list files in a directory
+- (slurp \"path/to/file.clj\") to read file contents
+- (system-info) to inspect system metadata
+- Standard Clojure math and collection utilities (reduce, map, filter, range, +, *, etc.)
+
+To invoke a tool, write a Clojure code block formatted as:
+```clojure
+(list-files \".\")
+```
+When you receive tool output, continue your task until complete.")
 
 (def DEFAULT_AGENT_OPTS
   {:prompt "Inspect the files in the workspace and calculate the total size of Clojure source files."
    :system DEFAULT_SYSTEM_PROMPT
    :max-new-tokens 300
    :max-turns 5
-   :temperature 0.7
+   :temperature 0.0
    :top-k 10
    :backend :cpu
    :precision :bf16
@@ -26,10 +35,16 @@ Use Clojure tool code to inspect system information, list files, perform math ca
    :quiet false})
 
 (defn extract-clojure-code-blocks
-  "Extracts all ```clojure ... ``` or ```clj ... ``` code block strings from text, including unclosed blocks up to EOF."
+  "Extracts all ```clojure ... ``` or ```clj ... ``` code block strings from text, cleaning nested backtick artifacts."
   [text]
-  (let [pattern #"(?s)```(?:clojure|clj)\s*\n(.*?)(?:```|$)"]
-    (mapv str/trim (filter #(seq (str/trim %)) (mapv second (re-seq pattern text))))))
+  (let [pattern #"(?s)```(?:clojure|clj)\s*\n(.*?)(?:```|$)"
+        raw-matches (mapv str/trim (filter #(seq (str/trim %)) (mapv second (re-seq pattern text))))]
+    (mapv (fn [block]
+            (-> block
+                (str/replace #"^```[a-z]*>?" "")
+                (str/replace #"```$" "")
+                str/trim))
+          raw-matches)))
 
 (defn create-agent-sci-ctx
   "Creates a safe SCI sandbox context populated with useful Clojure agent helper functions."
@@ -97,13 +112,13 @@ Use Clojure tool code to inspect system information, list files, perform math ca
   "Formats conversation history into Gemma 4 Turn syntax."
   [system-prompt history]
   (let [sys-turn (if (seq system-prompt)
-                   (str "<|turn|>system\n" system-prompt "<turn|>\n")
+                   (str "<|turn>system\n" system-prompt "\n<turn|>\n")
                    "")]
     (str "<bos>" sys-turn
          (str/join "" (map (fn [{:keys [role content]}]
-                             (str "<|turn|>" (name role) "\n" content "<turn|>\n"))
+                             (str "<|turn>" (name role) "\n" content "\n<turn|>\n"))
                            history))
-         "<|turn|>model\n")))
+         "<|turn>model\n")))
 
 (defn run-agent-loop
   "Runs autonomous agent loop with SCI Clojure tool calling across multiple turns."
@@ -125,10 +140,10 @@ Use Clojure tool code to inspect system information, list files, perform math ca
           (let [formatted-prompt (format-agent-chat-prompt system @history)
                 _ (when-not quiet (println "Executing Gemma 4 Agent Forward Pass..."))
                 full-gen (gemma4-inf/generate-text-string session formatted-prompt)
-                model-text (if (str/includes? full-gen "<|turn|>model\n")
-                             (last (str/split full-gen #"<\|turn\|>model\n"))
+                model-text (if (re-find #"<\|turn>model" full-gen)
+                             (last (str/split full-gen #"<\|turn>model\r?\n?"))
                              full-gen)
-                model-reply (str/trim (str/replace model-text #"<bos>|<eos>|<turn\|>|<\|turn\|>" ""))
+                model-reply (str/trim (str/replace model-text #"<bos>|<eos>|<turn\|>|<\|turn>" ""))
                 code-blocks (extract-clojure-code-blocks model-reply)]
 
             (swap! history conj {:role :model :content model-reply})
@@ -162,11 +177,29 @@ Use Clojure tool code to inspect system information, list files, perform math ca
 (defn -main
   "CLI Entrypoint for Gemma 4 Agent."
   [& args]
-  (let [opts (parse-agent-cli-args args)
-        model-dir (or (:model opts)
-                      (first (filter #(.exists (io/file %)) gemma4-inf/DEFAULT_MODEL_DIRS)))
-        _ (when-not model-dir
-            (println "Error: Gemma 4 model directory not found.")
-            (System/exit 1))
-        session (gemma4-inf/init-inference-session opts)]
-    (run-agent-loop session (:prompt opts))))
+  (try
+    (let [opts (parse-agent-cli-args args)]
+      (when (gemma4-inf/needs-libjsig-reexec? opts)
+        (gemma4-inf/reexec-with-libjsig! args "scripts.gemma4-agent"))
+      (let [model-dir (or (:model opts)
+                          (first (filter #(.exists (io/file %)) gemma4-inf/DEFAULT_MODEL_DIRS)))
+            _ (when-not model-dir
+                (println "Error: Gemma 4 model directory not found.")
+                (System/exit 1))
+            session (gemma4-inf/init-inference-session opts)
+            _ (when-not (:quiet opts) (println "Transferring Gemma 4 model weights to PJRT Device Memory..."))
+            device-weights (gemma4-inf/allocate-device-weights session)
+            session (assoc session :device-weights device-weights)]
+        (try
+          (run-agent-loop session (:prompt opts))
+          (finally
+            (doseq [w device-weights]
+              (xla/destroy-buffer! (:ctx session) w))))))
+    (catch Throwable e
+      (println "\nAgent Exception:" (.getMessage e))
+      (.printStackTrace e))
+    (finally
+      (.. Runtime getRuntime (halt 0)))))
+
+(when (= *file* (System/getProperty "clojure.script.filename"))
+  (apply -main *command-line-args*))

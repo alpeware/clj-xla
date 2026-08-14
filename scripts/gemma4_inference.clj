@@ -6,6 +6,7 @@
             [clj-xla.pjrt :as pjrt]
             [clj-xla.profile :as profile]
             [clj-xla.safetensors :as st]
+            [clj-xla.sampling :as sampling]
             [clj-xla.tensor :as t]
             [clj-xla.tokenizer.core :as tok]
             [clj-xla.tokenizer.protocol :refer [bos-id decode encode eos-id]]
@@ -395,6 +396,20 @@
         needed (* (max 1 blocks) 1024)]
     (min 16384 needed)))
 
+(defn argmax-host
+  "Finds the index of the maximum float value in float array `arr`."
+  [^floats arr]
+  (let [n (alength arr)]
+    (loop [i 1
+           max-idx 0
+           max-val (aget arr 0)]
+      (if (< i n)
+        (let [v (aget arr i)]
+          (if (> v max-val)
+            (recur (inc i) i v)
+            (recur (inc i) max-idx max-val)))
+        max-idx))))
+
 (defn compile-inference-executables
   "Traces and JIT-compiles Dual Gemma 4 Execution Graphs (1 Prefill Graph + 1 Decode Step Graph)."
   [{:keys [ctx config opts]} prompt-len]
@@ -436,8 +451,8 @@
                                      [:embed_tokens [:tensor [vocab-size hidden-dim] norm-dtype]]]
                                     common-rest-invars))
 
-        decode-invars (vec (concat [[:x [:tensor [1 1] :i32]]
-                                    [:pos [:tensor [1] :i32]]
+        decode-invars (vec (concat [[:x [:tensor [1] :i32]]
+                                    [:pos [:tensor [] :i32]]
                                     [:embed_tokens [:tensor [vocab-size hidden-dim] norm-dtype]]]
                                    common-rest-invars))
 
@@ -507,9 +522,9 @@
                                         all-layer-tracers)
                            f-opts {:final-logit-softcap 30.0 :num-kv-shared-layers num-kv-shared-layers :slice-last-token? is-prefill?}
                            [logits updated-kv] (gemma/full-gemma4-forward x emb emb-pl pl-model-proj pl-proj-norm lw-seq fn-norm pos-tracer num-heads num-kv-heads init-kv-caches (if is-prefill? 0 pos-tracer) f-opts)
-                           next-tok (t/reshape (t/argmax logits :axis -1) [1 1])
+                           last-logits (t/reshape logits [vocab-size])
                            flat-updated-kv (vec (apply concat updated-kv))]
-                       (vec (concat [next-tok] flat-updated-kv)))))
+                       (vec (concat [last-logits] flat-updated-kv)))))
 
         _ (when-not quiet (println "Tracing & Compiling Gemma 4 Prefill Execution Graph (Prompt:" prompt-len "tok)..."))
         prefill-graph (trace-graph "gemma4_prefill" prefill-invars (build-fn true))
@@ -518,12 +533,25 @@
         _ (when-not quiet (println "Tracing & Compiling Gemma 4 Decode 1-Token Execution Graph..."))
         decode-graph (trace-graph "gemma4_decode" decode-invars (build-fn false))
         decode-exec (xla/compile-graph ctx decode-graph)
-        _ (when-not quiet (println "Successfully compiled Gemma 4 Dual-Graph Executables!"))
-        dummy-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [0]) [1] 4)
-        _ (pjrt/buffer-to-host-int-buffer ctx dummy-buf 1)
-        _ (xla/destroy-buffer! ctx dummy-buf)]
+        _ (when-not quiet (println "Successfully compiled Gemma 4 Dual-Graph Executables!"))]
     {:prefill prefill-exec
      :decode decode-exec}))
+
+(defn sample-next-token
+  "Selects next token from float array `logits-arr` using sampling options and repetition penalty."
+  [^floats logits-arr opts prompt-ids gen-ids]
+  (let [{:keys [temperature top-k top-p repetition-penalty]
+         :or {temperature 0.0 top-k 10 top-p 1.0 repetition-penalty 1.15}} opts
+        rep-pen (double (or repetition-penalty 1.15))]
+    (if (and (or (nil? temperature) (<= temperature 0.0)) (<= rep-pen 1.0))
+      (argmax-host logits-arr)
+      (let [logits-vec (vec logits-arr)
+            seen-ids (vec (concat prompt-ids gen-ids))]
+        (sampling/sample-logits logits-vec {:temperature temperature
+                                            :top-k top-k
+                                            :top-p top-p
+                                            :repetition-penalty rep-pen
+                                            :seen-ids seen-ids})))))
 
 (defn run-autoregressive-generation
   "Executes In-VRAM Autoregressive Loop using Dual Gemma 4 Executables."
@@ -557,27 +585,33 @@
         prefill-tok-buf (if (sequential? prefill-res) (first prefill-res) prefill-res)
         updated-kv-bufs (if (sequential? prefill-res) (vec (rest prefill-res)) kv-bufs)
 
-        first-tok-ints (pjrt/buffer-to-host-int-buffer ctx prefill-tok-buf 1)
+        vocab-size (long (or (:vocab-size config) (:vocab_size config) 262144))
+        transfer-ctx (pjrt/create-host-float-buffer-transfer-context vocab-size)
+        logits-arr (float-array vocab-size)
+        _ (pjrt/copy-buffer-to-float-array! ctx prefill-tok-buf transfer-ctx logits-arr)
         t1 (System/nanoTime)
         prefill-ms (/ (- t1 t0) 1e6)
 
-        first-tok (int (first first-tok-ints))]
+        first-tok (sample-next-token logits-arr opts prompt-ids [])]
     (xla/destroy-buffer! ctx tok-buf)
     (xla/destroy-buffer! ctx pos-buf)
+    (xla/destroy-buffer! ctx prefill-tok-buf)
     (when-not quiet
       (println (format "  ↳ GPU Prefill Latency: %8.2f ms (%d prompt tokens)", prefill-ms prompt-len)))
 
     (loop [step 1
            cur-tok-id first-tok
            gen-ids [first-tok]
-           cur-kv-bufs updated-kv-bufs]
+           cur-kv-bufs updated-kv-bufs
+           old-kv-bufs []]
       (if (or (>= step max-new-tokens) (= cur-tok-id 1) (= cur-tok-id (eos-id tokenizer)))
         (let [t2 (System/nanoTime)
               total-ms (/ (- t2 t0) 1e6)
               gen-count (count gen-ids)
               decode-ms (- total-ms prefill-ms)
               decode-tok-s (if (pos? decode-ms) (/ (* (dec gen-count) 1000.0) decode-ms) 0.0)]
-          (doseq [b cur-kv-bufs] (xla/destroy-buffer! ctx b))
+          (doseq [b (concat cur-kv-bufs old-kv-bufs)]
+            (xla/destroy-buffer! ctx b))
           (when-not quiet
             (println "\n------------------------------------------------------------------")
             (println "  Telemetry Benchmark Metrics (Dual-Graph In-VRAM GPU Launch):")
@@ -588,18 +622,23 @@
             (println "------------------------------------------------------------------\n"))
           (vec (concat prompt-ids gen-ids)))
         (let [pos-val (int (min (dec max-seq-len) (+ prompt-len step -1)))
-              pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [pos-val]) [1] 4)
-              cur-tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [cur-tok-id]) [1 1] 4)
+              pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [pos-val]) [] 4)
+              cur-tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [cur-tok-id]) [1] 4)
               decode-args (vec (concat [cur-tok-buf pos-buf] device-weights cur-kv-bufs))
               decode-res (pjrt/execute-executable ctx (:handle decode) decode-args num-outputs)
               next-tok-buf (if (sequential? decode-res) (first decode-res) decode-res)
               next-kv-bufs (if (sequential? decode-res) (vec (rest decode-res)) cur-kv-bufs)
-              next-tok-ints (pjrt/buffer-to-host-int-buffer ctx next-tok-buf 1)
-              next-tok-id (int (first next-tok-ints))]
+              _ (pjrt/copy-buffer-to-float-array! ctx next-tok-buf transfer-ctx logits-arr)
+              next-tok-id (sample-next-token logits-arr opts prompt-ids gen-ids)]
           (xla/destroy-buffer! ctx pos-buf)
           (xla/destroy-buffer! ctx cur-tok-buf)
           (xla/destroy-buffer! ctx next-tok-buf)
-          (recur (inc step) next-tok-id (conj gen-ids next-tok-id) next-kv-bufs))))))
+          (when (and (sequential? decode-res) (not= next-kv-bufs cur-kv-bufs))
+            (doseq [b next-kv-bufs]
+              (xla/destroy-buffer! ctx b)))
+          (when-not quiet
+            (println (format "  ↳ Decode Step %3d: pos=%3d token=%d" step pos-val next-tok-id)))
+          (recur (inc step) next-tok-id (conj gen-ids next-tok-id) cur-kv-bufs []))))))
 
 (defn generate-text
   "Generates text response using Gemma 4 Single Fused XLA Execution Graph."
@@ -609,7 +648,7 @@
         clean-prompt (or prompt "The capital of France is")
         model-str (or model (get-in session [:config :model-dir]) "")
         is-it-model (str/includes? (str/lower-case model-str) "-it")
-        is-already-templated (or (str/includes? clean-prompt "<|turn|>user") (str/includes? clean-prompt "<|turn|>model"))
+        is-already-templated (or (str/includes? clean-prompt "<|turn>user") (str/includes? clean-prompt "<|turn>model"))
         prompt-ids (cond
                      (and is-it-model (not is-already-templated))
                      (let [raw-ids (encode tokenizer clean-prompt)
@@ -634,12 +673,16 @@
                          max-new-tokens temperature top-k (name (get-in session [:config :weight-dtype]))))
         (println (format "Encoded Token IDs (%d tokens): %s" prompt-len tok-str))))
 
-    (when-not quiet (println "Transferring Gemma 4 model weights to PJRT Device Memory..."))
     (let [metrics-atom (atom {})
           trace-spans-atom (atom [])
-          device-weights (binding [profile/*active-trace-spans* trace-spans-atom]
-                           (profile/with-profile metrics-atom "weight_transfer"
-                             (allocate-device-weights session)))
+          cached-weights (:device-weights session)
+          allocated-weights? (nil? cached-weights)
+          device-weights (or cached-weights
+                             (do
+                               (when-not quiet (println "Transferring Gemma 4 model weights to PJRT Device Memory..."))
+                               (binding [profile/*active-trace-spans* trace-spans-atom]
+                                 (profile/with-profile metrics-atom "weight_transfer"
+                                   (allocate-device-weights session)))))
           execs (binding [profile/*active-trace-spans* trace-spans-atom]
                   (profile/with-profile metrics-atom "graph_compilation"
                     (compile-inference-executables session prompt-len)))]
@@ -650,6 +693,9 @@
                               (run-autoregressive-generation session execs device-weights prompt-ids)))
             generated-str (decode tokenizer final-context)]
         (println generated-str)
+        (when allocated-weights?
+          (doseq [w device-weights]
+            (xla/destroy-buffer! (:ctx session) w)))
         (when-let [out-path (:out opts)]
           (spit out-path generated-str)
           (when-not quiet
@@ -684,47 +730,45 @@
                "/usr/lib64/openjdk-25/lib/server/libjsig.so"]]
     (first (filter #(.exists (io/file %)) paths))))
 
-(defn- needs-libjsig-reexec?
+(defn needs-libjsig-reexec?
   "Returns true when running with ROCm backend and LD_PRELOAD does not
-   already include libjsig.so.  Signal chaining via LD_PRELOAD is required
+   already include libjsig.so. Signal chaining via LD_PRELOAD is required
    because the ROCm PJRT plugin bundles LLVM, which installs its own signal
-   handlers that conflict with the JVM's.  System.load cannot interpose
-   symbols globally — only LD_PRELOAD does."
+   handlers that conflict with the JVM's."
   [opts]
   (and (= (:backend opts) :rocm)
        (not (some-> (System/getenv "LD_PRELOAD")
                     (.contains "libjsig")))))
 
-(defn- reexec-with-libjsig!
-  "Re-launches the current JVM process with LD_PRELOAD=libjsig.so so that
-   the OpenJDK signal-chaining library intercepts all sigaction calls before
-   the ROCm PJRT plugin installs LLVM's conflicting signal handlers."
-  [args]
-  (let [jsig-path (find-libjsig)]
-    (when-not jsig-path
-      (binding [*out* *err*]
-        (println "WARNING: libjsig.so not found — ROCm signal chaining unavailable."))
-      (flush)
-      nil)
-    (when jsig-path
-      (let [jh (System/getProperty "java.home")
-            java-bin (str jh "/bin/java")
-            rt-bean (java.lang.management.ManagementFactory/getRuntimeMXBean)
-            jvm-args (.getInputArguments rt-bean)
-            cp (System/getProperty "java.class.path")
-            cmd (vec (concat [java-bin]
-                             jvm-args
-                             ["-cp" cp "clojure.main" "-m" "scripts.gemma4-inference"]
-                             args))
-            pb (ProcessBuilder. ^java.util.List cmd)
-            env (.environment pb)
-            existing-preload (.get env "LD_PRELOAD")
-            new-preload (if (and existing-preload (not (.isEmpty ^String existing-preload)))
-                          (str jsig-path ":" existing-preload)
-                          jsig-path)]
-        (.put env "LD_PRELOAD" new-preload)
-        (.inheritIO pb)
-        (System/exit (.waitFor (.start pb)))))))
+(defn reexec-with-libjsig!
+  "Re-launches current JVM process with LD_PRELOAD=libjsig.so for ROCm signal chaining."
+  ([args] (reexec-with-libjsig! args "scripts.gemma4-inference"))
+  ([args main-ns]
+   (let [jsig-path (find-libjsig)]
+     (when-not jsig-path
+       (binding [*out* *err*]
+         (println "WARNING: libjsig.so not found — ROCm signal chaining unavailable."))
+       (flush)
+       nil)
+     (when jsig-path
+       (let [jh (System/getProperty "java.home")
+             java-bin (str jh "/bin/java")
+             rt-bean (java.lang.management.ManagementFactory/getRuntimeMXBean)
+             jvm-args (.getInputArguments rt-bean)
+             cp (System/getProperty "java.class.path")
+             cmd (vec (concat [java-bin]
+                              jvm-args
+                              ["-cp" cp "clojure.main" "-m" main-ns]
+                              args))
+             pb (ProcessBuilder. ^java.util.List cmd)
+             env (.environment pb)
+             existing-preload (.get env "LD_PRELOAD")
+             new-preload (if (and existing-preload (not (.isEmpty ^String existing-preload)))
+                           (str jsig-path ":" existing-preload)
+                           jsig-path)]
+         (.put env "LD_PRELOAD" new-preload)
+         (.inheritIO pb)
+         (System/exit (.waitFor (.start pb))))))))
 
 (defn -main
   "CLI entrypoint for Gemma 4 text generation."

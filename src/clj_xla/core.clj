@@ -90,6 +90,9 @@
                           (and async-stream? (contains? #{:cuda12 :sycl} target-kw))
                           (conj "--xla_gpu_enable_highest_priority_async_stream=true")
 
+                          (= target-kw :rocm)
+                          (conj "--xla_gpu_enable_command_buffer=")
+
                           (contains? #{:rocm :cuda12 :sycl} target-kw)
                           (conj (str "--xla_gpu_force_compilation_parallelism=" cpus))
 

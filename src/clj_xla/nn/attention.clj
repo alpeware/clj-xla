@@ -34,7 +34,7 @@
              freqs-const (clj-xla.tensor/emit-constant! [[[[freqs-vec]]]] [:tensor [1 1 1 half-dim] :f32])
              pos-f32 (convert pos-offset :f32)
              pos-shape (second (:type pos-f32))
-             s-len (if (= (count pos-shape) 2) (second pos-shape) (first pos-shape))
+             s-len (cond (= (count pos-shape) 2) (second pos-shape) (empty? pos-shape) 1 :else (or (first pos-shape) 1))
              pos-4d (reshape pos-f32 [1 1 s-len 1])
              angles (* pos-4d freqs-const)
              cos-half (cos angles)
@@ -80,17 +80,32 @@
              res-4d (apply-rope-single x-4d pos-ids h-dim t-base rotary-dim (or full-dim h-dim) rope-proportion)]
          (reshape (transpose res-4d [0 2 1 3]) [batch seq-len q-dim]))
        (let [[batch num-heads seq-len h-dim] shape
-             r-dim (or rotary-dim h-dim)
              f-dim (or full-dim h-dim)
-             rope-prop (or rope-proportion (if (< r-dim h-dim) (/ (double r-dim) (double h-dim)) 1.0))
-             half-dim (quot f-dim 2)
-             x1 (slice x [0 0 0 0] [batch num-heads seq-len half-dim] [1 1 1 1])
-             x2 (slice x [0 0 0 half-dim] [batch num-heads seq-len f-dim] [1 1 1 1])
-             neg-x2 (- x2)
-             x-rot (concatenate [neg-x2 x1] -1)
-             [cos-t sin-t] (generate-rope-freq-tensors seq-len f-dim t-base pos-ids f-dim rope-prop)
-             res (+ (* x cos-t) (* x-rot sin-t))]
-         (if (= dtype :f32) res (convert res dtype)))))))
+             rope-prop (double (or rope-proportion 1.0))
+             r-dim (long (or rotary-dim (clojure.core/* (double f-dim) rope-prop)))
+             partial? (< r-dim h-dim)]
+         (if partial?
+           (let [x-rope (slice x [0 0 0 0] [batch num-heads seq-len r-dim] [1 1 1 1])
+                 x-pass (slice x [0 0 0 r-dim] [batch num-heads seq-len h-dim] [1 1 1 1])
+                 half-dim (quot r-dim 2)
+                 x1 (slice x-rope [0 0 0 0] [batch num-heads seq-len half-dim] [1 1 1 1])
+                 x2 (slice x-rope [0 0 0 half-dim] [batch num-heads seq-len r-dim] [1 1 1 1])
+                 neg-x2 (- x2)
+                 x-rot (concatenate [neg-x2 x1] -1)
+                 [cos-t sin-t] (generate-rope-freq-tensors seq-len r-dim t-base pos-ids r-dim 1.0)
+                 res-rope (+ (* x-rope cos-t) (* x-rot sin-t))
+                 res-rope-typed (convert res-rope dtype)
+                 x-pass-typed (convert x-pass dtype)
+                 res (concatenate [res-rope-typed x-pass-typed] -1)]
+             res)
+           (let [half-dim (quot f-dim 2)
+                 x1 (slice x [0 0 0 0] [batch num-heads seq-len half-dim] [1 1 1 1])
+                 x2 (slice x [0 0 0 half-dim] [batch num-heads seq-len f-dim] [1 1 1 1])
+                 neg-x2 (- x2)
+                 x-rot (concatenate [neg-x2 x1] -1)
+                 [cos-t sin-t] (generate-rope-freq-tensors seq-len f-dim t-base pos-ids f-dim 1.0)
+                 res (+ (* x cos-t) (* x-rot sin-t))]
+             (if (= dtype :f32) res (convert res dtype)))))))))
 
 (defn apply-rope
   "Applies Rotary Position Embeddings (RoPE) to query or key tensor `x` (or `[q k]`) based on sequence position indices `pos-ids`."
@@ -179,7 +194,7 @@
            i-const (reshape i-iota [1 1 q-len 1])
            j-const (reshape j-iota [1 1 1 kv-len])
            p-const (cond
-                     (and (clj-xla.tensor/tracer? pos) (= (second (:type pos)) [1]))
+                     (and (clj-xla.tensor/tracer? pos) (or (= (second (:type pos)) [1]) (= (second (:type pos)) [])))
                      (reshape (convert pos :f32) [1 1 1 1])
 
                      (number? pos)
@@ -190,9 +205,9 @@
            effective-i (+ i-const p-const)
            diff (- j-const effective-i)
            zero-4d (broadcast-in-dim (reshape (clj-xla.tensor/emit-constant! [0.0] [:tensor [1] :f32]) [1 1 1 1]) [1 1 q-len kv-len] [0 1 2 3])
-           gt-zero (clj-xla.tensor/compare-t diff zero-4d "GT")
            mask-val (broadcast-in-dim (reshape (clj-xla.tensor/emit-constant! [-10000.0] [:tensor [1] :f32]) [1 1 1 1]) [1 1 q-len kv-len] [0 1 2 3])
-           zero-val (broadcast-in-dim (reshape (clj-xla.tensor/emit-constant! [0.0] [:tensor [1] :f32]) [1 1 1 1]) [1 1 q-len kv-len] [0 1 2 3])
+           gt-zero (clj-xla.tensor/compare-t diff zero-4d "GT")
+           zero-val zero-4d
            masked-gt (clj-xla.tensor/select gt-zero mask-val zero-val)]
        (if (and (number? sliding-window) (pos? sliding-window))
          (let [sw-val (double (- (double sliding-window)))
@@ -301,7 +316,7 @@
 
          k-act-type (:type k-act)
          kv-len (nth (second k-act-type) 2)
-         group-size (quot num-heads num-kv-heads)
+         group-size (quot num-heads actual-nkv)
          scale (get opts :scale (/ 1.0 (Math/sqrt (double head-dim))))
 
          ;; 1. Reshape & Transpose Q
@@ -316,12 +331,12 @@
          ;; 3. Repeat KV heads to Q heads if group-size > 1
          [k-heads v-heads] (if (= group-size 1)
                              [k-kvh v-kvh]
-                             (let [k-rep (broadcast-in-dim (reshape k-kvh [batch num-kv-heads 1 kv-len head-dim])
+                             (let [k-rep (broadcast-in-dim k-kvh
                                                            [batch num-kv-heads group-size kv-len head-dim]
-                                                           [0 1 2 3 4])
-                                   v-rep (broadcast-in-dim (reshape v-kvh [batch num-kv-heads 1 kv-len head-dim])
+                                                           [0 1 3 4])
+                                   v-rep (broadcast-in-dim v-kvh
                                                            [batch num-kv-heads group-size kv-len head-dim]
-                                                           [0 1 2 3 4])]
+                                                           [0 1 3 4])]
                                [(reshape k-rep [batch num-heads kv-len head-dim])
                                 (reshape v-rep [batch num-heads kv-len head-dim])]))
 

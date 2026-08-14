@@ -29,3 +29,13 @@
     (let [logits [100.0 0.0 0.0 0.0]
           idx (sampling/sample-logits logits {:top-k 1})]
       (is (= 0 idx)))))
+
+(defspec prop-apply-repetition-penalty 50
+  (prop/for-all [penalty (gen/choose 11 20)]
+                (let [p (/ penalty 10.0)
+                      logits [10.0 -5.0 2.0]
+                      penalized (sampling/apply-repetition-penalty logits [0 1] p)]
+                  (and (= (count logits) (count penalized))
+                       (< (first penalized) (first logits))
+                       (< (second penalized) (second logits))
+                       (= (nth penalized 2) (nth logits 2))))))
