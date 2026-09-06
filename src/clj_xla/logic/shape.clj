@@ -14,7 +14,13 @@
            head-name (first head)
            head-idxs (vec (rest head))
            attrs (ast/attrs eqn)
-           explicit-shape (:shape attrs)]
+           explicit-shape (or (:shape attrs)
+                              (when (and (= (first eqn) :slice)
+                                         (or (:limit attrs) (:limit_indices attrs))
+                                         (or (:start attrs) (:start_indices attrs)))
+                                (let [starts (or (:start attrs) (:start_indices attrs))
+                                      limits (or (:limit attrs) (:limit_indices attrs))]
+                                  (mapv - limits starts))))]
        (if explicit-shape
          (assoc known-shapes head-name (vec explicit-shape))
          (let [bindings

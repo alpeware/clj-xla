@@ -525,42 +525,53 @@
                (mapv (fn [i] (.getAtIndex ^MemorySegment out-ptrs ValueLayout/ADDRESS (long i))) (range num-outs))))))))))
 
 (defn buffer-to-host-buffer
-  "Copies device PJRT_Buffer `buffer-handle` to host float array, awaiting asynchronous completion."
-  [api-ctx buffer-handle num-floats]
-  (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)
-        ^MemorySegment buf-seg (cond
-                                 (instance? MemorySegment buffer-handle) buffer-handle
-                                 :else buffer-handle)
-        num-floats (long num-floats)
-        byte-size (* num-floats 4)]
-    (with-open [arena (Arena/ofConfined)]
-      (let [dst-seg (.allocate arena ValueLayout/JAVA_FLOAT num-floats)
-            args (.allocate arena (long 56))]
-        (.fill args (byte 0))
-        (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 56))
-        (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) buf-seg)
-        (.set ^MemorySegment args ValueLayout/ADDRESS (long 24) MemorySegment/NULL)
-        (.set ^MemorySegment args ValueLayout/ADDRESS (long 32) dst-seg)
-        (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long byte-size))
-        (let [handle (downcall-ptr linker api-ptr OFFSET_BUFFER_TO_HOST_BUFFER ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-              err (.invokeWithArguments ^MethodHandle handle [args])]
-          (check-error! api-ctx err)
-          (let [event-ptr (.get ^MemorySegment args ValueLayout/ADDRESS (long 48))]
-            (when (and (some? event-ptr) (not= MemorySegment/NULL event-ptr))
-              (let [await-args (.allocate arena (long 24))]
-                (.fill await-args (byte 0))
-                (.set ^MemorySegment await-args ValueLayout/JAVA_LONG (long 0) (long 24))
-                (.set ^MemorySegment await-args ValueLayout/ADDRESS (long 16) event-ptr)
-                (let [await-handle (downcall-ptr linker api-ptr OFFSET_EVENT_AWAIT ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-                      await-err (.invokeWithArguments ^MethodHandle await-handle [await-args])]
-                  (check-error! api-ctx await-err)))
-              (let [destroy-args (.allocate arena (long 24))]
-                (.fill destroy-args (byte 0))
-                (.set ^MemorySegment destroy-args ValueLayout/JAVA_LONG (long 0) (long 24))
-                (.set ^MemorySegment destroy-args ValueLayout/ADDRESS (long 16) event-ptr)
-                (let [destroy-handle (downcall-ptr linker api-ptr OFFSET_EVENT_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
-                      _ (.invokeWithArguments ^MethodHandle destroy-handle [destroy-args])])))))
-        (.toArray dst-seg ValueLayout/JAVA_FLOAT)))))
+  "Copies device PJRT_Buffer `buffer-handle` to host float array, awaiting asynchronous completion.
+   Supports optional `dtype` parameter (:f32 or :bf16), converting bfloat16 to float32 on transfer."
+  ([api-ctx buffer-handle num-floats]
+   (buffer-to-host-buffer api-ctx buffer-handle num-floats :f32))
+  ([api-ctx buffer-handle num-elements dtype]
+   (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)
+         ^MemorySegment buf-seg (cond
+                                  (instance? MemorySegment buffer-handle) buffer-handle
+                                  :else buffer-handle)
+         num-elements (long num-elements)
+         elem-bytes (if (= dtype :bf16) 2 4)
+         byte-size (* num-elements elem-bytes)]
+     (with-open [arena (Arena/ofConfined)]
+       (let [dst-seg (.allocate arena (long byte-size) (long 64))
+             args (.allocate arena (long 56))]
+         (.fill args (byte 0))
+         (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 56))
+         (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) buf-seg)
+         (.set ^MemorySegment args ValueLayout/ADDRESS (long 24) MemorySegment/NULL)
+         (.set ^MemorySegment args ValueLayout/ADDRESS (long 32) dst-seg)
+         (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 40) (long byte-size))
+         (let [handle (downcall-ptr linker api-ptr OFFSET_BUFFER_TO_HOST_BUFFER ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+               err (.invokeWithArguments ^MethodHandle handle [args])]
+           (check-error! api-ctx err)
+           (let [event-ptr (.get ^MemorySegment args ValueLayout/ADDRESS (long 48))]
+             (when (and (some? event-ptr) (not= MemorySegment/NULL event-ptr))
+               (let [await-args (.allocate arena (long 24))]
+                 (.fill await-args (byte 0))
+                 (.set ^MemorySegment await-args ValueLayout/JAVA_LONG (long 0) (long 24))
+                 (.set ^MemorySegment await-args ValueLayout/ADDRESS (long 16) event-ptr)
+                 (let [await-handle (downcall-ptr linker api-ptr OFFSET_EVENT_AWAIT ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                       await-err (.invokeWithArguments ^MethodHandle await-handle [await-args])]
+                   (check-error! api-ctx await-err)))
+               (let [destroy-args (.allocate arena (long 24))]
+                 (.fill destroy-args (byte 0))
+                 (.set ^MemorySegment destroy-args ValueLayout/JAVA_LONG (long 0) (long 24))
+                 (.set ^MemorySegment destroy-args ValueLayout/ADDRESS (long 16) event-ptr)
+                 (let [destroy-handle (downcall-ptr linker api-ptr OFFSET_EVENT_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+                       _ (.invokeWithArguments ^MethodHandle destroy-handle [destroy-args])])))))
+         (if (= dtype :bf16)
+           (let [dst-floats (float-array num-elements)]
+             (dotimes [i num-elements]
+               (let [s (.getAtIndex dst-seg ValueLayout/JAVA_SHORT (long i))
+                     raw-int (unchecked-int (bit-shift-left (bit-and (int s) 0xffff) 16))]
+                 (aset dst-floats i (Float/intBitsToFloat raw-int))))
+             dst-floats)
+           (.toArray dst-seg ValueLayout/JAVA_FLOAT)))))))
 
 (defn create-host-float-buffer-transfer-context
   "Pre-allocates off-heap MemorySegments for zero-allocation host float transfers."

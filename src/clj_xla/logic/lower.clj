@@ -16,17 +16,23 @@
 
 (defn- emit-post-activation! [eqns-atom counter in-var out-var attrs dtype]
   (let [scale (:scale attrs)
-        act (:act attrs)]
+        act (:act attrs)
+        softcap (:softcap attrs)]
     (cond
       scale
       (let [c-var (gen-id "c_scale" counter)
             c-eqn {:op :stablehlo/constant :value (double scale) :outvars [c-var]}
-            mul-var (if act (gen-id "t_scaled" counter) out-var)
+            mul-var (if (or act softcap) (gen-id "t_scaled" counter) out-var)
             mul-eqn {:op :stablehlo/multiply :invars [in-var c-var] :outvars [mul-var]}]
         (swap! eqns-atom conj c-eqn mul-eqn)
-        (if act
+        (if (or act softcap)
           (emit-post-activation! eqns-atom counter mul-var out-var (dissoc attrs :scale) dtype)
           mul-var))
+
+      (or (= act :sigmoid) (= act :logistic))
+      (let [log-eqn {:op :stablehlo/logistic :invars [in-var] :outvars [out-var]}]
+        (swap! eqns-atom conj log-eqn)
+        out-var)
 
       (= act :silu)
       (let [log-var (gen-id "t_logistic" counter)
@@ -70,6 +76,20 @@
         (swap! eqns-atom conj e-half e-sqrt e-poly e-one e-x2 e-x3 e-poly-mul e-inner e-sinner e-tanh e-plus-one e-half-x e-final)
         out-var)
 
+      softcap
+      (let [cap (double softcap)
+            c-cap (gen-id "c_cap" counter)
+            c-cap-eqn {:op :stablehlo/constant :value cap :outvars [c-cap]}
+            c-inv (gen-id "c_inv_cap" counter)
+            c-inv-eqn {:op :stablehlo/constant :value (/ 1.0 cap) :outvars [c-inv]}
+            scaled-var (gen-id "t_scaled_cap" counter)
+            scale-eqn {:op :stablehlo/multiply :invars [in-var c-inv] :outvars [scaled-var]}
+            tanh-var (gen-id "t_tanh_cap" counter)
+            tanh-eqn {:op :stablehlo/tanh :invars [scaled-var] :outvars [tanh-var]}
+            final-eqn {:op :stablehlo/multiply :invars [tanh-var c-cap] :outvars [out-var]}]
+        (swap! eqns-atom conj c-cap-eqn c-inv-eqn scale-eqn tanh-eqn final-eqn)
+        out-var)
+
       :else
       in-var)))
 
@@ -83,27 +103,35 @@
         {:keys [contracting batch lhs-free rhs-free]}
         (idx/partition-indices lhs-idxs rhs-idxs head-idxs)]
     (if (and (empty? contracting)
-             (= (set lhs-idxs) (set rhs-idxs) (set head-idxs)))
-      ;; Elementwise (Hadamard) product
-      (let [rhs-v (if (= lhs-idxs rhs-idxs)
-                    rhs-name
-                    (let [rhs-perm (indices->dim-numbers rhs-idxs lhs-idxs)
-                          out-r (gen-id "t_trans_r" counter)
-                          trans-r {:op :stablehlo/transpose :invars [rhs-name] :outvars [out-r] :attrs {:permutation rhs-perm}}]
-                      (swap! eqns-atom conj trans-r)
-                      out-r))
-            needs-perm? (not= lhs-idxs head-idxs)
-            has-post-act? (or (:scale attrs) (:act attrs))
+             (or (= (set lhs-idxs) (set head-idxs))
+                 (= (set rhs-idxs) (set head-idxs))))
+      ;; Elementwise or Broadcast product
+      (let [primary-is-lhs? (= (set lhs-idxs) (set head-idxs))
+            primary-name (if primary-is-lhs? lhs-name rhs-name)
+            primary-idxs (if primary-is-lhs? lhs-idxs rhs-idxs)
+            secondary-name (if primary-is-lhs? rhs-name lhs-name)
+            secondary-idxs (if primary-is-lhs? rhs-idxs lhs-idxs)
+            secondary-v (if (= (set primary-idxs) (set secondary-idxs))
+                          (if (= primary-idxs secondary-idxs)
+                            secondary-name
+                            (let [rhs-perm (indices->dim-numbers secondary-idxs primary-idxs)
+                                  out-r (gen-id "t_trans_r" counter)
+                                  trans-r {:op :stablehlo/transpose :invars [secondary-name] :outvars [out-r] :attrs {:permutation rhs-perm}}]
+                              (swap! eqns-atom conj trans-r)
+                              out-r))
+                          secondary-name)
+            needs-perm? (not= primary-idxs head-idxs)
+            has-post-act? (or (:scale attrs) (:act attrs) (:softcap attrs))
             mul-out-var (if (or needs-perm? has-post-act?)
                           (gen-id "t_mul" counter)
                           final-out-var)
             mul-eqn {:op :stablehlo/multiply
-                     :invars [lhs-name rhs-v]
+                     :invars [primary-name secondary-v]
                      :outvars [mul-out-var]}]
         (swap! eqns-atom conj mul-eqn)
         (let [perm-out-var
               (if needs-perm?
-                (let [perm (indices->dim-numbers lhs-idxs head-idxs)
+                (let [perm (indices->dim-numbers primary-idxs head-idxs)
                       out-v (if has-post-act? (gen-id "t_trans" counter) final-out-var)
                       trans-eqn {:op :stablehlo/transpose
                                  :invars [mul-out-var]
@@ -113,7 +141,7 @@
                   out-v)
                 mul-out-var)]
           (when has-post-act?
-            (emit-post-activation! eqns-atom counter perm-out-var final-out-var attrs (get var-dtypes lhs-name :f32)))))
+            (emit-post-activation! eqns-atom counter perm-out-var final-out-var attrs (get var-dtypes primary-name :f32)))))
       ;; Standard dot_general contraction
       (let [lhs-c-dims (indices->dim-numbers lhs-idxs contracting)
             rhs-c-dims (indices->dim-numbers rhs-idxs contracting)
@@ -125,7 +153,7 @@
 
             raw-dot-idxs (vec (concat batch lhs-free rhs-free))
             needs-perm? (not= raw-dot-idxs head-idxs)
-            has-post-act? (or (:scale attrs) (:act attrs))
+            has-post-act? (or (:scale attrs) (:act attrs) (:softcap attrs))
 
             dot-out-var (if (or needs-perm? has-post-act?)
                           (gen-id "t_dot" counter)
@@ -158,7 +186,7 @@
   (let [head-idxs (vec (rest head))
         term-name (first term)
         term-idxs (vec (rest term))
-        has-post-act? (or (:scale attrs) (:act attrs))]
+        has-post-act? (or (:scale attrs) (:act attrs) (:softcap attrs))]
     (cond
       ;; Direct copy or post-activation
       (= head-idxs term-idxs)
@@ -222,7 +250,7 @@
   (let [in-name (first in-term)
         starts (or (:start_indices attrs) (:start attrs) [0 0 0])
         limits (or (:limit_indices attrs) (:limit attrs) [1 128 768])
-        strides (or (:strides attrs) [1 1 1])
+        strides (or (:strides attrs) (vec (repeat (count starts) 1)))
         slice-eqn {:op :stablehlo/slice
                    :invars [in-name]
                    :outvars [final-out-var]
@@ -266,31 +294,38 @@
         final-eqn {:op :stablehlo/add :invars [scaled-var beta-name] :outvars [final-out-var]}]
     (swap! eqns-atom conj mean-eqn diff-eqn diff-sq-eqn var-eqn c-eps-eqn var-eps-eqn std-eqn xhat-eqn scaled-eqn final-eqn)))
 
-(defn- lower-causal-softmax! [eqns-atom counter in-term final-out-var known-shapes]
-  (let [in-name (first in-term)
-        scores-shape (get known-shapes in-name [1 12 128 128])
-        q-len (nth scores-shape 2 128)
-        kv-len (nth scores-shape 3 128)
-        mask-rows (vec (for [i (range q-len)]
-                         (vec (for [j (range kv-len)]
-                                (if (> j i) -10000.0 0.0)))))
-        c-mask (gen-id "c_mask" counter)
-        c-mask-eqn {:op :stablehlo/constant
-                    :value [[mask-rows]]
-                    :type [:tensor [1 1 q-len kv-len] :f32]
-                    :outvars [c-mask]}
-        masked-var (gen-id "t_masked" counter)
-        masked-eqn {:op :stablehlo/add :invars [in-name c-mask] :outvars [masked-var]}
-        max-var (gen-id "t_smax" counter)
-        max-eqn {:op :stablehlo/reduce_max :invars [masked-var] :outvars [max-var] :attrs {:axes [-1] :keep_dims true}}
-        diff-var (gen-id "t_sdiff" counter)
-        diff-eqn {:op :stablehlo/subtract :invars [masked-var max-var] :outvars [diff-var]}
-        exp-var (gen-id "t_sexp" counter)
-        exp-eqn {:op :stablehlo/exp :invars [diff-var] :outvars [exp-var]}
-        sum-var (gen-id "t_ssum" counter)
-        sum-eqn {:op :stablehlo/reduce_sum :invars [exp-var] :outvars [sum-var] :attrs {:axes [-1] :keep_dims true}}
-        div-eqn {:op :stablehlo/divide :invars [exp-var sum-var] :outvars [final-out-var]}]
-    (swap! eqns-atom conj c-mask-eqn masked-eqn max-eqn diff-eqn exp-eqn sum-eqn div-eqn)))
+(defn- lower-causal-softmax!
+  ([eqns-atom counter in-term attrs final-out-var known-shapes]
+   (lower-causal-softmax! eqns-atom counter in-term attrs final-out-var known-shapes :f32))
+  ([eqns-atom counter in-term attrs final-out-var known-shapes dtype]
+   (let [in-name (first in-term)
+         dtype (or dtype :f32)
+         scores-shape (get known-shapes in-name [1 12 128 128])
+         q-len (nth scores-shape 2 128)
+         kv-len (nth scores-shape 3 128)
+         window (or (:sliding-window attrs) (:window-size attrs))
+         mask-rows (vec (for [i (range q-len)]
+                          (vec (for [j (range kv-len)]
+                                 (if (or (> j i) (and window (>= (- i j) (long window))))
+                                   -10000.0
+                                   0.0)))))
+         c-mask (gen-id "c_mask" counter)
+         c-mask-eqn {:op :stablehlo/constant
+                     :value [[mask-rows]]
+                     :type [:tensor [1 1 q-len kv-len] dtype]
+                     :outvars [c-mask]}
+         masked-var (gen-id "t_masked" counter)
+         masked-eqn {:op :stablehlo/add :invars [in-name c-mask] :outvars [masked-var]}
+         max-var (gen-id "t_smax" counter)
+         max-eqn {:op :stablehlo/reduce_max :invars [masked-var] :outvars [max-var] :attrs {:axes [-1] :keep_dims true}}
+         diff-var (gen-id "t_sdiff" counter)
+         diff-eqn {:op :stablehlo/subtract :invars [masked-var max-var] :outvars [diff-var]}
+         exp-var (gen-id "t_sexp" counter)
+         exp-eqn {:op :stablehlo/exp :invars [diff-var] :outvars [exp-var]}
+         sum-var (gen-id "t_ssum" counter)
+         sum-eqn {:op :stablehlo/reduce_sum :invars [exp-var] :outvars [sum-var] :attrs {:axes [-1] :keep_dims true}}
+         div-eqn {:op :stablehlo/divide :invars [exp-var sum-var] :outvars [final-out-var]}]
+     (swap! eqns-atom conj c-mask-eqn masked-eqn max-eqn diff-eqn exp-eqn sum-eqn div-eqn))))
 
 (defn- lower-rms-norm! [eqns-atom counter _head in-term weight-term attrs final-out-var]
   (let [in-name (first in-term)
@@ -313,84 +348,119 @@
       (let [scaled-eqn {:op :stablehlo/multiply :invars [xhat-var weight-name] :outvars [final-out-var]}]
         (swap! eqns-atom conj scaled-eqn)))))
 
-(defn- lower-rope! [eqns-atom counter _head in-term attrs final-out-var known-shapes]
-  (let [in-name (first in-term)
-        shape (get known-shapes in-name [1 128 576])
-        batch (nth shape 0 1)
-        seq-len (nth shape 1 128)
-        total-dim (nth shape 2 576)
-        head-dim (long (or (:head-dim attrs) 64))
-        n-heads (quot total-dim head-dim)
-        half-dim (quot head-dim 2)
-        theta (double (or (:theta attrs) (:theta-base attrs) 10000.0))
+(defn- lower-rope!
+  ([eqns-atom counter head in-term attrs final-out-var known-shapes]
+   (lower-rope! eqns-atom counter head in-term attrs final-out-var known-shapes :f32))
+  ([eqns-atom counter _head in-term attrs final-out-var known-shapes dtype]
+   (let [in-name (first in-term)
+         dtype (or dtype :f32)
+         shape (get known-shapes in-name [1 128 576])
+         batch (nth shape 0 1)
+         seq-len (nth shape 1 128)
+         total-dim (nth shape 2 576)
+         head-dim (long (or (:head-dim attrs) 64))
+         n-heads (quot total-dim head-dim)
+         rope-prop (double (or (:rope-proportion attrs) (:partial-rotary-factor attrs) 1.0))
+         rot-dim (long (* head-dim rope-prop))
+         partial? (< rot-dim head-dim)
+         effective-rot-dim (if partial? rot-dim head-dim)
+         half-dim (quot effective-rot-dim 2)
+         theta (double (or (:theta attrs) (:theta-base attrs) 10000.0))
 
-        freqs (vec (for [i (range half-dim)]
-                     (Math/pow theta (/ (* -2.0 i) (double head-dim)))))
-        cos-rows (vec (for [idx (range seq-len)]
-                        (let [pos idx
-                              half (vec (for [i (range half-dim)]
-                                          (Math/cos (* (double pos) (nth freqs i)))))]
-                          (vec (concat half half)))))
-        sin-rows (vec (for [idx (range seq-len)]
-                        (let [pos idx
-                              half (vec (for [i (range half-dim)]
-                                          (Math/sin (* (double pos) (nth freqs i)))))]
-                          (vec (concat half half)))))
+         freqs (vec (for [i (range half-dim)]
+                      (Math/pow theta (/ (* -2.0 i) (double effective-rot-dim)))))
+         cos-rows (vec (for [idx (range seq-len)]
+                         (let [pos idx
+                               half (vec (for [i (range half-dim)]
+                                           (Math/cos (* (double pos) (nth freqs i)))))]
+                           (vec (concat half half)))))
+         sin-rows (vec (for [idx (range seq-len)]
+                         (let [pos idx
+                               half (vec (for [i (range half-dim)]
+                                           (Math/sin (* (double pos) (nth freqs i)))))]
+                           (vec (concat half half)))))
 
-        r4d-var (gen-id "rope_r4d" counter)
-        r4d-eqn {:op :stablehlo/reshape :invars [in-name] :outvars [r4d-var] :attrs {:shape [batch seq-len n-heads head-dim]}}
+         r4d-var (gen-id "rope_r4d" counter)
+         r4d-eqn {:op :stablehlo/reshape :invars [in-name] :outvars [r4d-var] :attrs {:shape [batch seq-len n-heads head-dim]}}
 
-        trans-var (gen-id "rope_trans" counter)
-        trans-eqn {:op :stablehlo/transpose :invars [r4d-var] :outvars [trans-var] :attrs {:permutation [0 2 1 3]}}
+         trans-var (gen-id "rope_trans" counter)
+         trans-eqn {:op :stablehlo/transpose :invars [r4d-var] :outvars [trans-var] :attrs {:permutation [0 2 1 3]}}
 
-        x1-var (gen-id "rope_x1" counter)
-        x1-eqn {:op :stablehlo/slice
-                :invars [trans-var]
-                :outvars [x1-var]
-                :attrs {:start_indices [0 0 0 0]
-                        :limit_indices [batch n-heads seq-len half-dim]
-                        :strides [1 1 1 1]}}
+         x-rope-var (if partial? (gen-id "rope_x_rot" counter) trans-var)
+         x-pass-var (when partial? (gen-id "rope_x_pass" counter))
+         slice-rot-eqn (when partial?
+                         {:op :stablehlo/slice
+                          :invars [trans-var]
+                          :outvars [x-rope-var]
+                          :attrs {:start_indices [0 0 0 0]
+                                  :limit_indices [batch n-heads seq-len effective-rot-dim]
+                                  :strides [1 1 1 1]}})
+         slice-pass-eqn (when partial?
+                          {:op :stablehlo/slice
+                           :invars [trans-var]
+                           :outvars [x-pass-var]
+                           :attrs {:start_indices [0 0 0 effective-rot-dim]
+                                   :limit_indices [batch n-heads seq-len head-dim]
+                                   :strides [1 1 1 1]}})
 
-        x2-var (gen-id "rope_x2" counter)
-        x2-eqn {:op :stablehlo/slice
-                :invars [trans-var]
-                :outvars [x2-var]
-                :attrs {:start_indices [0 0 0 half-dim]
-                        :limit_indices [batch n-heads seq-len head-dim]
-                        :strides [1 1 1 1]}}
+         x1-var (gen-id "rope_x1" counter)
+         x1-eqn {:op :stablehlo/slice
+                 :invars [x-rope-var]
+                 :outvars [x1-var]
+                 :attrs {:start_indices [0 0 0 0]
+                         :limit_indices [batch n-heads seq-len half-dim]
+                         :strides [1 1 1 1]}}
 
-        neg-x2-var (gen-id "rope_neg_x2" counter)
-        neg-x2-eqn {:op :stablehlo/negate :invars [x2-var] :outvars [neg-x2-var]}
+         x2-var (gen-id "rope_x2" counter)
+         x2-eqn {:op :stablehlo/slice
+                 :invars [x-rope-var]
+                 :outvars [x2-var]
+                 :attrs {:start_indices [0 0 0 half-dim]
+                         :limit_indices [batch n-heads seq-len effective-rot-dim]
+                         :strides [1 1 1 1]}}
 
-        rot-var (gen-id "rope_rot" counter)
-        rot-eqn {:op :stablehlo/concatenate :invars [neg-x2-var x1-var] :outvars [rot-var] :attrs {:dimension 3}}
+         neg-x2-var (gen-id "rope_neg_x2" counter)
+         neg-x2-eqn {:op :stablehlo/negate :invars [x2-var] :outvars [neg-x2-var]}
 
-        c-cos-var (gen-id "rope_cos" counter)
-        c-cos-eqn {:op :stablehlo/constant
-                   :value [[cos-rows]]
-                   :type [:tensor [1 1 seq-len head-dim] :f32]
-                   :outvars [c-cos-var]}
+         rot-var (gen-id "rope_rot" counter)
+         rot-eqn {:op :stablehlo/concatenate :invars [neg-x2-var x1-var] :outvars [rot-var] :attrs {:dimension 3}}
 
-        c-sin-var (gen-id "rope_sin" counter)
-        c-sin-eqn {:op :stablehlo/constant
-                   :value [[sin-rows]]
-                   :type [:tensor [1 1 seq-len head-dim] :f32]
-                   :outvars [c-sin-var]}
+         c-cos-var (gen-id "rope_cos" counter)
+         c-cos-eqn {:op :stablehlo/constant
+                    :value [[cos-rows]]
+                    :type [:tensor [1 1 seq-len effective-rot-dim] dtype]
+                    :outvars [c-cos-var]}
 
-        x-cos-var (gen-id "rope_x_cos" counter)
-        x-cos-eqn {:op :stablehlo/multiply :invars [trans-var c-cos-var] :outvars [x-cos-var]}
+         c-sin-var (gen-id "rope_sin" counter)
+         c-sin-eqn {:op :stablehlo/constant
+                    :value [[sin-rows]]
+                    :type [:tensor [1 1 seq-len effective-rot-dim] dtype]
+                    :outvars [c-sin-var]}
 
-        x-sin-var (gen-id "rope_x_sin" counter)
-        x-sin-eqn {:op :stablehlo/multiply :invars [rot-var c-sin-var] :outvars [x-sin-var]}
+         x-cos-var (gen-id "rope_x_cos" counter)
+         x-cos-eqn {:op :stablehlo/multiply :invars [x-rope-var c-cos-var] :outvars [x-cos-var]}
 
-        add-var (gen-id "rope_res" counter)
-        add-eqn {:op :stablehlo/add :invars [x-cos-var x-sin-var] :outvars [add-var]}
+         x-sin-var (gen-id "rope_x_sin" counter)
+         x-sin-eqn {:op :stablehlo/multiply :invars [rot-var c-sin-var] :outvars [x-sin-var]}
 
-        back-trans-var (gen-id "rope_back_trans" counter)
-        back-trans-eqn {:op :stablehlo/transpose :invars [add-var] :outvars [back-trans-var] :attrs {:permutation [0 2 1 3]}}
+         add-rot-var (if partial? (gen-id "rope_res_rot" counter) (gen-id "rope_res" counter))
+         add-rot-eqn {:op :stablehlo/add :invars [x-cos-var x-sin-var] :outvars [add-rot-var]}
 
-        final-eqn {:op :stablehlo/reshape :invars [back-trans-var] :outvars [final-out-var] :attrs {:shape [batch seq-len total-dim]}}]
-    (swap! eqns-atom conj r4d-eqn trans-eqn x1-eqn x2-eqn neg-x2-eqn rot-eqn c-cos-eqn c-sin-eqn x-cos-eqn x-sin-eqn add-eqn back-trans-eqn final-eqn)))
+         add-var (if partial? (gen-id "rope_res" counter) add-rot-var)
+         concat-pass-eqn (when partial?
+                           {:op :stablehlo/concatenate :invars [add-rot-var x-pass-var] :outvars [add-var] :attrs {:dimension 3}})
+
+         back-trans-var (gen-id "rope_back_trans" counter)
+         back-trans-eqn {:op :stablehlo/transpose :invars [add-var] :outvars [back-trans-var] :attrs {:permutation [0 2 1 3]}}
+
+         final-eqn {:op :stablehlo/reshape :invars [back-trans-var] :outvars [final-out-var] :attrs {:shape [batch seq-len total-dim]}}]
+     (swap! eqns-atom conj r4d-eqn trans-eqn)
+     (when partial?
+       (swap! eqns-atom conj slice-rot-eqn slice-pass-eqn))
+     (swap! eqns-atom conj x1-eqn x2-eqn neg-x2-eqn rot-eqn c-cos-eqn c-sin-eqn x-cos-eqn x-sin-eqn add-rot-eqn)
+     (when partial?
+       (swap! eqns-atom conj concat-pass-eqn))
+     (swap! eqns-atom conj back-trans-eqn final-eqn))))
 
 (defn ast->graph
   "Compiles a Tensor Logic Hiccup AST into a validated EDN SSA graph for OpenXLA compilation.
@@ -404,6 +474,7 @@
         ;; 3. Shape unification
         in-shapes (into {} (map (fn [[v [_ shape _]]] [v (vec shape)]) invars))
         in-dtypes (into {} (map (fn [[v [_ _ dt]]] [v dt]) invars))
+        default-dtype (or (get in-dtypes :embed_tokens) (get in-dtypes :final_norm_w) :f32)
         known-shapes (shape/unify-shapes in-shapes pruned)
 
         eqns-atom (atom [])
@@ -456,13 +527,13 @@
           (lower-layer-norm! eqns-atom counter head (first body) (second body) (nth body 2) attrs final-var)
 
           (= op :causal-softmax)
-          (lower-causal-softmax! eqns-atom counter (first body) final-var known-shapes)
+          (lower-causal-softmax! eqns-atom counter (first body) attrs final-var known-shapes default-dtype)
 
           (= op :rms-norm)
           (lower-rms-norm! eqns-atom counter head (first body) (second body) attrs final-var)
 
           (= op :rope)
-          (lower-rope! eqns-atom counter head (first body) attrs final-var known-shapes)
+          (lower-rope! eqns-atom counter head (first body) attrs final-var known-shapes default-dtype)
 
           :else
           (throw (ex-info "Unknown AST equation or lowering hook" {:equation eqn :op op})))

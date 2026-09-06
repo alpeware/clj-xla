@@ -223,17 +223,20 @@
         out-buf))))
 
 (defn to-host-slice
-  "Transfers a slice of PJRT output device buffer back to host float array."
+  "Transfers a slice of PJRT output device buffer back to host float array.
+   Supports optional `dtype` parameter (:f32 or :bf16), converting bfloat16 to float32 on transfer."
   ([out-buf]
-   (to-host-slice out-buf 0 256000 (* 128 256000)))
+   (to-host-slice out-buf 0 256000 (* 128 256000) :f32))
   ([out-buf slice-idx]
-   (to-host-slice out-buf slice-idx 256000 (* 128 256000)))
+   (to-host-slice out-buf slice-idx 256000 (* 128 256000) :f32))
   ([out-buf slice-idx vocab-size]
-   (to-host-slice out-buf slice-idx vocab-size (* 128 vocab-size)))
+   (to-host-slice out-buf slice-idx vocab-size (* 128 vocab-size) :f32))
   ([out-buf slice-idx vocab-size total-elements]
+   (to-host-slice out-buf slice-idx vocab-size total-elements :f32))
+  ([out-buf slice-idx vocab-size total-elements dtype]
    (let [ctx (get-context)
-         n-floats (max (long total-elements) (long (* (inc slice-idx) vocab-size)))
-         all-floats (pjrt/buffer-to-host-buffer ctx out-buf n-floats)
+         n-elements (max (long total-elements) (long (* (inc slice-idx) vocab-size)))
+         all-floats (pjrt/buffer-to-host-buffer ctx out-buf n-elements (or dtype :f32))
          offset (* slice-idx vocab-size)]
      (if (and (>= offset 0) (<= (+ offset vocab-size) (alength ^floats all-floats)))
        (let [slice (float-array vocab-size)]
