@@ -299,7 +299,7 @@
    (lower-causal-softmax! eqns-atom counter in-term attrs final-out-var known-shapes :f32))
   ([eqns-atom counter in-term attrs final-out-var known-shapes dtype]
    (let [in-name (first in-term)
-         dtype (or dtype :f32)
+         orig-dtype (or dtype :f32)
          scores-shape (get known-shapes in-name [1 12 128 128])
          q-len (nth scores-shape 2 128)
          kv-len (nth scores-shape 3 128)
@@ -309,13 +309,17 @@
                                  (if (or (> j i) (and window (>= (- i j) (long window))))
                                    -10000.0
                                    0.0)))))
+         needs-f32? (not= orig-dtype :f32)
+         f32-in-var (if needs-f32? (gen-id "s_f32" counter) in-name)
+         conv-in-eqn (when needs-f32?
+                       {:op :stablehlo/convert :invars [in-name] :outvars [f32-in-var] :attrs {:target_dtype :f32}})
          c-mask (gen-id "c_mask" counter)
          c-mask-eqn {:op :stablehlo/constant
                      :value [[mask-rows]]
-                     :type [:tensor [1 1 q-len kv-len] dtype]
+                     :type [:tensor [1 1 q-len kv-len] :f32]
                      :outvars [c-mask]}
          masked-var (gen-id "t_masked" counter)
-         masked-eqn {:op :stablehlo/add :invars [in-name c-mask] :outvars [masked-var]}
+         masked-eqn {:op :stablehlo/add :invars [f32-in-var c-mask] :outvars [masked-var]}
          max-var (gen-id "t_smax" counter)
          max-eqn {:op :stablehlo/reduce_max :invars [masked-var] :outvars [max-var] :attrs {:axes [-1] :keep_dims true}}
          diff-var (gen-id "t_sdiff" counter)
@@ -324,12 +328,18 @@
          exp-eqn {:op :stablehlo/exp :invars [diff-var] :outvars [exp-var]}
          sum-var (gen-id "t_ssum" counter)
          sum-eqn {:op :stablehlo/reduce_sum :invars [exp-var] :outvars [sum-var] :attrs {:axes [-1] :keep_dims true}}
-         div-eqn {:op :stablehlo/divide :invars [exp-var sum-var] :outvars [final-out-var]}]
-     (swap! eqns-atom conj c-mask-eqn masked-eqn max-eqn diff-eqn exp-eqn sum-eqn div-eqn))))
+         f32-div-var (if needs-f32? (gen-id "t_sdiv" counter) final-out-var)
+         div-eqn {:op :stablehlo/divide :invars [exp-var sum-var] :outvars [f32-div-var]}
+         conv-out-eqn (when needs-f32?
+                        {:op :stablehlo/convert :invars [f32-div-var] :outvars [final-out-var] :attrs {:target_dtype orig-dtype}})]
+     (when needs-f32? (swap! eqns-atom conj conv-in-eqn))
+     (swap! eqns-atom conj c-mask-eqn masked-eqn max-eqn diff-eqn exp-eqn sum-eqn div-eqn)
+     (when needs-f32? (swap! eqns-atom conj conv-out-eqn)))))
 
 (defn- lower-rms-norm! [eqns-atom counter _head in-term weight-term attrs final-out-var]
   (let [in-name (first in-term)
         weight-name (when weight-term (first weight-term))
+        gemma? (:gemma? attrs)
         eps (or (:eps attrs) 1e-5)
         sq-var (gen-id "rms_sq" counter)
         sq-eqn {:op :stablehlo/multiply :invars [in-name in-name] :outvars [sq-var]}
@@ -345,7 +355,15 @@
         xhat-eqn {:op :stablehlo/divide :invars [in-name std-var] :outvars [xhat-var]}]
     (swap! eqns-atom conj sq-eqn ms-eqn c-eps-eqn ms-eps-eqn std-eqn xhat-eqn)
     (when weight-name
-      (let [scaled-eqn {:op :stablehlo/multiply :invars [xhat-var weight-name] :outvars [final-out-var]}]
+      (let [w-var (if gemma?
+                    (let [c-one (gen-id "rms_one" counter)
+                          c-one-eqn {:op :stablehlo/constant :value 1.0 :outvars [c-one]}
+                          w-plus-one (gen-id "rms_w1" counter)
+                          add-one-eqn {:op :stablehlo/add :invars [weight-name c-one] :outvars [w-plus-one]}]
+                      (swap! eqns-atom conj c-one-eqn add-one-eqn)
+                      w-plus-one)
+                    weight-name)
+            scaled-eqn {:op :stablehlo/multiply :invars [xhat-var w-var] :outvars [final-out-var]}]
         (swap! eqns-atom conj scaled-eqn)))))
 
 (defn- lower-rope!
@@ -529,8 +547,10 @@
           (= op :causal-softmax)
           (lower-causal-softmax! eqns-atom counter (first body) attrs final-var known-shapes default-dtype)
 
-          (= op :rms-norm)
-          (lower-rms-norm! eqns-atom counter head (first body) (second body) attrs final-var)
+          (or (= op :rms-norm) (= op :gemma-rms-norm))
+          (lower-rms-norm! eqns-atom counter head (first body) (second body)
+                           (if (= op :gemma-rms-norm) (assoc attrs :gemma? true) attrs)
+                           final-var)
 
           (= op :rope)
           (lower-rope! eqns-atom counter head (first body) attrs final-var known-shapes default-dtype)

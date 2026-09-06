@@ -33,6 +33,7 @@
             [clj-xla.logic.dce-test]
             [clj-xla.logic.expand-test]
             [clj-xla.logic.gemma-test]
+            [clj-xla.logic.gemma3-test]
             [clj-xla.logic.gpt2-test]
             [clj-xla.logic.index-test]
             [clj-xla.logic.lower-test]
@@ -90,6 +91,7 @@
                            'clj-xla.logic.dce-test
                            'clj-xla.logic.expand-test
                            'clj-xla.logic.gemma-test
+                           'clj-xla.logic.gemma3-test
                            'clj-xla.logic.gpt2-test
                            'clj-xla.logic.index-test
                            'clj-xla.logic.lower-test

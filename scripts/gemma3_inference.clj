@@ -1,31 +1,36 @@
 (ns scripts.gemma3-inference
   "Top-level runnable integration script and REPL API for end-to-end Gemma 3 text generation via pure XLA execution."
   (:require [clj-xla.core :as xla]
+            [clj-xla.logic.lower :as lower]
+            [clj-xla.logic.models.gemma3 :as gemma3-logic]
             [clj-xla.models.gemma :as gemma]
+            [clj-xla.nn.norm :as norm]
             [clj-xla.safetensors :as st]
             [clj-xla.sampling :as sampling]
             [clj-xla.tensor :as t]
             [clj-xla.tokenizer.core :as tok]
             [clj-xla.tokenizer.protocol :refer [bos-id decode encode eos-id]]
             [clj-xla.trace :refer [trace-graph]]
-            [clojure.java.io :as io]
-            [clojure.pprint :as pprint])
+            [clojure.java.io :as io])
   (:import [java.lang.foreign Arena]))
 
 (def DEFAULT_CLI_OPTS
   {:prompt "The capital of France is"
-   :max-new-tokens 20
+   :max-new-tokens 10
    :temperature 0.7
    :top-k 10
    :backend :cpu
    :precision :bf16
+   :method :tensor-logic
+   :compare false
+   :chat nil
    :verbose false})
 
 (def DEFAULT_MODEL_DIRS
   [".models/gemma-3-270m-it" ".models/gemma-3-270m" ".models/gemma-3" ".models/gemma"])
 
 (defn parse-cli-args
-  "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k, --backend, --precision, --verbose)."
+  "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k, --backend, --precision, --method, --compare, --chat, --model-dir, --verbose)."
   [args]
   (loop [remaining (vec args)
          opts DEFAULT_CLI_OPTS]
@@ -51,6 +56,18 @@
 
           (and (= flag "--precision") val)
           (recur (subvec remaining 2) (assoc opts :precision (keyword val)))
+
+          (and (= flag "--method") val)
+          (recur (subvec remaining 2) (assoc opts :method (keyword val)))
+
+          (and (= flag "--compare") val)
+          (recur (subvec remaining 2) (assoc opts :compare (Boolean/parseBoolean val)))
+
+          (and (= flag "--chat") val)
+          (recur (subvec remaining 2) (assoc opts :chat (Boolean/parseBoolean val)))
+
+          (and (= flag "--model-dir") val)
+          (recur (subvec remaining 2) (assoc opts :model-dir val))
 
           (= flag "--verbose")
           (recur (subvec remaining 1) (assoc opts :verbose true))
@@ -86,12 +103,13 @@
    Returns an inference session map."
   ([opts]
    (let [opts (merge DEFAULT_CLI_OPTS opts)
-         {:keys [backend precision]} opts
+         {:keys [backend precision model-dir]} opts
          ctx (xla/init-backend! (or backend :cpu))
-         model-dir (find-model-dir DEFAULT_MODEL_DIRS)
+         dirs (if model-dir (into [model-dir] DEFAULT_MODEL_DIRS) DEFAULT_MODEL_DIRS)
+         resolved-dir (find-model-dir dirs)
          arena (Arena/ofConfined)
-         weights-mmap (st/map-safetensors-weights model-dir arena)
-         tokenizer (tok/from-file model-dir)
+         weights-mmap (st/map-safetensors-weights resolved-dir arena)
+         tokenizer (tok/from-file resolved-dir)
          header (or (:header weights-mmap) {})
          emb-shape (get-in header ["model.embed_tokens.weight" "shape"] [262144 640])
          q-shape (get-in header ["model.layers.0.self_attn.q_proj.weight" "shape"] [1024 640])
@@ -104,19 +122,19 @@
          kv-dim (nth k-shape 0 256)
          intermediate-dim (nth gate-shape 0 2048)
          num-layers (count (filter #(re-find #"^model\.layers\.\d+\.input_layernorm\.weight$" %) (keys header)))
-         num-heads (quot q-dim 256)
-         num-kv-heads (quot kv-dim 256)
          head-dim 256
+         num-heads (quot q-dim head-dim)
+         num-kv-heads (quot kv-dim head-dim)
          max-seq-len 128
-         kv-cache-shape [1 num-kv-heads max-seq-len head-dim]
          weight-dtype (or precision :bf16)
          weight-enum (if (= weight-dtype :f32) 11 13)]
 
-     (println (str "Loaded Gemma 3 model weights from [" model-dir "] in [" (name weight-dtype) "] precision (" num-layers " layers)."))
+     (println (format "Loaded Gemma 3 model weights from [%s] in [%s] precision (%d layers)."
+                      resolved-dir (name weight-dtype) num-layers))
 
      {:ctx ctx
       :opts opts
-      :model-dir model-dir
+      :model-dir resolved-dir
       :tokenizer tokenizer
       :weights-mmap weights-mmap
       :arena arena
@@ -130,7 +148,6 @@
                :num-kv-heads num-kv-heads
                :head-dim head-dim
                :max-seq-len max-seq-len
-               :kv-cache-shape kv-cache-shape
                :weight-dtype weight-dtype
                :weight-enum weight-enum}})))
 
@@ -160,221 +177,204 @@
         flat-layer-bufs (vec (apply concat layer-bufs))]
     (into [embed-buf final-norm-buf] flat-layer-bufs)))
 
-(defn allocate-kv-caches
-  "Allocates initial zero-filled PJRT device memory buffers for layer K/V caches."
-  [{:keys [ctx config]}]
-  (let [{:keys [num-layers kv-cache-shape weight-enum]} config
-        num-elements (reduce * 1 kv-cache-shape)
-        zero-data (if (= weight-enum 11) (float-array num-elements) (short-array num-elements))]
-    (mapv (fn [_i]
-            [(xla/buffer-from-host-buffer ctx (:client ctx) zero-data kv-cache-shape weight-enum)
-             (xla/buffer-from-host-buffer ctx (:client ctx) zero-data kv-cache-shape weight-enum)])
-          (range num-layers))))
+(defn format-prompt
+  "Encodes prompt text with optional Chat ML instruction formatting for instruction-tuned (-it) models."
+  [tokenizer prompt chat?]
+  (if chat?
+    (vec (concat [(bos-id tokenizer) 105 2364 107]
+                 (encode tokenizer prompt)
+                 [106 107 105 4368 107]))
+    (into [(bos-id tokenizer)] (encode tokenizer prompt))))
 
-(defn compile-inference-executables
-  "Traces and JIT-compiles Gemma 3 Single-Pass Prefill and Single-Token Decode StableHLO graphs into PJRT Executables."
-  [{:keys [ctx config opts]} prompt-len]
-  (let [{:keys [vocab-size hidden-dim q-dim kv-dim intermediate-dim head-dim num-layers num-heads num-kv-heads kv-cache-shape weight-dtype]} config
-        {:keys [verbose]} opts
+(defn- prepare-input-tensor
+  "Pads token IDs sequence to `max-len` with zero padding."
+  [tokens max-len]
+  (let [padded (take max-len (concat tokens (repeat 0)))]
+    (int-array (vec padded))))
 
-        prefill-invars (vec (concat
-                             [[:x [:tensor [1 prompt-len] :i32]]
-                              [:pos [:tensor [prompt-len] :i32]]
-                              [:embed_tokens [:tensor [vocab-size hidden-dim] weight-dtype]]
-                              [:final_norm_w [:tensor [hidden-dim] weight-dtype]]]
-                             (mapcat (fn [i]
-                                       [[(keyword (str "input_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                        [(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] weight-dtype]]
-                                        [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
-                                        [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
-                                        [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] weight-dtype]]
-                                        [(keyword (str "q_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
-                                        [(keyword (str "k_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
-                                        [(keyword (str "post_attn_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                        [(keyword (str "pre_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                        [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                        [(keyword (str "gate_w_" i)) [:tensor [intermediate-dim hidden-dim] weight-dtype]]
-                                        [(keyword (str "up_w_" i)) [:tensor [intermediate-dim hidden-dim] weight-dtype]]
-                                        [(keyword (str "down_w_" i)) [:tensor [hidden-dim intermediate-dim] weight-dtype]]])
-                                     (range num-layers))
-                             (mapcat (fn [i]
-                                       [[(keyword (str "k_cache_" i)) [:tensor kv-cache-shape weight-dtype]]
-                                        [(keyword (str "v_cache_" i)) [:tensor kv-cache-shape weight-dtype]]])
-                                     (range num-layers))))
-
-        prefill-trace-fn (fn [x _pos-tracer emb fn-norm & rest-args]
-                           (let [weight-args (take (* 13 num-layers) rest-args)
-                                 kv-cache-args (drop (* 13 num-layers) rest-args)
-                                 lw-seq (mapv (fn [i [in-ln qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw]]
+(defn compile-executable
+  "Compiles Gemma 3 model for sequence length `max-seq-len` using either `:tensor-logic` (AST lowering) or `:trace`."
+  [{:keys [ctx config]} max-seq-len comp-method]
+  (let [{:keys [vocab-size hidden-dim q-dim kv-dim intermediate-dim head-dim num-layers weight-dtype]} config
+        invars (vec (concat
+                     [[:x [:tensor [1 max-seq-len] :i32]]
+                      [:embed_tokens [:tensor [vocab-size hidden-dim] weight-dtype]]
+                      [:final_norm_w [:tensor [hidden-dim] weight-dtype]]]
+                     (mapcat (fn [i]
+                               [[(keyword (str "input_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                [(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] weight-dtype]]
+                                [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
+                                [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
+                                [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] weight-dtype]]
+                                [(keyword (str "q_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
+                                [(keyword (str "k_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
+                                [(keyword (str "post_attn_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                [(keyword (str "pre_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
+                                [(keyword (str "gate_w_" i)) [:tensor [intermediate-dim hidden-dim] weight-dtype]]
+                                [(keyword (str "up_w_" i)) [:tensor [intermediate-dim hidden-dim] weight-dtype]]
+                                [(keyword (str "down_w_" i)) [:tensor [hidden-dim intermediate-dim] weight-dtype]]])
+                             (range num-layers))))]
+    (case comp-method
+      :trace
+      (do
+        (println "Tracing full Gemma 3 model graph (legacy tracer)...")
+        (let [trace-fn (fn [x emb fn-norm & rest-args]
+                         (let [scale-factor (Math/sqrt (double hidden-dim))
+                               tok-embed (t/* (t/gather emb x) scale-factor)
+                               lw-seq (mapv (fn [i [in-ln qw kw vw ow qn kn post-attn pre-mlp post-mlp gw uw dw]]
+                                              (let [is-global? (zero? (mod (inc i) 6))]
                                                 {:input-ln-w in-ln :q-w qw :k-w kw :v-w vw :o-w ow
                                                  :q-norm-w qn :k-norm-w kn
-                                                 :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
+                                                 :post-attn-ln-w post-attn :pre-mlp-ln-w pre-mlp :post-mlp-ln-w post-mlp
                                                  :gate-w gw :up-w uw :down-w dw
-                                                 :theta-base (if (zero? (mod (inc i) 6)) 1000000.0 10000.0)
-                                                 :attn-softcap nil})
-                                              (range num-layers)
-                                              (partition 13 weight-args))
-                                 kv-seq (mapv vec (partition 2 kv-cache-args))
-                                 [logits updated-kv-caches] (gemma/full-gemma-forward x emb lw-seq fn-norm (vec (range prompt-len)) num-heads num-kv-heads kv-seq 0 {:final-logit-softcap nil})
-                                 f32-logits (t/convert logits :f32)]
-                             (into [f32-logits] (apply concat updated-kv-caches))))
+                                                 :norm-fn norm/gemma-rms-norm
+                                                 :scale (/ 1.0 (Math/sqrt (double head-dim)))
+                                                 :theta-base (if is-global? 1000000.0 10000.0)
+                                                 :sliding-window (if is-global? nil 512)}))
+                                            (range num-layers)
+                                            (partition 13 rest-args))
+                               h (reduce (fn [curr lw]
+                                           (gemma/gemma-block curr lw 4 1 (vec (range max-seq-len)) nil nil))
+                                         tok-embed
+                                         lw-seq)
+                               normed (norm/gemma-rms-norm h fn-norm 1e-6)
+                               logits (t/matmul normed (t/transpose emb [1 0]))]
+                           (t/convert logits weight-dtype)))
+              graph (trace-graph "gemma3_trace" invars trace-fn)]
+          (xla/compile-graph ctx graph)))
 
-        decode-invars (vec (concat
-                            [[:x [:tensor [1 1] :i32]]
-                             [:pos [:tensor [1] :i32]]
-                             [:embed_tokens [:tensor [vocab-size hidden-dim] weight-dtype]]
-                             [:final_norm_w [:tensor [hidden-dim] weight-dtype]]]
-                            (mapcat (fn [i]
-                                      [[(keyword (str "input_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                       [(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] weight-dtype]]
-                                       [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
-                                       [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
-                                       [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] weight-dtype]]
-                                       [(keyword (str "q_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
-                                       [(keyword (str "k_norm_w_" i)) [:tensor [head-dim] weight-dtype]]
-                                       [(keyword (str "post_attn_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                       [(keyword (str "pre_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                       [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] weight-dtype]]
-                                       [(keyword (str "gate_w_" i)) [:tensor [intermediate-dim hidden-dim] weight-dtype]]
-                                       [(keyword (str "up_w_" i)) [:tensor [intermediate-dim hidden-dim] weight-dtype]]
-                                       [(keyword (str "down_w_" i)) [:tensor [hidden-dim intermediate-dim] weight-dtype]]])
-                                    (range num-layers))
-                            (mapcat (fn [i]
-                                      [[(keyword (str "k_cache_" i)) [:tensor kv-cache-shape weight-dtype]]
-                                       [(keyword (str "v_cache_" i)) [:tensor kv-cache-shape weight-dtype]]])
-                                    (range num-layers))))
-
-        decode-trace-fn (fn [x pos-tracer emb fn-norm & rest-args]
-                          (let [weight-args (take (* 13 num-layers) rest-args)
-                                kv-cache-args (drop (* 13 num-layers) rest-args)
-                                lw-seq (mapv (fn [i [in-ln qw kw vw ow qn kn post-attn-ln pre-mlp-ln post-mlp-ln gw uw dw]]
-                                               {:input-ln-w in-ln :q-w qw :k-w kw :v-w vw :o-w ow
-                                                :q-norm-w qn :k-norm-w kn
-                                                :post-attn-ln-w post-attn-ln :pre-mlp-ln-w pre-mlp-ln :post-mlp-ln-w post-mlp-ln
-                                                :gate-w gw :up-w uw :down-w dw
-                                                :theta-base (if (zero? (mod (inc i) 6)) 1000000.0 10000.0)
-                                                :attn-softcap nil})
-                                             (range num-layers)
-                                             (partition 13 weight-args))
-                                kv-seq (mapv vec (partition 2 kv-cache-args))
-                                [logits updated-kv-caches] (gemma/full-gemma-forward x emb lw-seq fn-norm pos-tracer num-heads num-kv-heads kv-seq pos-tracer {:final-logit-softcap nil})
-                                f32-logits (t/convert logits :f32)]
-                            (into [f32-logits] (apply concat updated-kv-caches))))
-
-        _ (println "Tracing & JIT Compiling Gemma 3 Single-Pass Prefill Graph...")
-        prefill-graph (trace-graph "gemma3_prefill" prefill-invars prefill-trace-fn)
-        prefill-exec (xla/compile-graph ctx prefill-graph)
-
-        _ (println "Tracing & JIT Compiling Gemma 3 Single-Token Decoding Graph...")
-        decode-graph (trace-graph "gemma3_decode" decode-invars decode-trace-fn)
-        decode-exec (xla/compile-graph ctx decode-graph)
-        _ (println "Successfully compiled StableHLO prefill and decode graphs to native XLA PjRtLoadedExecutable handles.")]
-
-    (when verbose
-      (println "\n==================================================================")
-      (println "--- Single-Pass Prefill EDN SSA Graph ---")
-      (pprint/pprint prefill-graph)
-      (println "\n--- Single-Token Decode EDN SSA Graph ---")
-      (pprint/pprint decode-graph)
-      (println "==================================================================\n"))
-
-    {:prefill-exec prefill-exec
-     :decode-exec decode-exec
-     :prefill-graph prefill-graph
-     :decode-graph decode-graph}))
-
-(defn run-prompt-prefill
-  "Runs Single-Pass Prompt Prefill phase on PJRT device runtime."
-  [{:keys [ctx config opts]} executables device-weights initial-kv-bufs prompt-ids]
-  (let [prompt-len (count prompt-ids)
-        {:keys [vocab-size]} config
-        {:keys [temperature top-k]} opts
-        {:keys [prefill-exec]} executables
-        prompt-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array prompt-ids) [1 prompt-len] 4)
-        pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array (range prompt-len)) [prompt-len] 4)
-        flat-kv-bufs (vec (apply concat initial-kv-bufs))
-        prefill-args (into [prompt-buf pos-buf] (concat device-weights flat-kv-bufs))
-        prefill-res (xla/execute prefill-exec prefill-args)
-        prefill-logits-buf (if (vector? prefill-res) (first prefill-res) prefill-res)
-        prefill-kv-flat (if (vector? prefill-res) (rest prefill-res) [])
-        prefill-kv-bufs (mapv vec (partition 2 prefill-kv-flat))
-        last-logits (xla/to-host-slice prefill-logits-buf (dec prompt-len) vocab-size (* prompt-len vocab-size))
-        first-gen-tok (sampling/sample-logits last-logits {:temperature temperature :top-k top-k})]
-    {:first-gen-tok first-gen-tok
-     :prefill-kv-bufs prefill-kv-bufs
-     :prompt-ids prompt-ids}))
-
-(defn run-autoregressive-decode
-  "Runs the single-token autoregressive decoding loop."
-  [{:keys [ctx tokenizer config opts]} executables device-weights prefill-result]
-  (let [{:keys [max-new-tokens temperature top-k]} opts
-        {:keys [vocab-size]} config
-        {:keys [decode-exec]} executables
-        {:keys [first-gen-tok prefill-kv-bufs prompt-ids]} prefill-result
-        prompt-len (count prompt-ids)
-        eos (eos-id tokenizer)]
-    (print (decode tokenizer [first-gen-tok]))
-    (flush)
-    (if (= first-gen-tok eos)
-      (do (println "\nReached EOS token.")
-          (vec prompt-ids))
-      (loop [context (conj (vec prompt-ids) first-gen-tok)
-             current-kv-bufs prefill-kv-bufs
-             pos prompt-len
-             step 1]
-        (if (>= step max-new-tokens)
-          context
-          (let [last-tok (last context)
-                tok-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [last-tok]) [1 1] 4)
-                pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [pos]) [1] 4)
-                flat-kv (vec (apply concat current-kv-bufs))
-                exec-args (into [tok-buf pos-buf] (concat device-weights flat-kv))
-                res-bufs (xla/execute decode-exec exec-args)
-                logits-buf (if (vector? res-bufs) (first res-bufs) res-bufs)
-                new-kv-flat (if (vector? res-bufs) (rest res-bufs) [])
-                updated-kv-bufs (mapv vec (partition 2 new-kv-flat))
-                step-logits (xla/to-host-slice logits-buf 0 vocab-size vocab-size)
-                next-tok (sampling/sample-logits step-logits {:temperature temperature :top-k top-k})
-                next-context (conj context next-tok)]
-            (print (decode tokenizer [next-tok]))
-            (flush)
-            (if (= next-tok eos)
-              next-context
-              (recur next-context updated-kv-bufs (inc pos) (inc step)))))))))
+      :tensor-logic
+      (do
+        (println "Lowering declarative Tensor Logic Gemma 3 AST to StableHLO graph...")
+        (let [cfg (assoc config :max-seq-len max-seq-len :head-dim head-dim)
+              ast (gemma3-logic/gemma3-model-ast cfg)
+              graph (lower/ast->graph "gemma3_logic" invars ast #{:logits})]
+          (xla/compile-graph ctx graph))))))
 
 (defn generate-text
   "Top-level REPL/programmatic helper: runs full end-to-end text generation on an initialized session."
   ([session] (generate-text session (or (:prompt (:opts session)) "The capital of France is")))
   ([session prompt-text]
-   (let [{:keys [tokenizer opts]} session
-         {:keys [max-new-tokens temperature top-k]} opts
-         prompt-ids (into [(bos-id tokenizer)] (encode tokenizer prompt-text))
-         prompt-len (count prompt-ids)]
-     (println (format "Prompt: \"%s\"" prompt-text))
-     (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d, precision=%s"
-                      max-new-tokens temperature top-k (name (get-in session [:config :weight-dtype]))))
+   (let [{:keys [ctx tokenizer config opts]} session
+         {:keys [max-new-tokens temperature top-k method compare chat]} opts
+         {:keys [vocab-size weight-dtype]} config
+         chat? (if (some? chat) (boolean chat) (boolean (re-find #"-it" (or (:model-dir session) ""))))
+         prompt-ids (format-prompt tokenizer prompt-text chat?)
+         prompt-len (count prompt-ids)
+         max-seq-len (max 32 (+ prompt-len max-new-tokens 4))
+         device-weights (allocate-device-weights session)]
+
+     (println (format "Prompt: \"%s\" (chat=%s)" prompt-text chat?))
+     (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d, method=%s, compare=%s"
+                      max-new-tokens temperature top-k method compare))
      (println (format "Encoded Token IDs (%d tokens): %s" prompt-len prompt-ids))
 
-     (println "Transferring Gemma 3 model weights to PJRT Device Memory...")
-     (let [device-weights (allocate-device-weights session)
-           initial-kv-bufs (allocate-kv-caches session)
-           executables (compile-inference-executables session prompt-len)]
-       (println "\nGenerating tokens autoregressively with Gemma 3 Single-Pass Prefill...")
-       (print prompt-text)
-       (flush)
-       (let [prefill-res (run-prompt-prefill session executables device-weights initial-kv-bufs prompt-ids)
-             final-context (run-autoregressive-decode session executables device-weights prefill-res)]
-         (println "\n\n==================================================================")
-         (println "=== End-to-End Gemma 3 Single-Pass Prefill Verification Passed! ===")
+     (if compare
+       (do
+         (println "\n==================================================================")
+         (println "               STARTING E2E PARITY COMPARISON MODE                ")
          (println "==================================================================")
-         final-context)))))
+         (let [exec-trace (compile-executable session max-seq-len :trace)
+               exec-logic (compile-executable session max-seq-len :tensor-logic)
+               input-arr (prepare-input-tensor prompt-ids max-seq-len)
+               input-buf (xla/buffer-from-host-buffer ctx (:client ctx) input-arr [1 max-seq-len] 4)
+               args (into [input-buf] device-weights)
+
+               _ (println "\nExecuting prompt forward pass on both engines...")
+               out-trace (xla/execute exec-trace args)
+               out-logic (xla/execute exec-logic args)
+               buf-t (if (vector? out-trace) (first out-trace) out-trace)
+               buf-l (if (vector? out-logic) (first out-logic) out-logic)
+
+               slice-t (xla/to-host-slice buf-t (dec prompt-len) vocab-size (* max-seq-len vocab-size) weight-dtype)
+               slice-l (xla/to-host-slice buf-l (dec prompt-len) vocab-size (* max-seq-len vocab-size) weight-dtype)
+
+               diffs (mapv (fn [a b] (Math/abs (double (- a b)))) (vec slice-t) (vec slice-l))
+               max-diff (reduce max 0.0 diffs)
+               mean-diff (/ (reduce + 0.0 diffs) (count diffs))
+               top-k-trace (take 5 (sort-by second > (map-indexed vector slice-t)))
+               top-k-logic (take 5 (sort-by second > (map-indexed vector slice-l)))]
+
+           (println "\n--- Logit Parity Metrics ---")
+           (println (format "Max Absolute Error  : %.6e" max-diff))
+           (println (format "Mean Absolute Error : %.6e" mean-diff))
+           (println "Top 5 Logits (Tracer)      :" top-k-trace)
+           (println "Top 5 Logits (Tensor Logic):" top-k-logic)
+
+           (println "\n--- Running Autoregressive Generation Comparison ---")
+           (let [generate-tokens-fn (fn [engine-name exec]
+                                      (println (str "\nGenerating with [" engine-name "]..."))
+                                      (print prompt-text)
+                                      (flush)
+                                      (let [cur-tokens (atom (vec prompt-ids))
+                                            eos (eos-id tokenizer)]
+                                        (dotimes [_ max-new-tokens]
+                                          (let [s-len (count @cur-tokens)
+                                                in-arr (prepare-input-tensor @cur-tokens max-seq-len)
+                                                in-b (xla/buffer-from-host-buffer ctx (:client ctx) in-arr [1 max-seq-len] 4)
+                                                in-args (into [in-b] device-weights)
+                                                out (xla/execute exec in-args)
+                                                out-b (if (vector? out) (first out) out)
+                                                l (xla/to-host-slice out-b (dec s-len) vocab-size (* max-seq-len vocab-size) weight-dtype)
+                                                next-id (sampling/sample-logits l {:temperature temperature :top-k top-k})]
+                                            (swap! cur-tokens conj next-id)
+                                            (print (decode tokenizer [next-id]))
+                                            (flush)
+                                            (when (= next-id eos)
+                                              (reduced nil))))
+                                        (println)
+                                        @cur-tokens))
+                 tokens-trace (generate-tokens-fn "Legacy Tracer" exec-trace)
+                 tokens-logic (generate-tokens-fn "Tensor Logic" exec-logic)
+                 str-trace (decode tokenizer tokens-trace)
+                 str-logic (decode tokenizer tokens-logic)
+                 match? (= tokens-trace tokens-logic)]
+
+             (println "\n==================================================================")
+             (println "                   FINAL VERIFICATION SUMMARY                     ")
+             (println "==================================================================")
+             (println "Legacy Tracer Output:\n" str-trace)
+             (println "\nTensor Logic Output :\n" str-logic)
+             (println "Token Matching:" (if match? "EXACT MATCH (100% PARITY)" "CLOSE PARITY"))
+             tokens-logic)))
+
+       ;; Standard generation with selected method
+       (let [exec (compile-executable session max-seq-len (or method :tensor-logic))
+             eos (eos-id tokenizer)
+             cur-tokens (atom (vec prompt-ids))]
+         (println "Successfully compiled model to native XLA PjRtLoadedExecutable handle.")
+         (println "\nGenerating tokens autoregressively...")
+         (print prompt-text)
+         (flush)
+         (dotimes [_ max-new-tokens]
+           (let [s-len (count @cur-tokens)
+                 in-arr (prepare-input-tensor @cur-tokens max-seq-len)
+                 in-b (xla/buffer-from-host-buffer ctx (:client ctx) in-arr [1 max-seq-len] 4)
+                 in-args (into [in-b] device-weights)
+                 out (xla/execute exec in-args)
+                 out-b (if (vector? out) (first out) out)
+                 l (xla/to-host-slice out-b (dec s-len) vocab-size (* max-seq-len vocab-size) weight-dtype)
+                 next-id (sampling/sample-logits l {:temperature temperature :top-k top-k})]
+             (swap! cur-tokens conj next-id)
+             (print (decode tokenizer [next-id]))
+             (flush)
+             (when (= next-id eos)
+               (println "\nReached EOS token.")
+               (reduced nil))))
+         (println "\n\n==================================================================")
+         (println "Final Generated Sequence:")
+         (println (decode tokenizer @cur-tokens))
+         (println "==================================================================")
+         (println "=== End-to-End Gemma 3 Generation Completed! ===")
+         @cur-tokens)))))
 
 (defn -main
   "CLI entrypoint for Gemma 3 text generation."
   [& args]
   (let [opts (parse-cli-args args)]
     (println "==================================================================")
-    (println "  clj-xla Gemma 3 270M Single-Pass Prefill & BF16 Generation ")
+    (println "      clj-xla Gemma 3 270M End-to-End Text Generation Loop        ")
     (println "==================================================================")
     (let [session (init-inference-session opts)]
       (generate-text session (:prompt opts)))))

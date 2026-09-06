@@ -176,8 +176,9 @@
 
          [q-rope _] (apply-rope q-normed q-normed pos-ids h-dim theta-base rotary-dim nil rope-proportion)
          q-rope-3d (reshape (transpose q-rope [0 2 1 3]) [batch seq-len q-proj-dim])
-         attn-scale (get opts :scale (if (some? q-norm-w) 1.0 (/ 1.0 (Math/sqrt (double h-dim)))))
-         attn-opts {:scale attn-scale}
+         attn-scale (or (:scale opts) (if (some? q-norm-w) 1.0 (/ 1.0 (Math/sqrt (double h-dim)))))
+         attn-opts (cond-> {:scale attn-scale}
+                     (:sliding-window opts) (assoc :sliding-window (:sliding-window opts)))
          kr-shape (second (:type k-rope-3d))
          kv-dim (last kr-shape)
          l-nkv (quot kv-dim h-dim)
@@ -211,6 +212,8 @@
                     :head-dim (:head-dim weights)
                     :rope-proportion rope-proportion
                     :norm-fn norm-fn
+                    :scale (:scale weights)
+                    :sliding-window (:sliding-window weights)
                     :shared-kv shared-kv}
          [attn-raw updated-kv computed-kv] (gemma-attention x-norm1 q-w k-w v-w o-w num-heads num-kv-heads pos-ids past-kv pos attn-opts)
          attn-normed (if post-attn-ln-w (norm-fn attn-raw post-attn-ln-w 1e-6) attn-raw)
