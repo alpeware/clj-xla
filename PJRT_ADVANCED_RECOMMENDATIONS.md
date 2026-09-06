@@ -99,7 +99,7 @@ Because `clj-xla` represents graphs as pure EDN data maps (`{:invars [...], :eqn
 (defn parallel-dense [x w mesh]
   (let [x-sharded (shard-tensor x {:mesh mesh :spec [:replicated :shard_cols]})
         w-sharded (shard-tensor w {:mesh mesh :spec [:shard_rows :replicated]})]
-    (clj-xla.tensor/* x-sharded w-sharded)))
+    [:* x-sharded w-sharded]))
 ```
 
 When generating StableHLO MLIR, `clj-xla.stablehlo` automatically lowers sharding metadata into `squad` partitioning MLIR attributes or `stablehlo.custom_call @Sharding`.

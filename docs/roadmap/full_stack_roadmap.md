@@ -19,7 +19,7 @@ flowchart LR
 ### Phase 1: Local Single-Batch Inference (Current Focus)
 * **Goal**: Minimize single-request ($B=1$) latency on consumer hardware via zero-copy unified memory, in-graph quantization, and speculative decoding.
 * **Key Components**:
-  - StableHLO graph tracing (`clj-xla.trace`).
+  - Pedro Domingos' Declarative Tensor Logic (`clj-xla.logic.*`).
   - Native Panama PJRT C API bindings (`clj-xla.pjrt`).
   - SOTA benchmark suite (`scripts/benchmark.clj`).
   - Gemma 4, GPT-2, SmolLM, and Muse-Glimmer model definitions.
@@ -30,7 +30,7 @@ flowchart LR
 * **Goal**: Build pure Clojure evaluation suites and model distillation utilities for consumer devices.
 * **Key Additions**:
   - Task evaluation harness (MMLU, GSM8K, HumanEval, SWE-bench mini).
-  - Logit distillation loss pipeline (`clj-xla.nn.loss`) to train small draft assistant models (e.g. 15MB EAGLE heads or 300M draft models).
+  - Logit distillation loss pipeline (`clj-xla.logic.nn`) to train small draft assistant models (e.g. 15MB EAGLE heads or 300M draft models).
 
 ---
 

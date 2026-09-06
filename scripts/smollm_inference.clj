@@ -3,11 +3,9 @@
   (:require [clj-xla.core :as xla]
             [clj-xla.logic.lower :as lower]
             [clj-xla.logic.models.smollm :as smollm-logic]
-            [clj-xla.models.smollm :as smollm]
             [clj-xla.safetensors :as st]
             [clj-xla.tokenizer.core :as tok]
-            [clj-xla.tokenizer.protocol :as proto]
-            [clj-xla.trace :refer [trace-graph]])
+            [clj-xla.tokenizer.protocol :as proto])
   (:import [java.lang.foreign Arena]))
 
 (def DEFAULT_CLI_OPTS
@@ -121,7 +119,7 @@
                                          (catch Exception _ nil))
                                     embed-tokens)
               layers-weights (mapv (fn [i]
-                                     (let [kmap (smollm/weight-key-map i)]
+                                     (let [kmap (smollm-logic/weight-key-map i)]
                                        {:input-ln-w (st/get-tensor-floats weights-mmap (:input-ln-w kmap))
                                         :q-w (st/get-tensor-floats weights-mmap (:q-w kmap))
                                         :k-w (st/get-tensor-floats weights-mmap (:k-w kmap))
@@ -151,133 +149,51 @@
                                         [(keyword (str "gate_w_" i)) [:tensor [1536 576] :f32]]
                                         [(keyword (str "up_w_" i)) [:tensor [1536 576] :f32]]
                                         [(keyword (str "down_w_" i)) [:tensor [576 1536] :f32]]])
-                                     (range 30)))
-                compile-fn (fn [comp-method]
-                             (case comp-method
-                               :trace
-                               (do
-                                 (println "Tracing full SmolLM-135M model graph (legacy tracer)...")
-                                 (let [trace-fn (fn [x emb fn-norm lm-hw & layer-args]
-                                                  (let [lw-seq (mapv (fn [[in-ln qw kw vw ow post-ln gw uw dw]]
-                                                                       {:input-ln-w in-ln :q-w qw :k-w kw :v-w vw :o-w ow :post-attn-ln-w post-ln :gate-w gw :up-w uw :down-w dw})
-                                                                     (partition 9 layer-args))]
-                                                    (smollm/full-smollm-forward x emb lw-seq fn-norm lm-hw [0])))
-                                       graph (trace-graph "full_smollm_model_trace" invars trace-fn)]
-                                   (xla/compile-graph ctx graph)))
+                                     (range 30)))]
+            (println "Lowering declarative Tensor Logic SmolLM-135M AST to StableHLO graph...")
+            (let [ast (smollm-logic/smollm-model-ast {:num-layers 30 :max-seq-len max-seq-len})
+                  graph (lower/ast->graph "full_smollm_model_logic" invars ast #{:logits})
+                  exec (xla/compile-graph ctx graph)]
 
-                               :tensor-logic
-                               (do
-                                 (println "Lowering declarative Tensor Logic SmolLM-135M AST to StableHLO graph...")
-                                 (let [ast (smollm-logic/smollm-model-ast {:num-layers 30 :max-seq-len max-seq-len})
-                                       graph (lower/ast->graph "full_smollm_model_logic" invars ast #{:logits})]
-                                   (xla/compile-graph ctx graph)))))]
+              (println "Transferring weights to PJRT Device Memory...")
+              (let [embed-buf (xla/buffer-from-host-buffer ctx (:client ctx) embed-tokens [49152 576] 11)
+                    final-norm-buf (xla/buffer-from-host-buffer ctx (:client ctx) final-norm-w [576] 11)
+                    lm-head-buf (xla/buffer-from-host-buffer ctx (:client ctx) lm-head-w [49152 576] 11)
+                    layer-bufs (mapv (fn [m]
+                                       [(xla/buffer-from-host-buffer ctx (:client ctx) (:input-ln-w m) [576] 11)
+                                        (xla/buffer-from-host-buffer ctx (:client ctx) (:q-w m) [576 576] 11)
+                                        (xla/buffer-from-host-buffer ctx (:client ctx) (:k-w m) [192 576] 11)
+                                        (xla/buffer-from-host-buffer ctx (:client ctx) (:v-w m) [192 576] 11)
+                                        (xla/buffer-from-host-buffer ctx (:client ctx) (:o-w m) [576 576] 11)
+                                        (xla/buffer-from-host-buffer ctx (:client ctx) (:post-attn-ln-w m) [576] 11)
+                                        (xla/buffer-from-host-buffer ctx (:client ctx) (:gate-w m) [1536 576] 11)
+                                        (xla/buffer-from-host-buffer ctx (:client ctx) (:up-w m) [1536 576] 11)
+                                        (xla/buffer-from-host-buffer ctx (:client ctx) (:down-w m) [576 1536] 11)])
+                                     layers-weights)
+                    flat-layer-bufs (vec (apply concat layer-bufs))
+                    flat-device-weights (into [embed-buf final-norm-buf lm-head-buf] flat-layer-bufs)]
 
-            (println "Transferring weights to PJRT Device Memory...")
-            (let [embed-buf (xla/buffer-from-host-buffer ctx (:client ctx) embed-tokens [49152 576] 11)
-                  final-norm-buf (xla/buffer-from-host-buffer ctx (:client ctx) final-norm-w [576] 11)
-                  lm-head-buf (xla/buffer-from-host-buffer ctx (:client ctx) lm-head-w [49152 576] 11)
-                  layer-bufs (mapv (fn [m]
-                                     [(xla/buffer-from-host-buffer ctx (:client ctx) (:input-ln-w m) [576] 11)
-                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:q-w m) [576 576] 11)
-                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:k-w m) [192 576] 11)
-                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:v-w m) [192 576] 11)
-                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:o-w m) [576 576] 11)
-                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:post-attn-ln-w m) [576] 11)
-                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:gate-w m) [1536 576] 11)
-                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:up-w m) [1536 576] 11)
-                                      (xla/buffer-from-host-buffer ctx (:client ctx) (:down-w m) [576 1536] 11)])
-                                   layers-weights)
-                  flat-layer-bufs (vec (apply concat layer-bufs))
-                  flat-device-weights (into [embed-buf final-norm-buf lm-head-buf] flat-layer-bufs)]
-
-              (if compare
-                (do
-                  (println "\n==================================================================")
-                  (println "               STARTING E2E PARITY COMPARISON MODE                ")
+                (println "Successfully compiled model to native XLA PjRtLoadedExecutable handle.")
+                (println "\nGenerating tokens autoregressively...")
+                (print prompt)
+                (flush)
+                (let [cur-tokens (atom (vec prompt-ids))]
+                  (dotimes [_ max-new-tokens]
+                    (let [s-len (count @cur-tokens)
+                          in-arr (prepare-input-tensor @cur-tokens max-seq-len)
+                          in-b (xla/buffer-from-host-buffer ctx (:client ctx) in-arr [1 max-seq-len] 4)
+                          args (into [in-b] flat-device-weights)
+                          out (xla/execute exec args)
+                          l (xla/to-host-slice out (dec s-len) 49152)
+                          next-id (sample-logits l temperature top-k)]
+                      (swap! cur-tokens conj next-id)
+                      (print (proto/decode tokenizer [next-id]))
+                      (flush)))
+                  (println "\n\n==================================================================")
+                  (println "Final Generated Sequence:")
+                  (println (proto/decode tokenizer @cur-tokens))
                   (println "==================================================================")
-                  (let [exec-trace (compile-fn :trace)
-                        exec-logic (compile-fn :tensor-logic)
-                        seq-len (count prompt-ids)
-                        input-array (prepare-input-tensor prompt-ids max-seq-len)
-                        input-buf (xla/buffer-from-host-buffer ctx (:client ctx) input-array [1 max-seq-len] 4)
-                        input-args (into [input-buf] flat-device-weights)
-
-                        _ (println "\nExecuting prompt forward pass on both engines...")
-                        out-trace (xla/execute exec-trace input-args)
-                        out-logic (xla/execute exec-logic input-args)
-                        logits-trace (xla/to-host-slice out-trace (dec seq-len) 49152)
-                        logits-logic (xla/to-host-slice out-logic (dec seq-len) 49152)
-
-                        diffs (mapv (fn [a b] (Math/abs (double (- a b)))) logits-trace logits-logic)
-                        max-diff (reduce max 0.0 diffs)
-                        mean-diff (/ (reduce + 0.0 diffs) (count diffs))
-                        top-k-trace (take 5 (sort-by second > (map-indexed vector logits-trace)))
-                        top-k-logic (take 5 (sort-by second > (map-indexed vector logits-logic)))]
-
-                    (println "\n--- Logit Parity Metrics ---")
-                    (println (format "Max Absolute Error  : %.6e" max-diff))
-                    (println (format "Mean Absolute Error : %.6e" mean-diff))
-                    (println "Top 5 Logits (Tracer)      :" top-k-trace)
-                    (println "Top 5 Logits (Tensor Logic):" top-k-logic)
-
-                    (println "\n--- Running Autoregressive Generation Comparison ---")
-                    (let [generate-tokens-fn (fn [engine-name exec]
-                                               (println (str "\nGenerating with [" engine-name "]..."))
-                                               (print prompt)
-                                               (flush)
-                                               (let [cur-tokens (atom (vec prompt-ids))]
-                                                 (dotimes [_ max-new-tokens]
-                                                   (let [s-len (count @cur-tokens)
-                                                         in-arr (prepare-input-tensor @cur-tokens max-seq-len)
-                                                         in-b (xla/buffer-from-host-buffer ctx (:client ctx) in-arr [1 max-seq-len] 4)
-                                                         args (into [in-b] flat-device-weights)
-                                                         out (xla/execute exec args)
-                                                         l (xla/to-host-slice out (dec s-len) 49152)
-                                                         next-id (sample-logits l temperature top-k)]
-                                                     (swap! cur-tokens conj next-id)
-                                                     (print (proto/decode tokenizer [next-id]))
-                                                     (flush)))
-                                                 (println)
-                                                 @cur-tokens))
-                          tokens-trace (generate-tokens-fn "Legacy Tracer" exec-trace)
-                          tokens-logic (generate-tokens-fn "Tensor Logic" exec-logic)
-                          str-trace (proto/decode tokenizer tokens-trace)
-                          str-logic (proto/decode tokenizer tokens-logic)
-                          match? (= tokens-trace tokens-logic)]
-
-                      (println "\n==================================================================")
-                      (println "                   FINAL VERIFICATION SUMMARY                     ")
-                      (println "==================================================================")
-                      (println "Legacy Tracer Output:\n" str-trace)
-                      (println "\nTensor Logic Output :\n" str-logic)
-                      (println "Token Matching:" (if match? "EXACT MATCH (100% PARITY)" "MISMATCH"))
-                      (when-not match?
-                        (throw (ex-info "E2E Parity Mismatch between Tracer and Tensor Logic"
-                                        {:trace-tokens tokens-trace :logic-tokens tokens-logic}))))))
-
-                ;; Normal generation with selected method
-                (let [exec (compile-fn (or method :tensor-logic))]
-                  (println "Successfully compiled model to native XLA PjRtLoadedExecutable handle.")
-                  (println "\nGenerating tokens autoregressively...")
-                  (print prompt)
-                  (flush)
-                  (let [cur-tokens (atom (vec prompt-ids))]
-                    (dotimes [_ max-new-tokens]
-                      (let [s-len (count @cur-tokens)
-                            in-arr (prepare-input-tensor @cur-tokens max-seq-len)
-                            in-b (xla/buffer-from-host-buffer ctx (:client ctx) in-arr [1 max-seq-len] 4)
-                            args (into [in-b] flat-device-weights)
-                            out (xla/execute exec args)
-                            l (xla/to-host-slice out (dec s-len) 49152)
-                            next-id (sample-logits l temperature top-k)]
-                        (swap! cur-tokens conj next-id)
-                        (print (proto/decode tokenizer [next-id]))
-                        (flush)))
-                    (println "\n\n==================================================================")
-                    (println "Final Generated Sequence:")
-                    (println (proto/decode tokenizer @cur-tokens))
-                    (println "==================================================================")
-                    (println "=== End-to-End SmolLM-135M Generation Completed! ===")))))))))))
+                  (println "=== End-to-End SmolLM-135M Generation Completed! ==="))))))))))
 
 (defn -main-wrapper [& args]
   (apply -main args))

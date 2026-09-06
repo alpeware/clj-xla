@@ -4,22 +4,19 @@ This guide outlines the debugging, profiling, and telemetry tracing tools built 
 
 ---
 
-## 1. 🔍 Debugging Affordances (JAX Baseline Parity)
+## 1. 🔍 Graph Introspection & Metadata Annotations
 
-`clj-xla.debug` provides functional assertions and location metadata annotations that mirror JAX's `jax.debug` and `checkify` modules.
+In `clj-xla`, StableHLO equations support attached metadata and source locations directly in equation `:attrs` or via Tensor Logic AST annotations:
 
-### A. Location Metadata (`with-xla-metadata`)
-In large multi-layer architectures like Gemma 4 ($35$ layers), locating which specific layer or matrix multiplication triggered an issue can be difficult in raw MLIR text. `with-xla-metadata` attaches scoped location labels (`loc("gemma/layer_12/attn_matmul")`) to every traced equation:
+### A. Location Metadata
+In large multi-layer architectures like Gemma 4 ($35$ layers), locating which specific layer or matrix multiplication triggered an issue can be difficult in raw MLIR text. Attaching location labels (`loc("gemma/layer_12/attn_matmul")`) to equations or AST nodes carries through into StableHLO MLIR:
 
 ```clojure
-(require '[clj-xla.debug :as debug]
-         '[clj-xla.tensor :as t])
-
-(defn gemma-layer
-  [layer-id x weights]
-  (debug/with-xla-metadata {:op-name (str "gemma/layer_" layer-id "/attn")}
-    (let [qkv (t/dot-general x (:qkv-w weights) ...)]
-      qkv)))
+;; StableHLO SSA Equation with explicit metadata
+{:op :stablehlo/dot_general
+ :invars [:x :qkv_w]
+ :outvars [:t_dot_12]
+ :attrs {:loc "gemma/layer_12/attn"}}
 ```
 
 When serialized via `clj-xla.stablehlo/graph->mlir-text`, instructions inherit exact source labels:
@@ -27,15 +24,14 @@ When serialized via `clj-xla.stablehlo/graph->mlir-text`, instructions inherit e
 %t_dot_12 = "stablehlo.dot_general"(%x, %qkv_w) { ... } : (tensor<1x1x768xf32>, tensor<768x2304xf32>) -> tensor<1x1x2304xf32> loc("gemma/layer_12/attn")
 ```
 
-### B. Functional Assertions (`check-non-nan` & `check-non-inf`)
-To catch exploding gradients or activation NaNs without crashing native OpenXLA executables, `check-non-nan` instruments the MLIR graph with runtime validation assertions:
+### B. Graph Validation
+To catch ill-formed graphs, shape mismatches, or malformed ASTs before passing to the native compiler, Malli schema validation is run ahead-of-time via `clj-xla.stablehlo`:
 
 ```clojure
-(defn safe-attention-softmax
-  [logits]
-  (let [probs (t/softmax logits)
-        _ (debug/check-non-nan probs "NaN detected in attention softmax probabilities")]
-    probs))
+(require '[malli.core :as m]
+         '[clj-xla.stablehlo :as shlo])
+
+(m/validate shlo/GraphSchema graph)
 ```
 
 ---

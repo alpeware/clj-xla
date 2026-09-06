@@ -1,16 +1,13 @@
 (ns clj-xla.generation.autoregressive
   "Autoregressive token-by-token generation strategy."
-  (:require [clj-xla.sampling :as sampling]
-            [clj-xla.tensor :as tensor]))
+  (:require [clj-xla.sampling :as sampling]))
 
 (defn init-kv-caches
-  "Pre-allocates empty KV-cache tensors up to `max-seq-len` for `num-layers`."
-  ([num-layers shape]
-   (vec (for [_ (range num-layers)]
-          [(tensor/emit-constant! 0.0 shape)
-           (tensor/emit-constant! 0.0 shape)])))
+  "Pre-allocates empty KV-cache descriptors up to `max-seq-len` for `num-layers`."
+  ([num-layers _shape]
+   (vec (repeat num-layers [nil nil])))
   ([num-layers batch num-kv-heads max-seq-len head-dim]
-   (init-kv-caches num-layers [:tensor [batch num-kv-heads max-seq-len head-dim] :f32])))
+   (init-kv-caches num-layers [batch num-kv-heads max-seq-len head-dim])))
 
 (defn generate-tokens-cached
   "Generates tokens autoregressively using KV-caching.

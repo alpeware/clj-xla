@@ -8,7 +8,7 @@ Welcome to the **`clj-xla` Architectural Documentation & LLM Knowledge Base**.
 
 ## 💡 Why OpenXLA & `clj-xla`?
 
-1. **Pure Functional Trace Graphs**: Neural network architectures are traced into pure Clojure EDN graph structures using [`clj-xla.trace/trace-graph`](../src/clj_xla/trace.clj#L15).
+1. **Pedro Domingos' Declarative Tensor Logic**: Neural network architectures are defined as homoiconic, relational AST data structures using [`clj-xla.logic.*`](../src/clj_xla/logic/core.clj) and lowered directly into StableHLO SSA graphs.
 2. **StableHLO MLIR Codegen**: Graphs are serialized into standard StableHLO MLIR text representation via [`clj-xla.stablehlo`](../src/clj_xla/stablehlo.clj#L20).
 3. **Multi-Backend Portability**: A single Clojure model definition compiles seamlessly to native CPU binaries (`libpjrt_cpu.so`), Intel GPU Level-Zero (`libpjrt_sycl.so`), AMD ROCm (`libpjrt_rocm.so`), and NVIDIA CUDA (`libcudart.so`) via [`clj-xla.core/init-backend!`](../src/clj_xla/core.clj#L45).
 4. **Kernel Fusion & Hardware Acceleration**: OpenXLA automatically fuses elementwise operations, normalizations, and GEMM matrix multiplications into hardware tensor-core kernels (Intel XMX, AMD Matrix Cores, NVIDIA Tensor Cores).
@@ -49,7 +49,7 @@ Technical specifications for long-running autonomous AI agent loops, OpenXLA har
 
 ---
 
-## 🏛️ Model Specifications Index & Visual Trace Graphs
+## 🏛️ Model Specifications Index & Execution Graphs
 
 Every supported model family includes architectural details, hyperparameter specifications, and visual Mermaid diagrams of its StableHLO execution graph:
 

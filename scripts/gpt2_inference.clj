@@ -3,11 +3,9 @@
   (:require [clj-xla.core :as xla]
             [clj-xla.logic.lower :as lower]
             [clj-xla.logic.models.gpt2 :as gpt2-logic]
-            [clj-xla.models.gpt2 :refer [full-gpt2-forward]]
             [clj-xla.safetensors :as st]
             [clj-xla.tokenizer.bpe :as bpe]
-            [clj-xla.tokenizer.protocol :as proto]
-            [clj-xla.trace :refer [trace-graph]])
+            [clj-xla.tokenizer.protocol :as proto])
   (:import [java.lang.foreign Arena]))
 
 (defn- parse-cli-args [args]
@@ -88,7 +86,7 @@
     [(vec padded)]))
 
 (defn -main [& args]
-  (let [{:keys [prompt max-new-tokens temperature top-k backend method compare]} (parse-cli-args args)]
+  (let [{:keys [prompt max-new-tokens temperature top-k backend]} (parse-cli-args args)]
     (println "==================================================================")
     (println "      clj-xla GPT-2 End-to-End Autoregressive Generation Loop     ")
     (println "==================================================================")
@@ -158,29 +156,10 @@
           (println (format "Parsed Safetensors header (%d tensors, %d layers loaded)."
                            (count header) num-layers))
 
-          (let [compile-fn (fn [m]
-                             (case m
-                               :trace
-                               (do
-                                 (println "Tracing & JIT Compiling full GPT-2 via legacy tracer graph...")
-                                 (let [graph (trace-graph "full_gpt2_model" invars
-                                                          (fn [x pos-ids ln_f_g ln_f_b wte wpe & flat-weights]
-                                                            (let [layer-maps (mapv (fn [chunk]
-                                                                                     {:ln1-g (nth chunk 0) :ln1-b (nth chunk 1)
-                                                                                      :c-attn-w (nth chunk 2) :c-attn-b (nth chunk 3)
-                                                                                      :c-proj-w (nth chunk 4) :c-proj-b (nth chunk 5)
-                                                                                      :ln2-g (nth chunk 6) :ln2-b (nth chunk 7)
-                                                                                      :mlp-fc-w (nth chunk 8) :mlp-fc-b (nth chunk 9)
-                                                                                      :mlp-proj-w (nth chunk 10) :mlp-proj-b (nth chunk 11)})
-                                                                                   (partition 12 flat-weights))]
-                                                              (full-gpt2-forward x pos-ids ln_f_g ln_f_b wte wpe layer-maps))))]
-                                   (xla/compile-graph ctx graph)))
-                               :tensor-logic
-                               (do
-                                 (println "Lowering & JIT Compiling full GPT-2 via Tensor Logic Hiccup AST...")
-                                 (let [ast (gpt2-logic/gpt2-model-ast {:num-layers num-layers :max-seq-len max-seq-len})
-                                       graph (lower/ast->graph "full_gpt2_model_logic" invars ast #{:logits})]
-                                   (xla/compile-graph ctx graph)))))
+          (println "Lowering & JIT Compiling full GPT-2 via Tensor Logic Hiccup AST...")
+          (let [ast (gpt2-logic/gpt2-model-ast {:num-layers num-layers :max-seq-len max-seq-len})
+                graph (lower/ast->graph "full_gpt2_model_logic" invars ast #{:logits})
+                exec (xla/compile-graph ctx graph)
                 pos-array (int-array (range max-seq-len))
                 pos-buf (xla/buffer-from-host-buffer ctx (:client ctx) pos-array [1 max-seq-len] 4)
                 ln-f-g-buf (xla/buffer-from-host-buffer ctx (:client ctx) ln-f-g [768] 11)
@@ -195,89 +174,25 @@
                                   flat-layer-weights)
                 flat-device-weights (into [pos-buf ln-f-g-buf ln-f-b-buf wte-buf wpe-buf] weight-bufs)]
 
-            (if compare
-              (do
-                (println "\n==================================================================")
-                (println "               STARTING E2E PARITY COMPARISON MODE                ")
-                (println "==================================================================")
-                (let [exec-trace (compile-fn :trace)
-                      exec-logic (compile-fn :tensor-logic)
-                      seq-len (count encoded-tokens)
-                      input-tensor (prepare-input-tensor encoded-tokens max-seq-len)
+            (println "Successfully compiled model to native XLA PjRtLoadedExecutable handle.")
+            (println "\nGenerating tokens autoregressively...")
+            (print prompt)
+            (flush)
+            (let [cur-tokens (atom encoded-tokens)]
+              (dotimes [_ max-new-tokens]
+                (let [seq-len (count @cur-tokens)
+                      input-tensor (prepare-input-tensor @cur-tokens max-seq-len)
                       input-args (into [input-tensor] flat-device-weights)
-
-                      _ (println "\nExecuting prompt forward pass on both engines...")
-                      out-trace (xla/execute exec-trace input-args)
-                      out-logic (xla/execute exec-logic input-args)
-                      logits-trace (xla/to-host-slice out-trace (dec seq-len) 50257 (* max-seq-len 50257))
-                      logits-logic (xla/to-host-slice out-logic (dec seq-len) 50257 (* max-seq-len 50257))
-
-                      diffs (mapv (fn [a b] (Math/abs (double (- a b)))) logits-trace logits-logic)
-                      max-diff (reduce max 0.0 diffs)
-                      mean-diff (/ (reduce + 0.0 diffs) (count diffs))
-                      top-k-trace (take 5 (sort-by second > (map-indexed vector logits-trace)))
-                      top-k-logic (take 5 (sort-by second > (map-indexed vector logits-logic)))]
-
-                  (println "\n--- Logit Parity Metrics ---")
-                  (println (format "Max Absolute Error  : %.6e" max-diff))
-                  (println (format "Mean Absolute Error : %.6e" mean-diff))
-                  (println "Top 5 Logits (Tracer)      :" top-k-trace)
-                  (println "Top 5 Logits (Tensor Logic):" top-k-logic)
-
-                  (println "\n--- Running Autoregressive Generation Comparison ---")
-                  (let [generate-tokens (fn [engine-name exec]
-                                          (println (str "\nGenerating with [" engine-name "]..."))
-                                          (print prompt)
-                                          (flush)
-                                          (let [cur-tokens (atom encoded-tokens)]
-                                            (dotimes [_ max-new-tokens]
-                                              (let [s-len (count @cur-tokens)
-                                                    in-t (prepare-input-tensor @cur-tokens max-seq-len)
-                                                    args (into [in-t] flat-device-weights)
-                                                    out (xla/execute exec args)
-                                                    l (xla/to-host-slice out (dec s-len) 50257 (* max-seq-len 50257))
-                                                    next-id (sample-logits l temperature top-k)]
-                                                (swap! cur-tokens conj next-id)
-                                                (print (bpe-token->str (get id->tok next-id next-id)))
-                                                (flush)))
-                                            (println)
-                                            @cur-tokens))
-                        tokens-trace (generate-tokens "Legacy Tracer" exec-trace)
-                        tokens-logic (generate-tokens "Tensor Logic" exec-logic)
-                        str-trace (proto/decode tokenizer tokens-trace)
-                        str-logic (proto/decode tokenizer tokens-logic)
-                        match? (= tokens-trace tokens-logic)]
-
-                    (println "\n==================================================================")
-                    (println "                   FINAL VERIFICATION SUMMARY                     ")
-                    (println "==================================================================")
-                    (println "Legacy Tracer Output:\n" str-trace)
-                    (println "\nTensor Logic Output :\n" str-logic)
-                    (println "Token Matching:" (if match? "EXACT MATCH (100% PARITY)" "MISMATCH"))
-                    (when-not match?
-                      (throw (ex-info "E2E Parity Mismatch between Tracer and Tensor Logic"
-                                      {:trace-tokens tokens-trace :logic-tokens tokens-logic}))))))
-
-              (let [exec (compile-fn (or method :tensor-logic))]
-                (println "Successfully compiled model to native XLA PjRtLoadedExecutable handle.")
-                (println "\nGenerating tokens autoregressively...")
-                (print prompt)
-                (flush)
-                (let [cur-tokens (atom encoded-tokens)]
-                  (dotimes [_ max-new-tokens]
-                    (let [seq-len (count @cur-tokens)
-                          input-tensor (prepare-input-tensor @cur-tokens max-seq-len)
-                          input-args (into [input-tensor] flat-device-weights)
-                          out (xla/execute exec input-args)
-                          logits (xla/to-host-slice out (dec seq-len) 50257 (* max-seq-len 50257))
-                          next-id (sample-logits logits temperature top-k)]
-                      (swap! cur-tokens conj next-id)
-                      (print (bpe-token->str (get id->tok next-id next-id)))
-                      (flush)))
-                  (println "\n\n==================================================================")
-                  (println "Final Generated Sequence:")
-                  (println (proto/decode tokenizer @cur-tokens))
-                  (println "=================================================================="))))))))))
+                      out (xla/execute exec input-args)
+                      logits (xla/to-host-slice out (dec seq-len) 50257 (* max-seq-len 50257))
+                      next-id (sample-logits logits temperature top-k)]
+                  (swap! cur-tokens conj next-id)
+                  (print (bpe-token->str (get id->tok next-id next-id)))
+                  (flush)))
+              (println "\n\n==================================================================")
+              (println "Final Generated Sequence:")
+              (println (proto/decode tokenizer @cur-tokens))
+              (println "=================================================================="))))))))
 
 (defn -main-wrapper [& args]
   (apply -main args))

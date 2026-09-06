@@ -39,5 +39,5 @@ flowchart TD
 
 ## 3. Clojure Implementation in `clj-xla`
 
-- **Prefill Execution**: Handled in [`clj-xla.generation/autoregressive-cached-step`](../../src/clj_xla/generation.clj#L20) where prompt sequence tokens are evaluated in a single matrix pass.
-- **Decoding Loop**: Executed iteratively in [`clj-xla.generation/autoregressive-cached-step`](../../src/clj_xla/generation.clj#L45) passing length-1 tokens alongside updated KV-cache handles.
+- **Prefill Execution**: Handled in [`clj-xla.generation.autoregressive`](../../src/clj_xla/generation/autoregressive.clj) where prompt sequence tokens are evaluated in a single matrix pass.
+- **Decoding Loop**: Executed iteratively in [`clj-xla.generation.autoregressive`](../../src/clj_xla/generation/autoregressive.clj) passing length-1 tokens alongside updated KV-cache handles.

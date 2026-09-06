@@ -69,15 +69,10 @@ flowchart TD
 Instead of a single tensor `[1, 1, 10240, 256]`, the cache is defined as a block tensor `[num_blocks, 1024, 256]`:
 
 ```clojure
-(defn update-paged-kv-cache
-  [page-blocks block-table token-pos new-k new-v]
-  (let [page-size 1024
-        block-idx (clj-xla.tensor/quot token-pos page-size)
-        offset-in-block (clj-xla.tensor/rem token-pos page-size)
-        physical-block-id (clj-xla.tensor/gather block-table [block-idx])]
-    ;; Dynamic slice update operates strictly within a 1024-token page
-    (clj-xla.tensor/dynamic-update-slice
-     page-blocks new-k [physical-block-id offset-in-block 0])))
+;; StableHLO dynamic_update_slice within a physical block page:
+{:op :stablehlo/dynamic_update_slice
+ :invars [:page_blocks :new_k :slice_indices]
+ :outvars [:updated_page_blocks]}
 ```
 
 ---

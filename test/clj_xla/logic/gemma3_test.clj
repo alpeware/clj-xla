@@ -5,7 +5,6 @@
             [clj-xla.logic.expand :as expand]
             [clj-xla.logic.lower :as lower]
             [clj-xla.logic.models.gemma3 :as gemma3]
-            [clj-xla.models.gemma :as gemma-legacy]
             [clj-xla.stablehlo :as shlo]
             [clojure.test :refer [deftest is]]
             [clojure.test.check.clojure-test :refer [defspec]]
@@ -15,7 +14,7 @@
 (defspec prop-gemma3-layer-ast-validity 20
   (prop/for-all [layer-idx (gen/choose 0 17)
                  seq-len (gen/elements [4 8 16])]
-                (let [config (assoc (gemma-legacy/gemma3-config) :head-dim 256)
+                (let [config (assoc (gemma3/gemma3-config) :head-dim 256)
                       layer-ast (gemma3/gemma3-layer-ast layer-idx seq-len config)
                       expanded (expand/expand-ast {} layer-ast)]
                   (and (vector? layer-ast)

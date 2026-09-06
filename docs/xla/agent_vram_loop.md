@@ -41,38 +41,23 @@ In StableHLO MLIR, `stablehlo.while` accepts a single state tuple `(T_0, T_1, ..
 
 $$\text{LoopState} = \Big(\text{step}, \text{cur\_token}, \text{tokens\_out}, \text{rng\_state}, K_0, V_0, K_1, V_1, \dots, K_{34}, V_{34}\Big)$$
 
-### Clojure Trace Graph Representation
-Using [`clj-xla.trace`](../../src/clj_xla/trace.clj), the loop state tuple is defined as an immutable Clojure vector passed to `stablehlo/while`:
+### StableHLO SSA Graph Representation
+In `clj-xla`, the loop state tuple is defined as an immutable SSA vector lowered into a `:stablehlo/while` equation:
 
 ```clojure
-(defn build-in-vram-agent-loop
-  [model-fn config max-tokens]
-  (let [num-layers (:num-layers config)]
-    (clj-xla.trace/trace-graph
-     (fn [init-token init-kv-caches]
-       (clj-xla.tensor/while-loop
-        ;; Loop Condition: step < max-tokens
-        (fn [[step cur-tok tokens-out kv-caches]]
-          (clj-xla.tensor/< step max-tokens))
-        
-        ;; Loop Body: Forward Pass -> Sample Token -> Update KV -> Increment Step
-        (fn [[step cur-tok tokens-out kv-caches]]
-          (let [;; 1. Run single-token forward pass
-                [logits updated-kv] (model-fn cur-tok step kv-caches)
-                
-                ;; 2. In-Graph Top-K Sampling
-                next-tok (clj-xla.sampling/sample-top-k logits 0.7 10)
-                
-                ;; 3. Update token history array
-                updated-tokens (clj-xla.tensor/dynamic-update-slice 
-                                tokens-out (clj-xla.tensor/reshape next-tok [1]) [step])
-                
-                ;; 4. Increment step counter
-                next-step (clj-xla.tensor/+ step 1)]
-            [next-step next-tok updated-tokens updated-kv]))
-        
-        ;; Initial State Tuple
-        [0 init-token (clj-xla.tensor/zeros [max-tokens] :i32) init-kv-caches])))))
+(defn build-in-vram-agent-loop-graph
+  [config max-tokens]
+  ;; Cond graph: checks if step < max-tokens
+  ;; Body graph: single-token model forward -> sample -> update KV -> step + 1
+  {:name "in_vram_agent_loop"
+   :invars [[:init_token {:type [:tensor [1] :i32]}]
+            [:init_tokens_out {:type [:tensor [max-tokens] :i32]}]]
+   :outvars [:final_state]
+   :eqns [{:op :stablehlo/while
+           :invars [:init_token :init_tokens_out]
+           :outvars [:final_state]
+           :attrs {:cond-graph cond-graph
+                   :body-graph body-graph}}]})
 ```
 
 ---

@@ -1,19 +1,15 @@
 (ns clj-xla.benchmark.workloads
   "Standard benchmark workload specifications (GEMM, RMSNorm, SwiGLU, GQA Attention, GPT-2 block, Gemma 4 block)."
   (:require [clj-xla.benchmark.core :as bcore]
-            [clj-xla.models.gemma :as gemma]
-            [clj-xla.models.gpt2 :as gpt2]
-            [clj-xla.nn.activations :refer [swiglu]]
-            [clj-xla.nn.norm :refer [rms-norm]]
-            [clj-xla.tensor :as t]
-            [clj-xla.trace :refer [trace-graph]]))
+            [clj-xla.logic.lower :as lower]))
 
 (defn build-gemm-graph
   [m n k dtype]
-  (trace-graph (str "gemm_" (name dtype) "_" m "_" n "_" k)
-               [[:a [:tensor [m k] dtype]]
+  (let [invars [[:a [:tensor [m k] dtype]]
                 [:b [:tensor [k n] dtype]]]
-               (fn [a b] (t/matmul a b))))
+        ast [[:= [:c :m :n] [:a :m :k] [:b :k :n]]]]
+    (lower/ast->graph (str "gemm_" (name dtype) "_" m "_" n "_" k)
+                      invars ast [:c])))
 
 (defn make-gemm-inputs
   [m n k dtype]
@@ -27,10 +23,11 @@
 
 (defn build-rms-norm-graph
   [batch seq-len dim dtype]
-  (trace-graph (str "rms_norm_" batch "_" seq-len "_" dim)
-               [[:x [:tensor [batch seq-len dim] dtype]]
+  (let [invars [[:x [:tensor [batch seq-len dim] dtype]]
                 [:w [:tensor [dim] dtype]]]
-               (fn [x w] (rms-norm x w 1e-6))))
+        ast [[:rms-norm [:out :b :s :d] [:x :b :s :d] [:w :d] {:eps 1e-6}]]]
+    (lower/ast->graph (str "rms_norm_" batch "_" seq-len "_" dim)
+                      invars ast [:out])))
 
 (defn make-rms-norm-inputs
   [batch seq-len dim _dtype]
@@ -39,15 +36,15 @@
 
 (defn build-swiglu-graph
   [batch seq-len dim dtype]
-  (let [inter (* 4 dim)]
-    (trace-graph (str "swiglu_" batch "_" seq-len "_" dim)
-                 [[:x [:tensor [batch seq-len dim] dtype]]
-                  [:gate_w [:tensor [dim inter] dtype]]
-                  [:up_w [:tensor [dim inter] dtype]]]
-                 (fn [x gw uw]
-                   (let [gate (gemma/linear x gw nil)
-                         up (gemma/linear x uw nil)]
-                     (swiglu gate up))))))
+  (let [inter (* 4 dim)
+        invars [[:x [:tensor [batch seq-len dim] dtype]]
+                [:gate_w [:tensor [dim inter] dtype]]
+                [:up_w [:tensor [dim inter] dtype]]]
+        ast [[:= [:gate :b :s :i] {:act :swish} [:x :b :s :d] [:gate_w :d :i]]
+             [:= [:up :b :s :i] [:x :b :s :d] [:up_w :d :i]]
+             [:= [:out :b :s :i] [:gate :b :s :i] [:up :b :s :i]]]]
+    (lower/ast->graph (str "swiglu_" batch "_" seq-len "_" dim)
+                      invars ast [:out])))
 
 (defn make-swiglu-inputs
   [batch seq-len dim _dtype]
@@ -60,16 +57,45 @@
   [batch seq-len num-heads num-kv-heads head-dim dtype]
   (let [q-dim (* num-heads head-dim)
         kv-dim (* num-kv-heads head-dim)
-        hidden-dim q-dim]
-    (trace-graph (str "gqa_attn_" batch "_" seq-len "_" num-heads "_" num-kv-heads)
-                 [[:x [:tensor [batch seq-len hidden-dim] dtype]]
-                  [:q_w [:tensor [q-dim hidden-dim] dtype]]
-                  [:k_w [:tensor [kv-dim hidden-dim] dtype]]
-                  [:v_w [:tensor [kv-dim hidden-dim] dtype]]
-                  [:o_w [:tensor [hidden-dim q-dim] dtype]]
-                  [:pos [:tensor [seq-len] :i32]]]
-                 (fn [x qw kw vw ow pos]
-                   (first (gemma/gemma-attention x qw kw vw ow num-heads num-kv-heads pos))))))
+        hidden-dim q-dim
+        group-size (quot num-heads num-kv-heads)
+        scale (/ 1.0 (Math/sqrt (double head-dim)))
+        invars [[:x [:tensor [batch seq-len hidden-dim] dtype]]
+                [:q_w [:tensor [q-dim hidden-dim] dtype]]
+                [:k_w [:tensor [kv-dim hidden-dim] dtype]]
+                [:v_w [:tensor [kv-dim hidden-dim] dtype]]
+                [:o_w [:tensor [hidden-dim q-dim] dtype]]
+                [:pos [:tensor [seq-len] :i32]]]
+        ast [;; 1. Projections
+             [:= [:q_raw :b :p :qd] [:x :b :p :d] [:q_w :qd :d]]
+             [:= [:k_raw :b :p :kvd] [:x :b :p :d] [:k_w :kvd :d]]
+             [:= [:v_raw :b :p :kvd] [:x :b :p :d] [:v_w :kvd :d]]
+             ;; 2. RoPE
+             [:rope [:q_rope :b :p :qd] [:q_raw :b :p :qd] {:head-dim head-dim :theta 10000.0}]
+             [:rope [:k_rope :b :p :kvd] [:k_raw :b :p :kvd] {:head-dim head-dim :theta 10000.0}]
+             ;; 3. Reshape to heads
+             [:reshape [:q_heads :b :h :p :hd] [:q_rope :b :p :qd] {:shape [batch num-heads seq-len head-dim]}]
+             [:reshape [:k_heads :b :kvh :p :hd] [:k_rope :b :p :kvd] {:shape [batch num-kv-heads seq-len head-dim]}]
+             [:reshape [:v_heads :b :kvh :p :hd] [:v_raw :b :p :kvd] {:shape [batch num-kv-heads seq-len head-dim]}]
+             ;; 4. GQA Expand
+             (if (> group-size 1)
+               [:block {:name :gqa_expand}
+                [:= [:k_rep :b :kvh :g :p :hd] [:k_heads :b :kvh :p :hd] {:shape [batch num-kv-heads group-size seq-len head-dim]}]
+                [:reshape [:k_full :b :h :p :hd] [:k_rep :b :kvh :g :p :hd] {:shape [batch num-heads seq-len head-dim]}]
+                [:= [:v_rep :b :kvh :g :p :hd] [:v_heads :b :kvh :p :hd] {:shape [batch num-kv-heads group-size seq-len head-dim]}]
+                [:reshape [:v_full :b :h :p :hd] [:v_rep :b :kvh :g :p :hd] {:shape [batch num-heads seq-len head-dim]}]]
+               [:block {:name :mha_view}
+                [:= [:k_full :b :h :p :hd] [:k_heads :b :h :p :hd]]
+                [:= [:v_full :b :h :p :hd] [:v_heads :b :h :p :hd]]])
+             ;; 5. Attention
+             [:= [:scores_raw :b :h :p :k] {:scale scale} [:q_heads :b :h :p :hd] [:k_full :b :h :k :hd]]
+             [:causal-softmax [:attn_weights :b :h :p :k] [:scores_raw :b :h :p :k]]
+             [:= [:attn_ctx :b :h :p :hd] [:attn_weights :b :h :p :k] [:v_full :b :h :k :hd]]
+             ;; 6. Out proj
+             [:reshape [:attn_proj_in :b :p :qd] [:attn_ctx :b :h :p :hd] {:shape [batch seq-len q-dim]}]
+             [:= [:out :b :p :d] [:attn_proj_in :b :p :qd] [:o_w :d :qd]]]]
+    (lower/ast->graph (str "gqa_attn_" batch "_" seq-len "_" num-heads "_" num-kv-heads)
+                      invars ast [:out])))
 
 (defn make-gqa-attn-inputs
   [batch seq-len num-heads num-kv-heads head-dim _dtype]
@@ -86,28 +112,59 @@
 (defn build-gpt2-block-graph
   [batch seq-len hidden-dim dtype]
   (let [inter (* 4 hidden-dim)
-        attn-dim (* 3 hidden-dim)]
-    (trace-graph (str "gpt2_block_" batch "_" seq-len "_" hidden-dim)
-                 [[:x [:tensor [batch seq-len hidden-dim] dtype]]
-                  [:ln1_g [:tensor [hidden-dim] dtype]]
-                  [:ln1_b [:tensor [hidden-dim] dtype]]
-                  [:c_attn_w [:tensor [hidden-dim attn-dim] dtype]]
-                  [:c_attn_b [:tensor [attn-dim] dtype]]
-                  [:c_proj_w [:tensor [hidden-dim hidden-dim] dtype]]
-                  [:c_proj_b [:tensor [hidden-dim] dtype]]
-                  [:ln2_g [:tensor [hidden-dim] dtype]]
-                  [:ln2_b [:tensor [hidden-dim] dtype]]
-                  [:mlp_fc_w [:tensor [hidden-dim inter] dtype]]
-                  [:mlp_fc_b [:tensor [inter] dtype]]
-                  [:mlp_proj_w [:tensor [inter hidden-dim] dtype]]
-                  [:mlp_proj_b [:tensor [hidden-dim] dtype]]]
-                 (fn [x ln1g ln1b cw cb pw pb ln2g ln2b fcw fcb pw2 pb2]
-                   (gpt2/gpt2-block x {:ln1-g ln1g :ln1-b ln1b
-                                       :c-attn-w cw :c-attn-b cb
-                                       :c-proj-w pw :c-proj-b pb
-                                       :ln2-g ln2g :ln2-b ln2b
-                                       :mlp-fc-w fcw :mlp-fc-b fcb
-                                       :mlp-proj-w pw2 :mlp-proj-b pb2} 12)))))
+        attn-dim (* 3 hidden-dim)
+        num-heads 12
+        head-dim (quot hidden-dim num-heads)
+        invars [[:x [:tensor [batch seq-len hidden-dim] dtype]]
+                [:ln1_g [:tensor [hidden-dim] dtype]]
+                [:ln1_b [:tensor [hidden-dim] dtype]]
+                [:c_attn_w [:tensor [hidden-dim attn-dim] dtype]]
+                [:c_attn_b [:tensor [attn-dim] dtype]]
+                [:c_proj_w [:tensor [hidden-dim hidden-dim] dtype]]
+                [:c_proj_b [:tensor [hidden-dim] dtype]]
+                [:ln2_g [:tensor [hidden-dim] dtype]]
+                [:ln2_b [:tensor [hidden-dim] dtype]]
+                [:mlp_fc_w [:tensor [hidden-dim inter] dtype]]
+                [:mlp_fc_b [:tensor [inter] dtype]]
+                [:mlp_proj_w [:tensor [inter hidden-dim] dtype]]
+                [:mlp_proj_b [:tensor [hidden-dim] dtype]]]
+        ast [;; 1. Pre-LayerNorm 1
+             [:layer-norm [:x_norm1 :b :p :d] [:x :b :p :d] [:ln1_g :d] [:ln1_b :d]]
+             ;; 2. QKV Projection with bias
+             [:= [:qkv :b :p :qkv_dim] [:x_norm1 :b :p :d] [:c_attn_w :d :qkv_dim]]
+             [:= [:qkv :b :p :qkv_dim] [:c_attn_b :qkv_dim]]
+             ;; 3. Slice Q, K, V
+             [:slice [:q :b :p :d] [:qkv :b :p :qkv_dim] {:start [0 0 0] :limit [batch seq-len hidden-dim]}]
+             [:slice [:k :b :p :d] [:qkv :b :p :qkv_dim] {:start [0 0 hidden-dim] :limit [batch seq-len (* 2 hidden-dim)]}]
+             [:slice [:v :b :p :d] [:qkv :b :p :qkv_dim] {:start [0 0 (* 2 hidden-dim)] :limit [batch seq-len attn-dim]}]
+             ;; 4. Multi-head reshape
+             [:reshape [:q_heads :b :h :p :hd] [:q :b :p :d] {:shape [batch num-heads seq-len head-dim]}]
+             [:reshape [:k_heads :b :h :p :hd] [:k :b :p :d] {:shape [batch num-heads seq-len head-dim]}]
+             [:reshape [:v_heads :b :h :p :hd] [:v :b :p :d] {:shape [batch num-heads seq-len head-dim]}]
+             ;; 5. Scaled Dot-Product Causal Attention
+             [:= [:scores :b :h :p :k_idx] {:scale (/ 1.0 (Math/sqrt (double head-dim)))} [:q_heads :b :h :p :hd] [:k_heads :b :h :k_idx :hd]]
+             [:causal-softmax [:probs :b :h :p :k_idx] [:scores :b :h :p :k_idx]]
+             [:= [:ctx :b :h :p :hd] [:probs :b :h :p :k_idx] [:v_heads :b :h :k_idx :hd]]
+             [:reshape [:ctx_flat :b :p :d] [:ctx :b :h :p :hd] {:shape [batch seq-len hidden-dim]}]
+             ;; 6. Attn out projection with bias
+             [:= [:attn_out :b :p :d] [:ctx_flat :b :p :din] [:c_proj_w :din :d]]
+             [:= [:attn_out :b :p :d] [:c_proj_b :d]]
+             ;; 7. Residual 1
+             [:= [:res1 :b :p :d] [:x :b :p :d]]
+             [:= [:res1 :b :p :d] [:attn_out :b :p :d]]
+             ;; 8. Pre-LayerNorm 2
+             [:layer-norm [:x_norm2 :b :p :d] [:res1 :b :p :d] [:ln2_g :d] [:ln2_b :d]]
+             ;; 9. MLP with GeLU and bias
+             [:= [:mlp_fc :b :p :inter] [:x_norm2 :b :p :d] [:mlp_fc_w :d :inter]]
+             [:= [:mlp_fc :b :p :inter] [:mlp_fc_b :inter]]
+             [:= [:mlp_act :b :p :inter] {:act :gelu} [:mlp_fc :b :p :inter]]
+             [:= [:mlp_out :b :p :d] [:mlp_act :b :p :inter] [:mlp_proj_w :inter :d]]
+             [:= [:mlp_out :b :p :d] [:mlp_proj_b :d]]
+             ;; 10. Residual 2
+             [:= [:out :b :p :d] [:res1 :b :p :d]]
+             [:= [:out :b :p :d] [:mlp_out :b :p :d]]]]
+    (lower/ast->graph (str "gpt2_block_" batch "_" seq-len "_" hidden-dim)
+                      invars ast [:out])))
 
 (defn make-gpt2-block-inputs
   [batch seq-len hidden-dim _dtype]
@@ -131,38 +188,93 @@
   [batch seq-len hidden-dim num-heads num-kv-heads head-dim pl-dim dtype]
   (let [q-dim (* num-heads head-dim)
         kv-dim (* num-kv-heads head-dim)
-        mlp-dim (* 4 hidden-dim)]
-    (trace-graph (str "gemma4_block_" batch "_" seq-len "_" hidden-dim)
-                 [[:x [:tensor [batch seq-len hidden-dim] dtype]]
-                  [:in_ln [:tensor [hidden-dim] dtype]]
-                  [:layer_scalar [:tensor [1] dtype]]
-                  [:qw [:tensor [q-dim hidden-dim] dtype]]
-                  [:kw [:tensor [kv-dim hidden-dim] dtype]]
-                  [:vw [:tensor [kv-dim hidden-dim] dtype]]
-                  [:ow [:tensor [hidden-dim q-dim] dtype]]
-                  [:qn [:tensor [head-dim] dtype]]
-                  [:kn [:tensor [head-dim] dtype]]
-                  [:post_attn_ln [:tensor [hidden-dim] dtype]]
-                  [:pre_mlp_ln [:tensor [hidden-dim] dtype]]
-                  [:post_mlp_ln [:tensor [hidden-dim] dtype]]
-                  [:gate_w [:tensor [mlp-dim hidden-dim] dtype]]
-                  [:up_w [:tensor [mlp-dim hidden-dim] dtype]]
-                  [:down_w [:tensor [hidden-dim mlp-dim] dtype]]
-                  [:per_layer_gate [:tensor [pl-dim hidden-dim] dtype]]
-                  [:per_layer_proj [:tensor [hidden-dim pl-dim] dtype]]
-                  [:post_per_layer_norm [:tensor [hidden-dim] dtype]]
-                  [:per_layer_in [:tensor [batch seq-len pl-dim] dtype]]
-                  [:pos [:tensor [seq-len] :i32]]]
-                 (fn [x in-ln ls qw kw vw ow qn kn post-attn pre-mlp post-mlp gw uw dw plg plp pln pl-in pos]
-                   (let [weights {:input-ln-w in-ln
-                                  :layer-scalar-w ls
-                                  :q-w qw :k-w kw :v-w vw :o-w ow
-                                  :q-norm-w qn :k-norm-w kn
-                                  :post-attn-ln-w post-attn :pre-mlp-ln-w pre-mlp :post-mlp-ln-w post-mlp
-                                  :gate-w gw :up-w uw :down-w dw
-                                  :per-layer-gate-w plg :per-layer-proj-w plp :post-per-layer-norm-w pln
-                                  :per-layer-input pl-in}]
-                     (gemma/gemma-block x weights num-heads num-kv-heads pos))))))
+        mlp-dim (* 4 hidden-dim)
+        group-size (quot num-heads num-kv-heads)
+        scale (/ 1.0 (Math/sqrt (double head-dim)))
+        invars [[:x [:tensor [batch seq-len hidden-dim] dtype]]
+                [:in_ln [:tensor [hidden-dim] dtype]]
+                [:layer_scalar [:tensor [1] dtype]]
+                [:qw [:tensor [q-dim hidden-dim] dtype]]
+                [:kw [:tensor [kv-dim hidden-dim] dtype]]
+                [:vw [:tensor [kv-dim hidden-dim] dtype]]
+                [:ow [:tensor [hidden-dim q-dim] dtype]]
+                [:qn [:tensor [head-dim] dtype]]
+                [:kn [:tensor [head-dim] dtype]]
+                [:post_attn_ln [:tensor [hidden-dim] dtype]]
+                [:pre_mlp_ln [:tensor [hidden-dim] dtype]]
+                [:post_mlp_ln [:tensor [hidden-dim] dtype]]
+                [:gate_w [:tensor [mlp-dim hidden-dim] dtype]]
+                [:up_w [:tensor [mlp-dim hidden-dim] dtype]]
+                [:down_w [:tensor [hidden-dim mlp-dim] dtype]]
+                [:per_layer_gate [:tensor [pl-dim hidden-dim] dtype]]
+                [:per_layer_proj [:tensor [hidden-dim pl-dim] dtype]]
+                [:post_per_layer_norm [:tensor [hidden-dim] dtype]]
+                [:per_layer_in [:tensor [batch seq-len pl-dim] dtype]]
+                [:pos [:tensor [seq-len] :i32]]]
+        ast [;; 1. Input RMSNorm
+             [:rms-norm [:x_norm1 :b :p :d] [:x :b :p :d] [:in_ln :d] {:eps 1e-6 :gemma? true}]
+             ;; 2. Projections
+             [:= [:q_raw :b :p :qd] [:x_norm1 :b :p :d] [:qw :qd :d]]
+             [:= [:k_raw :b :p :kvd] [:x_norm1 :b :p :d] [:kw :kvd :d]]
+             [:= [:v_raw :b :p :kvd] [:x_norm1 :b :p :d] [:vw :kvd :d]]
+             ;; 3. Reshape and QK Norm
+             [:reshape [:q_heads_raw :b :h :p :hd] [:q_raw :b :p :qd] {:shape [batch num-heads seq-len head-dim]}]
+             [:reshape [:k_heads_raw :b :kvh :p :hd] [:k_raw :b :p :kvd] {:shape [batch num-kv-heads seq-len head-dim]}]
+             [:reshape [:v_heads :b :kvh :p :hd] [:v_raw :b :p :kvd] {:shape [batch num-kv-heads seq-len head-dim]}]
+             [:rms-norm [:q_normed_4d :b :h :p :hd] [:q_heads_raw :b :h :p :hd] [:qn :hd] {:eps 1e-6}]
+             [:rms-norm [:k_normed_4d :b :kvh :p :hd] [:k_heads_raw :b :kvh :p :hd] [:kn :hd] {:eps 1e-6}]
+             [:reshape [:q_normed_3d :b :p :qd] [:q_normed_4d :b :h :p :hd] {:shape [batch seq-len q-dim]}]
+             [:reshape [:k_normed_3d :b :p :kvd] [:k_normed_4d :b :kvh :p :hd] {:shape [batch seq-len kv-dim]}]
+             ;; 4. RoPE
+             [:rope [:q_rope :b :p :qd] [:q_normed_3d :b :p :qd] {:head-dim head-dim :theta 10000.0}]
+             [:rope [:k_rope :b :p :kvd] [:k_normed_3d :b :p :kvd] {:head-dim head-dim :theta 10000.0}]
+             ;; 5. Reshape and GQA expand
+             [:reshape [:q_heads :b :h :p :hd] [:q_rope :b :p :qd] {:shape [batch num-heads seq-len head-dim]}]
+             [:reshape [:k_heads :b :kvh :p :hd] [:k_rope :b :p :kvd] {:shape [batch num-kv-heads seq-len head-dim]}]
+             (if (> group-size 1)
+               [:block {:name :gqa_expand}
+                [:= [:k_rep :b :kvh :g :p :hd] [:k_heads :b :kvh :p :hd] {:shape [batch num-kv-heads group-size seq-len head-dim]}]
+                [:reshape [:k_full :b :h :p :hd] [:k_rep :b :kvh :g :p :hd] {:shape [batch num-heads seq-len head-dim]}]
+                [:= [:v_rep :b :kvh :g :p :hd] [:v_heads :b :kvh :p :hd] {:shape [batch num-kv-heads group-size seq-len head-dim]}]
+                [:reshape [:v_full :b :h :p :hd] [:v_rep :b :kvh :g :p :hd] {:shape [batch num-heads seq-len head-dim]}]]
+               [:block {:name :mha_view}
+                [:= [:k_full :b :h :p :hd] [:k_heads :b :h :p :hd]]
+                [:= [:v_full :b :h :p :hd] [:v_heads :b :h :p :hd]]])
+             ;; 6. SDPA Causal Softmax
+             [:= [:scores_raw :b :h :p :k] {:scale scale} [:q_heads :b :h :p :hd] [:k_full :b :h :k :hd]]
+             [:causal-softmax [:attn_weights :b :h :p :k] [:scores_raw :b :h :p :k]]
+             [:= [:attn_ctx :b :h :p :hd] [:attn_weights :b :h :p :k] [:v_full :b :h :k :hd]]
+             ;; 7. Attn out proj
+             [:reshape [:attn_proj_in :b :p :qd] [:attn_ctx :b :h :p :hd] {:shape [batch seq-len q-dim]}]
+             [:= [:attn_out :b :p :d] [:attn_proj_in :b :p :qd] [:ow :d :qd]]
+             ;; 8. Post-attention RMSNorm
+             [:rms-norm [:attn_normed :b :p :d] [:attn_out :b :p :d] [:post_attn_ln :d] {:eps 1e-6 :gemma? true}]
+             ;; 9. First residual
+             [:= [:res1 :b :p :d] [:x :b :p :d]]
+             [:= [:res1 :b :p :d] [:attn_normed :b :p :d]]
+             ;; 10. Pre-feedforward RMSNorm
+             [:rms-norm [:x_norm2 :b :p :d] [:res1 :b :p :d] [:pre_mlp_ln :d] {:eps 1e-6 :gemma? true}]
+             ;; 11. GeGLU MLP
+             [:= [:gate_out :b :p :inter] {:act :gelu} [:x_norm2 :b :p :d] [:gate_w :inter :d]]
+             [:= [:up_out :b :p :inter] [:x_norm2 :b :p :d] [:up_w :inter :d]]
+             [:= [:hidden :b :p :inter] [:gate_out :b :p :inter] [:up_out :b :p :inter]]
+             [:= [:mlp_out :b :p :d] [:hidden :b :p :inter] [:down_w :d :inter]]
+             ;; 12. Post-feedforward RMSNorm
+             [:rms-norm [:mlp_normed :b :p :d] [:mlp_out :b :p :d] [:post_mlp_ln :d] {:eps 1e-6 :gemma? true}]
+             ;; 13. Second residual
+             [:= [:res2 :b :p :d] [:res1 :b :p :d]]
+             [:= [:res2 :b :p :d] [:mlp_normed :b :p :d]]
+             ;; 14. Gemma 4 PLE Gating
+             [:= [:pl_gate :b :p :pld] {:act :sigmoid} [:res2 :b :p :d] [:per_layer_gate :pld :d]]
+             [:= [:pl_gated :b :p :pld] [:pl_gate :b :p :pld] [:per_layer_in :b :p :pld]]
+             [:= [:pl_proj_raw :b :p :d] [:pl_gated :b :p :pld] [:per_layer_proj :d :pld]]
+             [:rms-norm [:pl_normed :b :p :d] [:pl_proj_raw :b :p :d] [:post_per_layer_norm :d] {:eps 1e-6 :gemma? true}]
+             [:= [:res3 :b :p :d] [:res2 :b :p :d]]
+             [:= [:res3 :b :p :d] [:pl_normed :b :p :d]]
+             ;; 15. Layer Scalar
+             [:= [:out :b :p :d] [:res3 :b :p :d] [:layer_scalar :one]]]]
+    (lower/ast->graph (str "gemma4_block_" batch "_" seq-len "_" hidden-dim)
+                      invars ast [:out])))
 
 (defn make-gemma4-block-inputs
   [batch seq-len hidden-dim num-heads num-kv-heads head-dim pl-dim _dtype]

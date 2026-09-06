@@ -18,16 +18,17 @@
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                   Clojure Application Layer                 │
-│  - Control Loops (e.g., DiffusionGemma Canvas, Sampling)    │
+│  - Control Loops (e.g., Autoregressive Sampling, REPL)       │
 │  - Model Weight Management (.safetensors Panama mmap)       │
 └──────────────────────────────┬──────────────────────────────┘
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                 Layer 3: Tracing & DSL                      │
-│  - Shadowed Operators (+, *, -, /, tanh, pow, etc.)         │
-│  - Scalar Auto-Lifting & Symbolic Execution Tracing         │
-│  - Trace-Time Control Flow vs Runtime Ops (xla/cond, while) │
+│       Layer 3: Pedro Domingos' Declarative Tensor Logic     │
+│  - Hiccup-style Relational AST DSL (clj-xla.logic.ast)      │
+│  - Index & Shape Unification (clj-xla.logic.index/shape)    │
+│  - Neural Primitives & Layers (clj-xla.logic.nn)            │
+│  - AST Lowering directly to SSA Graph (clj-xla.logic.lower) │
 └──────────────────────────────┬──────────────────────────────┘
                                │ Emits Pure EDN SSA Graph
                                ▼
@@ -137,37 +138,36 @@ In `clj-xla`, all inputs, intermediate tensors, constants, and outputs are repre
 
 ---
 
-### Layer 3: Tracing & Mathematical DSL (`clj-xla.trace` & `clj-xla.tensor`)
+### Layer 3: Pedro Domingos' Declarative Tensor Logic (`clj-xla.logic.*`)
 
-Layer 3 allows developers and AI agents to write standard functional math expressions using shadowed Clojure operators.
+Layer 3 provides a homoiconic, declarative DSL implementing Pedro Domingos' Tensor Logic. Rather than tracing imperative operator expressions with hidden thread-local state, neural network architectures are defined as pure, relational Hiccup-style AST data vectors.
 
-#### Operator Shadowing & Auto-Lifting (`clj-xla.tensor`)
-* Core operators (`+`, `*`, `-`, `/`, `pow`, `tanh`, `sqrt`, `dot-general`, `slice`, `reshape`, `transpose`) are defined in `clj-xla.tensor`.
-* When called with raw numerical scalars or Clojure collections, values are automatically lifted into SSA constant equations.
-* When executed inside a `trace` macro context, operations append equations to a thread-local SSA graph builder.
+#### Core Concepts & Hiccup AST (`clj-xla.logic.ast`)
+* **Relational Tensor Expressions:** Operations are expressed with explicit symbolic indices resembling Einstein notation:
+  ```clojure
+  ;; Matrix multiplication: C[i,j] = sum_k A[i,k] * B[k,j]
+  [:matmul [:c :i :j] [:a :i :k] [:b :k :j]]
+  ;; General relational definition
+  [:= [:y :b :p :d] [:x :b :p :din] [:w :din :d]]
+  ```
+* **Neural Component Primitives (`clj-xla.logic.nn`):** Standard layers such as `[:rms-norm ...]`, `[:layer-norm ...]`, `[:gelu ...]`, `[:swiglu ...]`, `[:rope ...]`, `[:gqa-attention ...]`, and `[:dense-block ...]` are first-class declarative AST forms.
+* **Shape & Index Unification (`clj-xla.logic.shape` & `clj-xla.logic.index`):** Symbolic indices (`:b`, `:p`, `:d`, `:kvh`, etc.) are unified across equation heads and bodies, automatically deriving broadcast dimensions, transpose permutations, and contraction axes.
 
-#### Trace-Time Meta-Control Flow vs Runtime Dynamic Control Flow
-* **Trace-Time Control Flow:** Standard Clojure `if`, `when`, `cond`, `dotimes`, `loop`/`recur` execute during tracing to conditionally emit graph equations or unroll repetitive network layers (e.g. 24 Transformer blocks).
-* **Runtime Dynamic Control Flow:** Dynamic runtime conditions or dynamic loops on GPU/TPU tensors are expressed using explicit higher-order operators (`xla/cond`, `xla/while_loop`, `xla/map`, `xla/reduce`).
+#### Direct Lowering to StableHLO SSA (`clj-xla.logic.lower`)
+* `clj-xla.logic.lower/ast->graph` expands compound neural operations and lowers relational equations directly into flat, optimized StableHLO EDN SSA graphs with zero intermediate Java or Python runtime overhead.
 
-#### Pure Clojure Kernel Example
+#### Pure Clojure Layer Example
 
 ```clojure
-(ns clj-xla.example.kernels
-  (:refer-clojure :exclude [+ * - / min max pow tanh sqrt])
-  (:require [clj-xla.tensor :refer [+ * - / min max pow tanh sqrt reduce-mean]]))
+(ns example.transformer-layer
+  (:require [clj-xla.logic.lower :as lower]
+            [clj-xla.logic.models.smollm :as smollm]))
 
-(defn gelu [x]
-  (let [c-sqrt 0.7978845608]
-    (* 0.5 x (+ 1.0 (tanh (* c-sqrt (+ x (* 0.044715 (pow x 3.0)))))))))
+;; Generate a complete SmolLM transformer block AST
+(def layer-ast (smollm/smollm-layer-ast 0 128))
 
-(defn layer-norm [x gamma beta eps]
-  (let [mean (reduce-mean x :axes [-1] :keep-dims true)
-        diff (- x mean)
-        var  (reduce-mean (pow diff 2.0) :axes [-1] :keep-dims true)
-        std  (sqrt (+ var eps))
-        norm (/ diff std)]
-    (+ (* norm gamma) beta)))
+;; Lower to StableHLO SSA graph
+(def graph (lower/ast->graph "smollm_layer_0" invars layer-ast #{:h_out}))
 ```
 
 ---
@@ -228,15 +228,15 @@ To guarantee sub-millisecond REPL feedback while working with heavy XLA compiler
 ### Human REPL Workflow
 
 1. Load model weights into off-heap GPU buffers via `pjrt/to-device`.
-2. Edit kernel logic or loss functions directly in your Clojure editor.
-3. Evaluate the trace macro in the REPL (`(trace-and-compile my-kernel args)`).
+2. Author neural layers or kernel logic as declarative Tensor Logic AST expressions (`[:rms-norm ...]`, `[:matmul ...]`).
+3. Lower and compile in the REPL (`(->> ast (lower/ast->graph ...) (core/compile-and-run client ...))`).
 4. Execute instantly (< 1ms warm execution latency) over existing device memory buffers without losing GPU state.
 
 ### AI Agent Protocol (RSI & Code Generation)
 
-1. **Generation:** AI agent emits an EDN graph map (`{:invars [...], :eqns [...]}`).
-2. **Validation:** Agent verifies the graph against `malli/validate` locally in microseconds.
-3. **Execution & Feedback:** Agent passes the validated EDN graph to `clj-xla.core/compile-and-run`.
+1. **Generation:** AI agent emits declarative Tensor Logic AST vectors or EDN graph maps (`{:invars [...], :eqns [...]}`).
+2. **Validation:** Agent verifies AST shapes and graphs against Malli schemas locally in microseconds.
+3. **Execution & Feedback:** Agent lowers the AST to StableHLO SSA via `clj-xla.logic.lower/ast->graph` and compiles via `clj-xla.core/compile-and-run`.
 4. **Mutations:** Agent applies pure data transformations (`assoc-in`, `update`, `postwalk`) to explore novel network topologies or kernel optimizations deterministically.
 
 ---
@@ -252,12 +252,22 @@ clj-xla/
     └── clj_xla/
         ├── core.clj           ;; High-level JIT execution API & REPL entrypoint
         ├── compile.clj        ;; Graph hashing & executable caching
-        ├── pjrt.clj           ;; Panama Java 25 FFM bindings to libpjrt_cuda/cpu
+        ├── pjrt.clj           ;; Panama Java 25 FFM bindings to libpjrt_cuda/cpu/rocm
         ├── stablehlo.clj      ;; EDN SSA schema, validation, & MLIR printer
-        ├── tensor.clj         ;; Shadowed operators & scalar auto-lifting
-        ├── trace.clj          ;; Symbolic tracing engine
-        ├── autodiff.clj       ;; Reverse-mode VJP auto-differentiation & cotangent sum
-        ├── opt.clj            ;; DCE & constant folding graph passes
+        ├── logic/             ;; Pedro Domingos' Declarative Tensor Logic
+        │   ├── ast.clj        ;; Hiccup AST syntax & validation
+        │   ├── expand.clj     ;; Compound macro expansion
+        │   ├── shape.clj      ;; Symbolic shape inference & propagation
+        │   ├── index.clj      ;; Einstein notation index unification & permutations
+        │   ├── lower.clj      ;; AST -> StableHLO SSA compilation
+        │   ├── nn.clj         ;; Neural components (RMSNorm, RoPE, Attention, MLP)
+        │   ├── dce.clj        ;; Dead code elimination
+        │   ├── autodiff.clj   ;; Symbolic reverse-mode autodiff for AST
+        │   └── models/        ;; Pre-built pure AST architectures (GPT-2, SmolLM, Gemma)
+        ├── autodiff.clj       ;; SSA-level reverse-mode VJP auto-differentiation
+        ├── opt.clj            ;; SSA DCE & constant folding graph passes
+        ├── generation/        ;; Autoregressive & diffusion sampling loops
+        ├── tokenizer/         ;; Fast BPE and SentencePiece tokenizers
         └── safetensors.clj    ;; Panama MemorySegment zero-copy off-heap weight loader
 ```
 
@@ -267,17 +277,17 @@ clj-xla/
   * Implement Panama FFM bindings for `GetPjrtApi`, `PjRtClient`, `PjRtBuffer`, `PjRtLoadedExecutable`.
   * Build mmap `.safetensors` parser into off-heap `MemorySegment`s using Java 25 `Arena`.
 
-* **Phase 2: StableHLO IR, Tracing Engine & Caching**
+* **Phase 2: StableHLO IR, Tensor Logic Engine & Caching**
   * Implement strict Malli schemas for Jaxpr-style EDN graphs.
-  * Build `clj-xla.tensor` shadowed operator library and symbolic tracer.
+  * Build `clj-xla.logic.*` Pedro Domingos declarative Tensor Logic AST engine.
   * Write EDN-to-StableHLO MLIR text printer.
   * Implement SHA-256 graph hash compilation cache.
 
 * **Phase 3: Autodiff & Optimizations**
   * Build reverse-mode VJP generator with cotangent accumulation and broadcast reduction.
-  * Add DCE and constant-folding passes in `clj-xla.opt`.
+  * Add DCE and constant-folding passes in `clj-xla.opt` and `clj-xla.logic.dce`.
 
 * **Phase 4: High-Level Models & Agent Tooling**
-  * Implement Gemma / FunctionGemma 270M fine-tuning pipelines.
-  * Build DiffusionGemma discrete text diffusion canvas runtime.
+  * Implement Gemma 2, Gemma 3, Gemma 4, SmolLM, and GPT-2 Tensor Logic models.
+  * Build discrete text diffusion canvas runtime.
   * Package agent schema validation tooling for autonomous graph synthesis.

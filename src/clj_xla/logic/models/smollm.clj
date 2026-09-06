@@ -1,6 +1,34 @@
 (ns clj-xla.logic.models.smollm
   "Declarative SmolLM-135M Architecture definition in pure Tensor Logic Hiccup AST.")
 
+(def DEFAULT_SMOLLM_CONFIG
+  {:vocab-size 49152
+   :n-positions 2048
+   :n-embd 576
+   :intermediate-size 1536
+   :n-layer 30
+   :n-head 9
+   :n-kv-head 3
+   :rms-norm-eps 1e-5})
+
+(defn smollm-config
+  "Returns SmolLM configuration map with optional custom overrides."
+  ([] DEFAULT_SMOLLM_CONFIG)
+  ([overrides] (merge DEFAULT_SMOLLM_CONFIG overrides)))
+
+(defn weight-key-map
+  "Maps logical SmolLM layer index `i` to HuggingFace safetensors parameter keys."
+  [i]
+  {:input-ln-w (format "model.layers.%d.input_layernorm.weight" i)
+   :q-w (format "model.layers.%d.self_attn.q_proj.weight" i)
+   :k-w (format "model.layers.%d.self_attn.k_proj.weight" i)
+   :v-w (format "model.layers.%d.self_attn.v_proj.weight" i)
+   :o-w (format "model.layers.%d.self_attn.o_proj.weight" i)
+   :post-attn-ln-w (format "model.layers.%d.post_attention_layernorm.weight" i)
+   :gate-w (format "model.layers.%d.mlp.gate_proj.weight" i)
+   :up-w (format "model.layers.%d.mlp.up_proj.weight" i)
+   :down-w (format "model.layers.%d.mlp.down_proj.weight" i)})
+
 (defn smollm-layer-ast
   "Generates Tensor Logic Hiccup AST for SmolLM Transformer layer block `layer-idx`."
   [layer-idx max-seq-len]

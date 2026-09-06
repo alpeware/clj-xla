@@ -1,14 +1,14 @@
 # Gemma 4 26B-A4B Mixture-of-Experts (MoE) Architecture Specification
 
 - **Status**: **Planned / Backlog**
-- **Target Namespace**: `clj-xla.models.gemma4-moe`
+- **Target Namespace**: `clj-xla.logic.models.gemma4-moe`
 - **Target Hardware**: Laptops / Workstations (Intel Arc / Apple M4 36GB+ RAM)
 
 ---
 
 ## 1. Visual MoE Routing & Expert Dispatch Graph
 
-The following Mermaid diagram represents the planned StableHLO trace graph for Gemma 4 26B-A4B's Sparse MoE layer:
+The following Mermaid diagram represents the planned StableHLO execution graph for Gemma 4 26B-A4B's Sparse MoE layer:
 
 ```mermaid
 flowchart TD

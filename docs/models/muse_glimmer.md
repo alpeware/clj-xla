@@ -1,7 +1,7 @@
 # Meta Muse-Glimmer-30B Architecture Specification & Implementation Plan
 
 - **Status**: **Planned / Backlog**
-- **Target Namespace**: `clj-xla.models.muse-glimmer`
+- **Target Namespace**: `clj-xla.logic.models.muse-glimmer`
 - **License**: Apache 2.0 Open Weights
 - **Target Hardware**: Consumer iGPUs / Laptops (Intel Arc 140V, Apple M4/M4 Pro, NVIDIA RTX 24GB/32GB)
 
@@ -28,16 +28,16 @@ flowchart TD
 ```
 
 ### Milestone 1: Model Configuration & Schema Definitions
-- **Deliverable**: Define `clj-xla.models.muse-glimmer` config map and generative property tests in `test/clj_xla/models/muse_glimmer_test.clj`.
-- **Verification**: `clojure -M:test -e "(require 'clj-xla.models.muse-glimmer-test)"` passes cleanly.
+- **Deliverable**: Define `clj-xla.logic.models.muse-glimmer` config map and generative property tests in `test/clj_xla/logic/models/muse_glimmer_test.clj`.
+- **Verification**: `clojure -M:test -e "(require 'clj-xla.logic.models.muse-glimmer-test)"` passes cleanly.
 
 ### Milestone 2: In-Graph INT4 / INT8 Weight De-quantization
-- **Deliverable**: Implement fused de-quantization helper functions in `clj-xla.nn.quantization`.
+- **Deliverable**: Implement fused de-quantization helper functions in `clj-xla.logic.nn`.
 - **Verification**: Verify parity between INT8 quantized weights and FP32 reference matmul outputs.
 
-### Milestone 3: Causal Language Decoder Trace Graph
-- **Deliverable**: Build pure Clojure graph tracer for Muse-Glimmer 30B backbone ($d_{model}=6144$, GQA, RoPE, SwiGLU).
-- **Verification**: Test single-layer forward graph tracing and MLIR serialization.
+### Milestone 3: Causal Language Decoder Execution Graph
+- **Deliverable**: Build pure Clojure Tensor Logic AST for Muse-Glimmer 30B backbone ($d_{model}=6144$, GQA, RoPE, SwiGLU).
+- **Verification**: Test single-layer forward AST lowering and MLIR serialization.
 
 ### Milestone 4: DFlash 16-Token Parallel Block Speculation
 - **Deliverable**: Implement DFlash block predictor graph $[1, 1, \text{dim}] \to [1, 16, V]$ and 16-token batched verification pass.

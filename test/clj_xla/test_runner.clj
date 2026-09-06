@@ -7,26 +7,11 @@
             [clj-xla.benchmark.workloads-test]
             [clj-xla.compile-test]
             [clj-xla.core-test]
-            [clj-xla.debug-test]
             [clj-xla.download-hf-test]
             [clj-xla.fetch-pjrt-binaries-test]
             [clj-xla.generation-test]
             [clj-xla.integration.rocm-e2e-test]
             [clj-xla.integration.sycl-e2e-test]
-            [clj-xla.kernels-test]
-            [clj-xla.models.gemma-test]
-            [clj-xla.models.gpt2-test]
-            [clj-xla.nn.activations-test]
-            [clj-xla.nn.attention-test]
-            [clj-xla.nn.loss-test]
-            [clj-xla.nn.norm-test]
-            [clj-xla.opt-test]
-            [clj-xla.pjrt-test]
-            [clj-xla.pjrt.version-test]
-            [clj-xla.profile-test]
-            [clj-xla.safetensors-test]
-            [clj-xla.sampling-test]
-            [clj-xla.stablehlo-test]
             [clj-xla.logic.ast-test]
             [clj-xla.logic.autodiff-test]
             [clj-xla.logic.core-test]
@@ -40,7 +25,13 @@
             [clj-xla.logic.nn-test]
             [clj-xla.logic.shape-test]
             [clj-xla.logic.smollm-test]
-            [clj-xla.tensor-test]
+            [clj-xla.opt-test]
+            [clj-xla.pjrt-test]
+            [clj-xla.pjrt.version-test]
+            [clj-xla.profile-test]
+            [clj-xla.safetensors-test]
+            [clj-xla.sampling-test]
+            [clj-xla.stablehlo-test]
             [clj-xla.test.generators-test]
             [clj-xla.test.isolated-runner :as isolated-runner]
             [clj-xla.test.isolated-runner-test]
@@ -48,7 +39,6 @@
             [clj-xla.test.telemetry :as telemetry]
             [clj-xla.test.telemetry-test]
             [clj-xla.tokenizer-test]
-            [clj-xla.trace-test]
             [clojure.test :refer [run-tests]]))
 
 (defn -main
@@ -65,24 +55,14 @@
                            'clj-xla.benchmark.workloads-test
                            'clj-xla.benchmark.runner-test
                            'clj-xla.compile-test
-                           'clj-xla.tensor-test
-                           'clj-xla.trace-test
                            'clj-xla.autodiff-test
                            'clj-xla.opt-test
                            'clj-xla.safetensors-test
-                           'clj-xla.kernels-test
-                           'clj-xla.nn.activations-test
-                           'clj-xla.nn.norm-test
-                           'clj-xla.nn.attention-test
-                           'clj-xla.nn.loss-test
-                           'clj-xla.models.gemma-test
-                           'clj-xla.models.gpt2-test
                            'clj-xla.sampling-test
                            'clj-xla.tokenizer-test
                            'clj-xla.generation-test
                            'clj-xla.download-hf-test
                            'clj-xla.fetch-pjrt-binaries-test
-                           'clj-xla.debug-test
                            'clj-xla.profile-test
                            'clj-xla.agent-test
                            'clj-xla.logic.ast-test

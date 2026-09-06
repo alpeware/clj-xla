@@ -1,6 +1,35 @@
 (ns clj-xla.logic.models.gpt2
   "Declarative GPT-2 Architecture definition in pure Tensor Logic Hiccup AST.")
 
+(def DEFAULT_GPT2_CONFIG
+  {:vocab-size 50257
+   :n-positions 1024
+   :n-embd 768
+   :n-layer 12
+   :n-head 12
+   :layer-norm-epsilon 1e-5})
+
+(defn gpt2-config
+  "Returns GPT-2 configuration map with optional custom overrides."
+  ([] DEFAULT_GPT2_CONFIG)
+  ([overrides] (merge DEFAULT_GPT2_CONFIG overrides)))
+
+(defn weight-key-map
+  "Maps logical GPT-2 layer index `i` to HuggingFace safetensors parameter keys."
+  [i]
+  {:ln1-g (format "h.%d.ln_1.weight" i)
+   :ln1-b (format "h.%d.ln_1.bias" i)
+   :c-attn-w (format "h.%d.attn.c_attn.weight" i)
+   :c-attn-b (format "h.%d.attn.c_attn.bias" i)
+   :c-proj-w (format "h.%d.attn.c_proj.weight" i)
+   :c-proj-b (format "h.%d.attn.c_proj.bias" i)
+   :ln2-g (format "h.%d.ln_2.weight" i)
+   :ln2-b (format "h.%d.ln_2.bias" i)
+   :mlp-fc-w (format "h.%d.mlp.c_fc.weight" i)
+   :mlp-fc-b (format "h.%d.mlp.c_fc.bias" i)
+   :mlp-proj-w (format "h.%d.mlp.c_proj.weight" i)
+   :mlp-proj-b (format "h.%d.mlp.c_proj.bias" i)})
+
 (defn gpt2-layer-ast
   "Generates Tensor Logic Hiccup AST for GPT-2 Transformer layer block `layer-idx`."
   [layer-idx max-seq-len]

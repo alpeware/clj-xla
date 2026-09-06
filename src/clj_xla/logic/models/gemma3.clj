@@ -1,6 +1,39 @@
 (ns clj-xla.logic.models.gemma3
-  "Declarative Gemma 3 Architecture definition in pure Tensor Logic Hiccup AST."
-  (:require [clj-xla.models.gemma :as gemma-legacy]))
+  "Declarative Gemma 3 Architecture definition in pure Tensor Logic Hiccup AST.")
+
+(def DEFAULT_GEMMA3_270M_CONFIG
+  {:hidden-dim 640
+   :intermediate-dim 2048
+   :num-layers 18
+   :num-heads 4
+   :num-kv-heads 1
+   :head-dim 256
+   :query-pre-attn-scalar 256
+   :vocab-size 262144
+   :norm-eps 1e-6})
+
+(defn gemma3-config
+  "Returns Gemma 3 configuration map with optional custom overrides."
+  ([] DEFAULT_GEMMA3_270M_CONFIG)
+  ([overrides] (merge DEFAULT_GEMMA3_270M_CONFIG overrides)))
+
+(defn gemma3-weight-key-map
+  "Returns Gemma 3 safetensors weight key mapping for layer `layer-idx` including QK norm parameters."
+  [layer-idx]
+  (let [prefix (str "model.layers." layer-idx ".")]
+    {:input-ln-w     (str prefix "input_layernorm.weight")
+     :q-w            (str prefix "self_attn.q_proj.weight")
+     :k-w            (str prefix "self_attn.k_proj.weight")
+     :v-w            (str prefix "self_attn.v_proj.weight")
+     :o-w            (str prefix "self_attn.o_proj.weight")
+     :q-norm-w       (str prefix "self_attn.q_norm.weight")
+     :k-norm-w       (str prefix "self_attn.k_norm.weight")
+     :post-attn-ln-w (str prefix "post_attention_layernorm.weight")
+     :pre-mlp-ln-w   (str prefix "pre_feedforward_layernorm.weight")
+     :post-mlp-ln-w  (str prefix "post_feedforward_layernorm.weight")
+     :gate-w         (str prefix "mlp.gate_proj.weight")
+     :up-w           (str prefix "mlp.up_proj.weight")
+     :down-w         (str prefix "mlp.down_proj.weight")}))
 
 (defn gemma3-layer-ast
   "Generates Tensor Logic Hiccup AST for Gemma 3 Transformer layer block `layer-idx`."
@@ -133,7 +166,7 @@
 (defn gemma3-model-ast
   "Generates full Gemma 3 model forward pass in pure Tensor Logic Hiccup AST."
   [config]
-  (let [cfg (merge (gemma-legacy/gemma3-config) config)
+  (let [cfg (merge (gemma3-config) config)
         {:keys [num-layers max-seq-len hidden-dim norm-eps final-logit-softcap]} cfg
         num-layers (long (or num-layers 18))
         max-seq-len (long (or max-seq-len 128))

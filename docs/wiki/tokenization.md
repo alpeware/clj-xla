@@ -21,6 +21,6 @@ Tokenization converts natural language text into numerical token ID sequences us
 ## 2. Clojure Implementation in `clj-xla`
 
 Tokenization in `clj-xla` is managed via pure Clojure wrapper modules interfacing with SentencePiece / Hugging Face tokenizers:
-- **Encoding**: [`clj-xla.tokenizer/encode`](../../src/clj_xla/tokenizer.clj#L15) in [`clj-xla.tokenizer`](../../src/clj_xla/tokenizer.clj).
-- **Decoding**: [`clj-xla.tokenizer/decode`](../../src/clj_xla/tokenizer.clj#L30) in [`clj-xla.tokenizer`](../../src/clj_xla/tokenizer.clj).
+- **Encoding**: [`clj-xla.tokenizer.core/encode`](../../src/clj_xla/tokenizer/core.clj) in [`clj-xla.tokenizer.core`](../../src/clj_xla/tokenizer/core.clj).
+- **Decoding**: [`clj-xla.tokenizer.core/decode`](../../src/clj_xla/tokenizer/core.clj) in [`clj-xla.tokenizer.core`](../../src/clj_xla/tokenizer/core.clj).
 - **Unit & Property Tests**: [`test/clj_xla/tokenizer_test.clj`](../../test/clj_xla/tokenizer_test.clj).

@@ -34,7 +34,7 @@
         (swap! eqns-atom conj log-eqn)
         out-var)
 
-      (= act :silu)
+      (or (= act :silu) (= act :swish))
       (let [log-var (gen-id "t_logistic" counter)
             log-eqn {:op :stablehlo/logistic :invars [in-var] :outvars [log-var]}
             mul-eqn {:op :stablehlo/multiply :invars [in-var log-var] :outvars [out-var]}]
