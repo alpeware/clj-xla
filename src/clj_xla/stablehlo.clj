@@ -455,13 +455,27 @@
             red-type (if (seq reduced-dims)
                        (str "tensor<" (str/join "x" reduced-dims) "x" in-dtype ">")
                        (str "tensor<" in-dtype ">"))]
-        (str "    %" (name out-var) "_c0 = stablehlo.constant dense<" init-const "> : tensor<" in-dtype ">\n"
-             "    %" (name out-var) "_red = \"stablehlo.reduce\"(%" (name in-var) ", %" (name out-var) "_c0) ({\n"
-             "    ^bb0(%arg_a: tensor<" in-dtype ">, %arg_b: tensor<" in-dtype ">):\n"
-             "      %arg_res = " red-op-name " %arg_a, %arg_b : tensor<" in-dtype ">\n"
-             "      \"stablehlo.return\"(%arg_res) : (tensor<" in-dtype ">) -> ()\n"
-             "    }) {dimensions = array<i64: " axes-str ">} : (" in-type ", tensor<" in-dtype ">) -> " red-type "\n"
-             "    %" (name out-var) " = stablehlo.reshape %" (name out-var) "_red : (" red-type ") -> " out-type))
+        (if (= op :stablehlo/reduce_mean)
+          (let [red-count (double (reduce clojure.core/* 1.0 (map #(nth in-dims %) norm-axes)))
+                c-name (str (name out-var) "_count")
+                unscaled-name (str (name out-var) "_unscaled")]
+            (str "    %" (name out-var) "_c0 = stablehlo.constant dense<" init-const "> : tensor<" in-dtype ">\n"
+                 "    %" (name out-var) "_red = \"stablehlo.reduce\"(%" (name in-var) ", %" (name out-var) "_c0) ({\n"
+                 "    ^bb0(%arg_a: tensor<" in-dtype ">, %arg_b: tensor<" in-dtype ">):\n"
+                 "      %arg_res = " red-op-name " %arg_a, %arg_b : tensor<" in-dtype ">\n"
+                 "      \"stablehlo.return\"(%arg_res) : (tensor<" in-dtype ">) -> ()\n"
+                 "    }) {dimensions = array<i64: " axes-str ">} : (" in-type ", tensor<" in-dtype ">) -> " red-type "\n"
+                 "    %" unscaled-name " = stablehlo.reshape %" (name out-var) "_red : (" red-type ") -> " out-type "\n"
+                 "    %" c-name " = stablehlo.constant dense<" (format "%.6e" red-count) "> : tensor<" in-dtype ">\n"
+                 "    %" c-name "_bcast = \"stablehlo.broadcast_in_dim\"(%" c-name ") {broadcast_dimensions = array<i64>} : (tensor<" in-dtype ">) -> " out-type "\n"
+                 "    %" (name out-var) " = stablehlo.divide %" unscaled-name ", %" c-name "_bcast : " out-type))
+          (str "    %" (name out-var) "_c0 = stablehlo.constant dense<" init-const "> : tensor<" in-dtype ">\n"
+               "    %" (name out-var) "_red = \"stablehlo.reduce\"(%" (name in-var) ", %" (name out-var) "_c0) ({\n"
+               "    ^bb0(%arg_a: tensor<" in-dtype ">, %arg_b: tensor<" in-dtype ">):\n"
+               "      %arg_res = " red-op-name " %arg_a, %arg_b : tensor<" in-dtype ">\n"
+               "      \"stablehlo.return\"(%arg_res) : (tensor<" in-dtype ">) -> ()\n"
+               "    }) {dimensions = array<i64: " axes-str ">} : (" in-type ", tensor<" in-dtype ">) -> " red-type "\n"
+               "    %" (name out-var) " = stablehlo.reshape %" (name out-var) "_red : (" red-type ") -> " out-type)))
 
       (= op :stablehlo/custom_call)
       (let [[in0 in1] invars

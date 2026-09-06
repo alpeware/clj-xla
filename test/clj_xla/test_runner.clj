@@ -27,6 +27,16 @@
             [clj-xla.safetensors-test]
             [clj-xla.sampling-test]
             [clj-xla.stablehlo-test]
+            [clj-xla.logic.ast-test]
+            [clj-xla.logic.autodiff-test]
+            [clj-xla.logic.core-test]
+            [clj-xla.logic.dce-test]
+            [clj-xla.logic.expand-test]
+            [clj-xla.logic.gpt2-test]
+            [clj-xla.logic.index-test]
+            [clj-xla.logic.lower-test]
+            [clj-xla.logic.nn-test]
+            [clj-xla.logic.shape-test]
             [clj-xla.tensor-test]
             [clj-xla.test.generators-test]
             [clj-xla.test.isolated-runner :as isolated-runner]
@@ -72,6 +82,16 @@
                            'clj-xla.debug-test
                            'clj-xla.profile-test
                            'clj-xla.agent-test
+                           'clj-xla.logic.ast-test
+                           'clj-xla.logic.autodiff-test
+                           'clj-xla.logic.core-test
+                           'clj-xla.logic.dce-test
+                           'clj-xla.logic.expand-test
+                           'clj-xla.logic.gpt2-test
+                           'clj-xla.logic.index-test
+                           'clj-xla.logic.lower-test
+                           'clj-xla.logic.nn-test
+                           'clj-xla.logic.shape-test
                            'clj-xla.core-test)
         rocm-res (isolated-runner/run-isolated-test 'clj-xla.integration.rocm-e2e-test {"HIP_VISIBLE_DEVICES" "0" "ROCR_VISIBLE_DEVICES" "0"})
         sycl-res (isolated-runner/run-isolated-test 'clj-xla.integration.sycl-e2e-test)
