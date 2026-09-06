@@ -37,6 +37,7 @@
             [clj-xla.logic.lower-test]
             [clj-xla.logic.nn-test]
             [clj-xla.logic.shape-test]
+            [clj-xla.logic.smollm-test]
             [clj-xla.tensor-test]
             [clj-xla.test.generators-test]
             [clj-xla.test.isolated-runner :as isolated-runner]
@@ -92,6 +93,7 @@
                            'clj-xla.logic.lower-test
                            'clj-xla.logic.nn-test
                            'clj-xla.logic.shape-test
+                           'clj-xla.logic.smollm-test
                            'clj-xla.core-test)
         rocm-res (isolated-runner/run-isolated-test 'clj-xla.integration.rocm-e2e-test {"HIP_VISIBLE_DEVICES" "0" "ROCR_VISIBLE_DEVICES" "0"})
         sycl-res (isolated-runner/run-isolated-test 'clj-xla.integration.sycl-e2e-test)

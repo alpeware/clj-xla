@@ -81,45 +81,77 @@
         rhs-name (first rhs)
         rhs-idxs (vec (rest rhs))
         {:keys [contracting batch lhs-free rhs-free]}
-        (idx/partition-indices lhs-idxs rhs-idxs head-idxs)
+        (idx/partition-indices lhs-idxs rhs-idxs head-idxs)]
+    (if (and (empty? contracting)
+             (= (set lhs-idxs) (set rhs-idxs) (set head-idxs)))
+      ;; Elementwise (Hadamard) product
+      (let [rhs-v (if (= lhs-idxs rhs-idxs)
+                    rhs-name
+                    (let [rhs-perm (indices->dim-numbers rhs-idxs lhs-idxs)
+                          out-r (gen-id "t_trans_r" counter)
+                          trans-r {:op :stablehlo/transpose :invars [rhs-name] :outvars [out-r] :attrs {:permutation rhs-perm}}]
+                      (swap! eqns-atom conj trans-r)
+                      out-r))
+            needs-perm? (not= lhs-idxs head-idxs)
+            has-post-act? (or (:scale attrs) (:act attrs))
+            mul-out-var (if (or needs-perm? has-post-act?)
+                          (gen-id "t_mul" counter)
+                          final-out-var)
+            mul-eqn {:op :stablehlo/multiply
+                     :invars [lhs-name rhs-v]
+                     :outvars [mul-out-var]}]
+        (swap! eqns-atom conj mul-eqn)
+        (let [perm-out-var
+              (if needs-perm?
+                (let [perm (indices->dim-numbers lhs-idxs head-idxs)
+                      out-v (if has-post-act? (gen-id "t_trans" counter) final-out-var)
+                      trans-eqn {:op :stablehlo/transpose
+                                 :invars [mul-out-var]
+                                 :outvars [out-v]
+                                 :attrs {:permutation perm}}]
+                  (swap! eqns-atom conj trans-eqn)
+                  out-v)
+                mul-out-var)]
+          (when has-post-act?
+            (emit-post-activation! eqns-atom counter perm-out-var final-out-var attrs (get var-dtypes lhs-name :f32)))))
+      ;; Standard dot_general contraction
+      (let [lhs-c-dims (indices->dim-numbers lhs-idxs contracting)
+            rhs-c-dims (indices->dim-numbers rhs-idxs contracting)
+            lhs-b-dims (indices->dim-numbers lhs-idxs batch)
+            rhs-b-dims (indices->dim-numbers rhs-idxs batch)
 
-        lhs-c-dims (indices->dim-numbers lhs-idxs contracting)
-        rhs-c-dims (indices->dim-numbers rhs-idxs contracting)
-        lhs-b-dims (indices->dim-numbers lhs-idxs batch)
-        rhs-b-dims (indices->dim-numbers rhs-idxs batch)
+            dot-attrs {:contracting_dims {:lhs lhs-c-dims :rhs rhs-c-dims}
+                       :batch_dims {:lhs lhs-b-dims :rhs rhs-b-dims}}
 
-        dot-attrs {:contracting_dims {:lhs lhs-c-dims :rhs rhs-c-dims}
-                   :batch_dims {:lhs lhs-b-dims :rhs rhs-b-dims}}
+            raw-dot-idxs (vec (concat batch lhs-free rhs-free))
+            needs-perm? (not= raw-dot-idxs head-idxs)
+            has-post-act? (or (:scale attrs) (:act attrs))
 
-        raw-dot-idxs (vec (concat batch lhs-free rhs-free))
-        needs-perm? (not= raw-dot-idxs head-idxs)
-        has-post-act? (or (:scale attrs) (:act attrs))
+            dot-out-var (if (or needs-perm? has-post-act?)
+                          (gen-id "t_dot" counter)
+                          final-out-var)
 
-        dot-out-var (if (or needs-perm? has-post-act?)
-                      (gen-id "t_dot" counter)
-                      final-out-var)
-
-        dot-eqn {:op :stablehlo/dot_general
-                 :invars [lhs-name rhs-name]
-                 :outvars [dot-out-var]
-                 :attrs dot-attrs}]
-    (swap! eqns-atom conj dot-eqn)
-    (let [perm-out-var
-          (if needs-perm?
-            (let [perm (indices->dim-numbers raw-dot-idxs head-idxs)
-                  out-v (if has-post-act? (gen-id "t_trans" counter) final-out-var)
-                  trans-eqn {:op :stablehlo/transpose
-                             :invars [dot-out-var]
-                             :outvars [out-v]
-                             :attrs {:permutation perm}}]
-              (swap! eqns-atom conj trans-eqn)
-              out-v)
-            dot-out-var)
-          _post-out-var
-          (if has-post-act?
-            (emit-post-activation! eqns-atom counter perm-out-var final-out-var attrs (get var-dtypes lhs-name :f32))
-            perm-out-var)]
-      nil)))
+            dot-eqn {:op :stablehlo/dot_general
+                     :invars [lhs-name rhs-name]
+                     :outvars [dot-out-var]
+                     :attrs dot-attrs}]
+        (swap! eqns-atom conj dot-eqn)
+        (let [perm-out-var
+              (if needs-perm?
+                (let [perm (indices->dim-numbers raw-dot-idxs head-idxs)
+                      out-v (if has-post-act? (gen-id "t_trans" counter) final-out-var)
+                      trans-eqn {:op :stablehlo/transpose
+                                 :invars [dot-out-var]
+                                 :outvars [out-v]
+                                 :attrs {:permutation perm}}]
+                  (swap! eqns-atom conj trans-eqn)
+                  out-v)
+                dot-out-var)
+              _post-out-var
+              (if has-post-act?
+                (emit-post-activation! eqns-atom counter perm-out-var final-out-var attrs (get var-dtypes lhs-name :f32))
+                perm-out-var)]
+          nil)))))
 
 (defn- lower-unary-equation!
   [eqns-atom counter head attrs term known-shapes var-dtypes final-out-var]
@@ -260,6 +292,106 @@
         div-eqn {:op :stablehlo/divide :invars [exp-var sum-var] :outvars [final-out-var]}]
     (swap! eqns-atom conj c-mask-eqn masked-eqn max-eqn diff-eqn exp-eqn sum-eqn div-eqn)))
 
+(defn- lower-rms-norm! [eqns-atom counter _head in-term weight-term attrs final-out-var]
+  (let [in-name (first in-term)
+        weight-name (when weight-term (first weight-term))
+        eps (or (:eps attrs) 1e-5)
+        sq-var (gen-id "rms_sq" counter)
+        sq-eqn {:op :stablehlo/multiply :invars [in-name in-name] :outvars [sq-var]}
+        ms-var (gen-id "rms_ms" counter)
+        ms-eqn {:op :stablehlo/reduce_mean :invars [sq-var] :outvars [ms-var] :attrs {:axes [-1] :keep_dims true}}
+        c-eps (gen-id "rms_eps" counter)
+        c-eps-eqn {:op :stablehlo/constant :value (double eps) :outvars [c-eps]}
+        ms-eps-var (gen-id "rms_ms_eps" counter)
+        ms-eps-eqn {:op :stablehlo/add :invars [ms-var c-eps] :outvars [ms-eps-var]}
+        std-var (gen-id "rms_std" counter)
+        std-eqn {:op :stablehlo/sqrt :invars [ms-eps-var] :outvars [std-var]}
+        xhat-var (if weight-name (gen-id "rms_xhat" counter) final-out-var)
+        xhat-eqn {:op :stablehlo/divide :invars [in-name std-var] :outvars [xhat-var]}]
+    (swap! eqns-atom conj sq-eqn ms-eqn c-eps-eqn ms-eps-eqn std-eqn xhat-eqn)
+    (when weight-name
+      (let [scaled-eqn {:op :stablehlo/multiply :invars [xhat-var weight-name] :outvars [final-out-var]}]
+        (swap! eqns-atom conj scaled-eqn)))))
+
+(defn- lower-rope! [eqns-atom counter _head in-term attrs final-out-var known-shapes]
+  (let [in-name (first in-term)
+        shape (get known-shapes in-name [1 128 576])
+        batch (nth shape 0 1)
+        seq-len (nth shape 1 128)
+        total-dim (nth shape 2 576)
+        head-dim (long (or (:head-dim attrs) 64))
+        n-heads (quot total-dim head-dim)
+        half-dim (quot head-dim 2)
+        theta (double (or (:theta attrs) (:theta-base attrs) 10000.0))
+
+        freqs (vec (for [i (range half-dim)]
+                     (Math/pow theta (/ (* -2.0 i) (double head-dim)))))
+        cos-rows (vec (for [idx (range seq-len)]
+                        (let [pos idx
+                              half (vec (for [i (range half-dim)]
+                                          (Math/cos (* (double pos) (nth freqs i)))))]
+                          (vec (concat half half)))))
+        sin-rows (vec (for [idx (range seq-len)]
+                        (let [pos idx
+                              half (vec (for [i (range half-dim)]
+                                          (Math/sin (* (double pos) (nth freqs i)))))]
+                          (vec (concat half half)))))
+
+        r4d-var (gen-id "rope_r4d" counter)
+        r4d-eqn {:op :stablehlo/reshape :invars [in-name] :outvars [r4d-var] :attrs {:shape [batch seq-len n-heads head-dim]}}
+
+        trans-var (gen-id "rope_trans" counter)
+        trans-eqn {:op :stablehlo/transpose :invars [r4d-var] :outvars [trans-var] :attrs {:permutation [0 2 1 3]}}
+
+        x1-var (gen-id "rope_x1" counter)
+        x1-eqn {:op :stablehlo/slice
+                :invars [trans-var]
+                :outvars [x1-var]
+                :attrs {:start_indices [0 0 0 0]
+                        :limit_indices [batch n-heads seq-len half-dim]
+                        :strides [1 1 1 1]}}
+
+        x2-var (gen-id "rope_x2" counter)
+        x2-eqn {:op :stablehlo/slice
+                :invars [trans-var]
+                :outvars [x2-var]
+                :attrs {:start_indices [0 0 0 half-dim]
+                        :limit_indices [batch n-heads seq-len head-dim]
+                        :strides [1 1 1 1]}}
+
+        neg-x2-var (gen-id "rope_neg_x2" counter)
+        neg-x2-eqn {:op :stablehlo/negate :invars [x2-var] :outvars [neg-x2-var]}
+
+        rot-var (gen-id "rope_rot" counter)
+        rot-eqn {:op :stablehlo/concatenate :invars [neg-x2-var x1-var] :outvars [rot-var] :attrs {:dimension 3}}
+
+        c-cos-var (gen-id "rope_cos" counter)
+        c-cos-eqn {:op :stablehlo/constant
+                   :value [[cos-rows]]
+                   :type [:tensor [1 1 seq-len head-dim] :f32]
+                   :outvars [c-cos-var]}
+
+        c-sin-var (gen-id "rope_sin" counter)
+        c-sin-eqn {:op :stablehlo/constant
+                   :value [[sin-rows]]
+                   :type [:tensor [1 1 seq-len head-dim] :f32]
+                   :outvars [c-sin-var]}
+
+        x-cos-var (gen-id "rope_x_cos" counter)
+        x-cos-eqn {:op :stablehlo/multiply :invars [trans-var c-cos-var] :outvars [x-cos-var]}
+
+        x-sin-var (gen-id "rope_x_sin" counter)
+        x-sin-eqn {:op :stablehlo/multiply :invars [rot-var c-sin-var] :outvars [x-sin-var]}
+
+        add-var (gen-id "rope_res" counter)
+        add-eqn {:op :stablehlo/add :invars [x-cos-var x-sin-var] :outvars [add-var]}
+
+        back-trans-var (gen-id "rope_back_trans" counter)
+        back-trans-eqn {:op :stablehlo/transpose :invars [add-var] :outvars [back-trans-var] :attrs {:permutation [0 2 1 3]}}
+
+        final-eqn {:op :stablehlo/reshape :invars [back-trans-var] :outvars [final-out-var] :attrs {:shape [batch seq-len total-dim]}}]
+    (swap! eqns-atom conj r4d-eqn trans-eqn x1-eqn x2-eqn neg-x2-eqn rot-eqn c-cos-eqn c-sin-eqn x-cos-eqn x-sin-eqn add-eqn back-trans-eqn final-eqn)))
+
 (defn ast->graph
   "Compiles a Tensor Logic Hiccup AST into a validated EDN SSA graph for OpenXLA compilation.
    Pipeline: expand -> prune (DCE) -> unify shapes -> lower to dot_general & StableHLO ops."
@@ -325,6 +457,12 @@
 
           (= op :causal-softmax)
           (lower-causal-softmax! eqns-atom counter (first body) final-var known-shapes)
+
+          (= op :rms-norm)
+          (lower-rms-norm! eqns-atom counter head (first body) (second body) attrs final-var)
+
+          (= op :rope)
+          (lower-rope! eqns-atom counter head (first body) attrs final-var known-shapes)
 
           :else
           (throw (ex-info "Unknown AST equation or lowering hook" {:equation eqn :op op})))

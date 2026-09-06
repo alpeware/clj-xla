@@ -1,11 +1,12 @@
 (ns scripts.smollm-inference
   "Top-level runnable integration script for end-to-end SmolLM-135M text generation via pure XLA execution."
   (:require [clj-xla.core :as xla]
-            [clj-xla.generation.autoregressive :as ar]
+            [clj-xla.logic.lower :as lower]
+            [clj-xla.logic.models.smollm :as smollm-logic]
             [clj-xla.models.smollm :as smollm]
             [clj-xla.safetensors :as st]
             [clj-xla.tokenizer.core :as tok]
-            [clj-xla.tokenizer.protocol :refer [decode encode eos-id]]
+            [clj-xla.tokenizer.protocol :as proto]
             [clj-xla.trace :refer [trace-graph]])
   (:import [java.lang.foreign Arena]))
 
@@ -14,10 +15,12 @@
    :max-new-tokens 8
    :temperature 0.7
    :top-k 10
-   :backend :cpu})
+   :backend :cpu
+   :method :tensor-logic
+   :compare false})
 
 (defn parse-cli-args
-  "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k, --backend)."
+  "Parses command-line flags (--prompt, --max-new-tokens, --temperature, --top-k, --backend, --method, --compare)."
   [args]
   (loop [remaining (vec args)
          opts DEFAULT_CLI_OPTS]
@@ -41,6 +44,12 @@
           (and (= flag "--backend") val)
           (recur (subvec remaining 2) (assoc opts :backend (keyword val)))
 
+          (and (= flag "--method") val)
+          (recur (subvec remaining 2) (assoc opts :method (keyword val)))
+
+          (and (= flag "--compare") val)
+          (recur (subvec remaining 2) (assoc opts :compare (Boolean/parseBoolean val)))
+
           :else
           (recur (subvec remaining 1) opts))))))
 
@@ -48,10 +57,41 @@
   (let [padded (take max-len (concat tokens (repeat 0)))]
     (int-array (vec padded))))
 
+(defn- sample-logits
+  "Performs temperature scaling and top-k sampling over logit float array.
+   When temp <= 0.0, performs deterministic greedy argmax."
+  [logits temp top-k]
+  (if (<= temp 0.0)
+    (let [n (count logits)]
+      (loop [i 0 max-i 0 max-v (aget ^floats logits 0)]
+        (if (< i n)
+          (let [v (aget ^floats logits i)]
+            (if (> v max-v)
+              (recur (inc i) i v)
+              (recur (inc i) max-i max-v)))
+          max-i)))
+    (let [indexed (map-indexed vector logits)
+          sorted (sort-by second > indexed)
+          k-truncated (take (min top-k (count logits)) sorted)
+          max-logit (apply max (map second k-truncated))
+          exp-logits (map (fn [[idx l]] [idx (Math/exp (/ (- l max-logit) temp))]) k-truncated)
+          sum-exp (reduce + 0.0 (map second exp-logits))
+          probs (map (fn [[idx e]] [idx (/ e sum-exp)]) exp-logits)
+          r (rand)]
+      (loop [ps probs accum 0.0]
+        (if (seq ps)
+          (let [[idx p] (first ps)
+                new-accum (+ accum p)]
+            (if (<= r new-accum)
+              idx
+              (recur (rest ps) new-accum)))
+          (first (first probs)))))))
+
 (defn -main
-  "Runs end-to-end SmolLM-135M text generation pipeline: model loading, tokenization, full-model graph tracing, StableHLO JIT compilation, and autoregressive decoding."
+  "Runs end-to-end SmolLM-135M text generation pipeline: model loading, tokenization,
+   full-model compilation (Tensor Logic or legacy tracer), and autoregressive decoding."
   [& args]
-  (let [{:keys [prompt max-new-tokens temperature top-k backend]} (parse-cli-args args)]
+  (let [{:keys [prompt max-new-tokens temperature top-k backend method compare]} (parse-cli-args args)]
     (println "==================================================================")
     (println "    clj-xla SmolLM-135M End-to-End Autoregressive Generation Loop ")
     (println "==================================================================")
@@ -64,10 +104,10 @@
       ;; 2. Load Tokenizer (BPE with HF tokenizer.json schema)
       (println (str "Loading SmolLM Tokenizer from [" model-dir "]..."))
       (let [tokenizer (tok/from-file model-dir)
-            prompt-ids (encode tokenizer prompt)]
+            prompt-ids (proto/encode tokenizer prompt)]
         (println (format "Prompt: \"%s\"" prompt))
-        (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d"
-                         max-new-tokens temperature top-k))
+        (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d, method=%s, compare=%s"
+                         max-new-tokens temperature top-k method compare))
         (println (format "Encoded Token IDs (%d tokens): %s" (count prompt-ids) prompt-ids))
 
         ;; 3. Load Safetensors weights header & memory-map 30 layers
@@ -95,8 +135,7 @@
           (println (format "Parsed Safetensors header (%d tensors, %d layers loaded)."
                            (count metadata) (count layers-weights)))
 
-          ;; 4. Trace full SmolLM-135M Model graph & JIT Compile
-          (println "Tracing & JIT Compiling full SmolLM-135M model graph to XLA Executable...")
+          ;; 4. Define model signature and compilation function
           (let [max-seq-len 128
                 invars (into [[:x [:tensor [1 max-seq-len] :i32]]
                               [:embed_tokens [:tensor [49152 576] :f32]]
@@ -113,14 +152,25 @@
                                         [(keyword (str "up_w_" i)) [:tensor [1536 576] :f32]]
                                         [(keyword (str "down_w_" i)) [:tensor [576 1536] :f32]]])
                                      (range 30)))
-                trace-fn (fn [x emb fn-norm lm-hw & layer-args]
-                           (let [lw-seq (mapv (fn [[in-ln qw kw vw ow post-ln gw uw dw]]
-                                                {:input-ln-w in-ln :q-w qw :k-w kw :v-w vw :o-w ow :post-attn-ln-w post-ln :gate-w gw :up-w uw :down-w dw})
-                                              (partition 9 layer-args))]
-                             (smollm/full-smollm-forward x emb lw-seq fn-norm lm-hw [0])))
-                graph (trace-graph "full_smollm_model" invars trace-fn)
-                exec (xla/compile-graph ctx graph)]
-            (println "Successfully compiled StableHLO graph to native XLA PjRtLoadedExecutable handle.")
+                compile-fn (fn [comp-method]
+                             (case comp-method
+                               :trace
+                               (do
+                                 (println "Tracing full SmolLM-135M model graph (legacy tracer)...")
+                                 (let [trace-fn (fn [x emb fn-norm lm-hw & layer-args]
+                                                  (let [lw-seq (mapv (fn [[in-ln qw kw vw ow post-ln gw uw dw]]
+                                                                       {:input-ln-w in-ln :q-w qw :k-w kw :v-w vw :o-w ow :post-attn-ln-w post-ln :gate-w gw :up-w uw :down-w dw})
+                                                                     (partition 9 layer-args))]
+                                                    (smollm/full-smollm-forward x emb lw-seq fn-norm lm-hw [0])))
+                                       graph (trace-graph "full_smollm_model_trace" invars trace-fn)]
+                                   (xla/compile-graph ctx graph)))
+
+                               :tensor-logic
+                               (do
+                                 (println "Lowering declarative Tensor Logic SmolLM-135M AST to StableHLO graph...")
+                                 (let [ast (smollm-logic/smollm-model-ast {:num-layers 30 :max-seq-len max-seq-len})
+                                       graph (lower/ast->graph "full_smollm_model_logic" invars ast #{:logits})]
+                                   (xla/compile-graph ctx graph)))))]
 
             (println "Transferring weights to PJRT Device Memory...")
             (let [embed-buf (xla/buffer-from-host-buffer ctx (:client ctx) embed-tokens [49152 576] 11)
@@ -140,31 +190,97 @@
                   flat-layer-bufs (vec (apply concat layer-bufs))
                   flat-device-weights (into [embed-buf final-norm-buf lm-head-buf] flat-layer-bufs)]
 
-              ;; 5. Execute Autoregressive Generation Loop
-              (println "\nGenerating tokens autoregressively...")
-              (print prompt)
-              (flush)
-              (let [step-fn (fn [context-ids]
-                              (let [S (count context-ids)
-                                    input-array (prepare-input-tensor context-ids max-seq-len)
-                                    input-buf (xla/buffer-from-host-buffer ctx (:client ctx) input-array [1 max-seq-len] 4)
-                                    input-args (into [input-buf] flat-device-weights)
-                                    logits-out (xla/execute exec input-args)
-                                    last-logits (xla/to-host-slice logits-out (dec S) 49152)]
-                                last-logits))
-                    gen-ids (ar/generate-tokens step-fn prompt-ids {:max-new-tokens max-new-tokens
-                                                                    :temperature temperature
-                                                                    :top-k top-k
-                                                                    :eos-token-id (eos-id tokenizer)
-                                                                    :callback (fn [token-id]
-                                                                                (print (decode tokenizer [token-id]))
-                                                                                (flush))})
-                    full-text (decode tokenizer gen-ids)]
-                (println "\n\n==================================================================")
-                (println "Final Generated Sequence:")
-                (println full-text)
-                (println "==================================================================")
-                (println "=== End-to-End SmolLM-135M Generation Verification Passed! ===")))))))))
+              (if compare
+                (do
+                  (println "\n==================================================================")
+                  (println "               STARTING E2E PARITY COMPARISON MODE                ")
+                  (println "==================================================================")
+                  (let [exec-trace (compile-fn :trace)
+                        exec-logic (compile-fn :tensor-logic)
+                        seq-len (count prompt-ids)
+                        input-array (prepare-input-tensor prompt-ids max-seq-len)
+                        input-buf (xla/buffer-from-host-buffer ctx (:client ctx) input-array [1 max-seq-len] 4)
+                        input-args (into [input-buf] flat-device-weights)
+
+                        _ (println "\nExecuting prompt forward pass on both engines...")
+                        out-trace (xla/execute exec-trace input-args)
+                        out-logic (xla/execute exec-logic input-args)
+                        logits-trace (xla/to-host-slice out-trace (dec seq-len) 49152)
+                        logits-logic (xla/to-host-slice out-logic (dec seq-len) 49152)
+
+                        diffs (mapv (fn [a b] (Math/abs (double (- a b)))) logits-trace logits-logic)
+                        max-diff (reduce max 0.0 diffs)
+                        mean-diff (/ (reduce + 0.0 diffs) (count diffs))
+                        top-k-trace (take 5 (sort-by second > (map-indexed vector logits-trace)))
+                        top-k-logic (take 5 (sort-by second > (map-indexed vector logits-logic)))]
+
+                    (println "\n--- Logit Parity Metrics ---")
+                    (println (format "Max Absolute Error  : %.6e" max-diff))
+                    (println (format "Mean Absolute Error : %.6e" mean-diff))
+                    (println "Top 5 Logits (Tracer)      :" top-k-trace)
+                    (println "Top 5 Logits (Tensor Logic):" top-k-logic)
+
+                    (println "\n--- Running Autoregressive Generation Comparison ---")
+                    (let [generate-tokens-fn (fn [engine-name exec]
+                                               (println (str "\nGenerating with [" engine-name "]..."))
+                                               (print prompt)
+                                               (flush)
+                                               (let [cur-tokens (atom (vec prompt-ids))]
+                                                 (dotimes [_ max-new-tokens]
+                                                   (let [s-len (count @cur-tokens)
+                                                         in-arr (prepare-input-tensor @cur-tokens max-seq-len)
+                                                         in-b (xla/buffer-from-host-buffer ctx (:client ctx) in-arr [1 max-seq-len] 4)
+                                                         args (into [in-b] flat-device-weights)
+                                                         out (xla/execute exec args)
+                                                         l (xla/to-host-slice out (dec s-len) 49152)
+                                                         next-id (sample-logits l temperature top-k)]
+                                                     (swap! cur-tokens conj next-id)
+                                                     (print (proto/decode tokenizer [next-id]))
+                                                     (flush)))
+                                                 (println)
+                                                 @cur-tokens))
+                          tokens-trace (generate-tokens-fn "Legacy Tracer" exec-trace)
+                          tokens-logic (generate-tokens-fn "Tensor Logic" exec-logic)
+                          str-trace (proto/decode tokenizer tokens-trace)
+                          str-logic (proto/decode tokenizer tokens-logic)
+                          match? (= tokens-trace tokens-logic)]
+
+                      (println "\n==================================================================")
+                      (println "                   FINAL VERIFICATION SUMMARY                     ")
+                      (println "==================================================================")
+                      (println "Legacy Tracer Output:\n" str-trace)
+                      (println "\nTensor Logic Output :\n" str-logic)
+                      (println "Token Matching:" (if match? "EXACT MATCH (100% PARITY)" "MISMATCH"))
+                      (when-not match?
+                        (throw (ex-info "E2E Parity Mismatch between Tracer and Tensor Logic"
+                                        {:trace-tokens tokens-trace :logic-tokens tokens-logic}))))))
+
+                ;; Normal generation with selected method
+                (let [exec (compile-fn (or method :tensor-logic))]
+                  (println "Successfully compiled model to native XLA PjRtLoadedExecutable handle.")
+                  (println "\nGenerating tokens autoregressively...")
+                  (print prompt)
+                  (flush)
+                  (let [cur-tokens (atom (vec prompt-ids))]
+                    (dotimes [_ max-new-tokens]
+                      (let [s-len (count @cur-tokens)
+                            in-arr (prepare-input-tensor @cur-tokens max-seq-len)
+                            in-b (xla/buffer-from-host-buffer ctx (:client ctx) in-arr [1 max-seq-len] 4)
+                            args (into [in-b] flat-device-weights)
+                            out (xla/execute exec args)
+                            l (xla/to-host-slice out (dec s-len) 49152)
+                            next-id (sample-logits l temperature top-k)]
+                        (swap! cur-tokens conj next-id)
+                        (print (proto/decode tokenizer [next-id]))
+                        (flush)))
+                    (println "\n\n==================================================================")
+                    (println "Final Generated Sequence:")
+                    (println (proto/decode tokenizer @cur-tokens))
+                    (println "==================================================================")
+                    (println "=== End-to-End SmolLM-135M Generation Completed! ===")))))))))))
+
+(defn -main-wrapper [& args]
+  (apply -main args))
 
 (when (= *file* (System/getProperty "clojure.script.filename"))
   (apply -main *command-line-args*))

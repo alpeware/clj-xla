@@ -15,8 +15,14 @@
   [:cat
    [:fn (fn [op] (or (= op ':=) (= op :=)))]
    HeadSchema
-   [:? [:map-of :keyword :any]]
-   [:* BodyTermSchema]])
+   [:* [:or BodyTermSchema [:map-of :keyword :any]]]])
+
+(def HookNodeSchema
+  "Schema for lowering hook nodes [:hook-op head & body-terms-and-attrs]."
+  [:cat
+   :keyword
+   HeadSchema
+   [:* [:or BodyTermSchema [:map-of :keyword :any]]]])
 
 (def ContainerNodeSchema
   "Schema for container nodes [:tag ?attrs & children]."
@@ -25,8 +31,8 @@
    [:* [:or [:vector :any] :keyword number? string?]]])
 
 (def NodeSchema
-  "General Malli schema for Tensor Logic Hiccup nodes (both equations and containers)."
-  [:or EquationSchema ContainerNodeSchema])
+  "General Malli schema for Tensor Logic Hiccup nodes (equations, lowering hooks, and containers)."
+  [:or EquationSchema HookNodeSchema ContainerNodeSchema])
 
 (defn valid-node?
   "Validates whether node matches the general Hiccup NodeSchema."
