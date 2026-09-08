@@ -29,6 +29,13 @@
              explicit-shape (or (:shape attrs) [])]
          (assoc known-shapes h-name (vec explicit-shape)))
 
+       (= (first eqn) :dynamic-update-slice)
+       (let [head (ast/head eqn)
+             head-name (first head)
+             body (ast/body-terms eqn)
+             op-name (first (first body))]
+         (assoc known-shapes head-name (get known-shapes op-name)))
+
        :else
        (let [body (ast/body-terms eqn)
              head (ast/head eqn)

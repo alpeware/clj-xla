@@ -42,10 +42,11 @@
     (let [body-names (set (map first (ast/body-terms eqn)))
           attrs (ast/attrs eqn)
           start-idx-names (when-let [starts (or (:start_indices attrs) (:start-indices attrs))]
-                            (set (filter keyword? starts)))]
-      (if (seq start-idx-names)
-        (into body-names start-idx-names)
-        body-names))))
+                            (set (filter keyword? starts)))
+          pos-name (when-let [p (:pos attrs)] (when (keyword? p) #{p}))]
+      (cond-> body-names
+        (seq start-idx-names) (into start-idx-names)
+        pos-name (into pos-name)))))
 
 (defn prune-ast
   "Performs backward-chaining dead-code elimination starting from `target-heads`.

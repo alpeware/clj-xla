@@ -122,3 +122,41 @@
     (is (= 5 val))
     (xla/destroy-buffer! out-buf)))
 
+(defspec prop-lower-dynamic-update-slice-produces-valid-graph
+  50
+  (prop/for-all [b (gen/choose 1 2)
+                 s (gen/choose 8 32)
+                 d (gen/choose 16 64)]
+                (let [invars [[:cache [:tensor [b s d] :f32]]
+                              [:new_slice [:tensor [b 1 d] :f32]]
+                              [:pos [:tensor [1] :i32]]]
+                      ast [:dynamic-update-slice [:out :b :s :d] [:cache :b :s :d] [:new_slice :b :one :d]
+                           {:start-indices [0 :pos 0]}]
+                      graph (lower/ast->graph "dus_graph" invars ast #{:out})]
+                  (and (shlo/validate-graph graph)
+                       (= [:out] (:outvars graph))
+                       (boolean (some #(= :stablehlo/dynamic_update_slice (:op %)) (:eqns graph)))))))
+
+(deftest test-end-to-end-dynamic-update-slice-execution
+  (let [ctx (xla/get-context)
+        invars [[:cache [:tensor [1 4 4] :f32]]
+                [:new_slice [:tensor [1 1 4] :f32]]
+                [:pos [:tensor [1] :i32]]]
+        ast [:dynamic-update-slice [:out :b :s :d] [:cache :b :s :d] [:new_slice :b :one :d]
+             {:start-indices [0 :pos 0]}]
+        graph (lower/ast->graph "e2e_dus" invars ast #{:out})
+        compiled (xla/compile-graph ctx graph)
+        cache-data (float-array (repeat 16 0.0))
+        slice-data (float-array [9.0 8.0 7.0 6.0])
+        pos-data (int-array [2])
+        out-buf (xla/execute compiled cache-data slice-data pos-data)
+        res (xla/to-host-slice out-buf 0 16 16)]
+    ;; Position 2 row in [1 4 4] should be [9.0 8.0 7.0 6.0] (indices 8, 9, 10, 11)
+    (is (= 0.0 (nth res 0)))
+    (is (= 9.0 (nth res 8)))
+    (is (= 8.0 (nth res 9)))
+    (is (= 7.0 (nth res 10)))
+    (is (= 6.0 (nth res 11)))
+    (is (= 0.0 (nth res 12)))
+    (xla/destroy-buffer! out-buf)))
+

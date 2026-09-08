@@ -140,3 +140,85 @@
                        (string? (:gate-w kmap))
                        (string? (:up-w kmap))
                        (string? (:down-w kmap))))))
+
+(defspec prop-gemma4-kv-layer-ast-validity 20
+  (prop/for-all [layer-idx (gen/choose 0 34)
+                 max-seq-len (gen/elements [16 32 64])]
+                (let [config (assoc (gemma/gemma4-config :e2b) :max-seq-len max-seq-len)
+                      layer-ast (gemma/gemma4-kv-layer-ast layer-idx max-seq-len config)
+                      expanded (expand/expand-ast {} layer-ast)]
+                  (and (vector? layer-ast)
+                       (seq expanded)
+                       (every? ast/valid-node? expanded)))))
+
+(deftest test-gemma4-kv-cache-step-lowering
+  (let [num-layers 1
+        max-seq-len 8
+        vocab-size 1000
+        hidden-dim 1536
+        intermediate-dim 6144
+        pl-dim 256
+        total-pl-dim 256
+        config {:vocab-size vocab-size
+                :hidden-dim hidden-dim
+                :intermediate-dim intermediate-dim
+                :pl-dim pl-dim
+                :total-pl-dim total-pl-dim
+                :num-layers num-layers
+                :num-heads 8
+                :num-kv-heads 1
+                :head-dim 256
+                :max-seq-len max-seq-len}
+        invars [[:x [:tensor [1 1] :i32]]
+                [:pos [:tensor [1] :i32]]
+                [:k_cache_in_0 [:tensor [1 max-seq-len 1 256] :f32]]
+                [:v_cache_in_0 [:tensor [1 max-seq-len 1 256] :f32]]
+                [:embed_tokens [:tensor [vocab-size hidden-dim] :f32]]
+                [:embed_tokens_per_layer [:tensor [vocab-size total-pl-dim] :f32]]
+                [:per_layer_model_projection [:tensor [total-pl-dim hidden-dim] :f32]]
+                [:per_layer_projection_norm [:tensor [pl-dim] :f32]]
+                [:final_norm_w [:tensor [hidden-dim] :f32]]
+                [:input_ln_w_0 [:tensor [hidden-dim] :f32]]
+                [:layer_scalar_0 [:tensor [1] :f32]]
+                [:q_w_0 [:tensor [2048 hidden-dim] :f32]]
+                [:k_w_0 [:tensor [256 hidden-dim] :f32]]
+                [:v_w_0 [:tensor [256 hidden-dim] :f32]]
+                [:o_w_0 [:tensor [hidden-dim 2048] :f32]]
+                [:q_norm_w_0 [:tensor [256] :f32]]
+                [:k_norm_w_0 [:tensor [256] :f32]]
+                [:post_attn_ln_w_0 [:tensor [hidden-dim] :f32]]
+                [:pre_mlp_ln_w_0 [:tensor [hidden-dim] :f32]]
+                [:post_mlp_ln_w_0 [:tensor [hidden-dim] :f32]]
+                [:gate_w_0 [:tensor [intermediate-dim hidden-dim] :f32]]
+                [:up_w_0 [:tensor [intermediate-dim hidden-dim] :f32]]
+                [:down_w_0 [:tensor [hidden-dim intermediate-dim] :f32]]
+                [:per_layer_gate_w_0 [:tensor [pl-dim hidden-dim] :f32]]
+                [:per_layer_proj_w_0 [:tensor [hidden-dim pl-dim] :f32]]
+                [:post_per_layer_norm_w_0 [:tensor [hidden-dim] :f32]]]
+        ast (gemma/gemma4-kv-model-ast config)
+        graph (lower/ast->graph "gemma4_kv_step" invars ast [:logits :k_cache_out_0 :v_cache_out_0])]
+    (is (shlo/validate-graph graph))
+    (is (= [:logits :k_cache_out_0 :v_cache_out_0] (:outvars graph)))
+    (let [ctx (xla/get-context)
+          compiled (xla/compile-graph ctx graph)
+          _ (is (some? compiled))
+          x-data (int-array [42])
+          pos-data (int-array [3])
+          k-cache (float-array (repeat (* max-seq-len 256) 0.0))
+          v-cache (float-array (repeat (* max-seq-len 256) 0.0))
+          weights-data (mapv (fn [[_ [_ shape _]]]
+                               (let [size (reduce * shape)]
+                                 (float-array (repeat size 0.01))))
+                             (subvec invars 4))
+          all-inputs (into [x-data pos-data k-cache v-cache] weights-data)
+          outs (apply xla/execute compiled all-inputs)
+          [logits-buf k-out-buf v-out-buf] (if (vector? outs) outs [outs])
+          logits (xla/to-host-slice logits-buf 0 vocab-size vocab-size)
+          k-out (xla/to-host-slice k-out-buf 0 (* max-seq-len 256) (* max-seq-len 256))]
+      (is (= vocab-size (count logits)))
+      (is (some #(not= 0.0 %) (subvec (vec k-out) (* 3 256) (* 4 256))))
+      (is (every? #(= 0.0 %) (subvec (vec k-out) 0 256)))
+      (xla/destroy-buffer! logits-buf)
+      (xla/destroy-buffer! k-out-buf)
+      (xla/destroy-buffer! v-out-buf))))
+

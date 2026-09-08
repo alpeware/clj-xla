@@ -270,6 +270,16 @@
                            :slice_sizes slice-sizes}}]
     (swap! eqns-atom conj slice-eqn)))
 
+(defn- lower-dynamic-update-slice! [eqns-atom _head op-term up-term attrs final-out-var]
+  (let [op-name (first op-term)
+        up-name (first up-term)
+        starts (or (:start_indices attrs) (:start-indices attrs) [0 0 0 0])
+        update-eqn {:op :stablehlo/dynamic_update_slice
+                    :invars [op-name up-name]
+                    :outvars [final-out-var]
+                    :attrs {:start_indices starts}}]
+    (swap! eqns-atom conj update-eqn)))
+
 (defn- lower-reshape! [eqns-atom head in-term attrs final-out-var]
   (let [in-name (first in-term)
         shape (or (:shape attrs) (vec (rest head)))
@@ -312,40 +322,88 @@
    (let [in-name (first in-term)
          orig-dtype (or dtype :f32)
          scores-shape (get known-shapes in-name [1 12 128 128])
+         batch (nth scores-shape 0 1)
+         num-heads (nth scores-shape 1 12)
          q-len (nth scores-shape 2 128)
          kv-len (nth scores-shape 3 128)
          window (or (:sliding-window attrs) (:window-size attrs))
-         mask-rows (vec (for [i (range q-len)]
-                          (vec (for [j (range kv-len)]
-                                 (if (or (> j i) (and window (>= (- i j) (long window))))
-                                   -10000.0
-                                   0.0)))))
+         pos-var (:pos attrs)
          needs-f32? (not= orig-dtype :f32)
          f32-in-var (if needs-f32? (gen-id "s_f32" counter) in-name)
          conv-in-eqn (when needs-f32?
                        {:op :stablehlo/convert :invars [in-name] :outvars [f32-in-var] :attrs {:target_dtype :f32}})
-         c-mask (gen-id "c_mask" counter)
-         c-mask-eqn {:op :stablehlo/constant
-                     :value [[mask-rows]]
-                     :type [:tensor [1 1 q-len kv-len] :f32]
-                     :outvars [c-mask]}
-         masked-var (gen-id "t_masked" counter)
-         masked-eqn {:op :stablehlo/add :invars [f32-in-var c-mask] :outvars [masked-var]}
-         max-var (gen-id "t_smax" counter)
-         max-eqn {:op :stablehlo/reduce_max :invars [masked-var] :outvars [max-var] :attrs {:axes [-1] :keep_dims true}}
-         diff-var (gen-id "t_sdiff" counter)
-         diff-eqn {:op :stablehlo/subtract :invars [masked-var max-var] :outvars [diff-var]}
-         exp-var (gen-id "t_sexp" counter)
-         exp-eqn {:op :stablehlo/exp :invars [diff-var] :outvars [exp-var]}
-         sum-var (gen-id "t_ssum" counter)
-         sum-eqn {:op :stablehlo/reduce_sum :invars [exp-var] :outvars [sum-var] :attrs {:axes [-1] :keep_dims true}}
-         f32-div-var (if needs-f32? (gen-id "t_sdiv" counter) final-out-var)
-         div-eqn {:op :stablehlo/divide :invars [exp-var sum-var] :outvars [f32-div-var]}
-         conv-out-eqn (when needs-f32?
-                        {:op :stablehlo/convert :invars [f32-div-var] :outvars [final-out-var] :attrs {:target_dtype orig-dtype}})]
+         masked-var (gen-id "t_masked" counter)]
      (when needs-f32? (swap! eqns-atom conj conv-in-eqn))
-     (swap! eqns-atom conj c-mask-eqn masked-eqn max-eqn diff-eqn exp-eqn sum-eqn div-eqn)
-     (when needs-f32? (swap! eqns-atom conj conv-out-eqn)))))
+     (if pos-var
+       (let [pos-scalar (gen-id "pos_s" counter)
+             pos-s-eqn {:op :stablehlo/reshape :invars [pos-var] :outvars [pos-scalar] :attrs {:shape []}}
+             pos-4d (gen-id "pos_4d" counter)
+             pos-4d-eqn {:op :stablehlo/broadcast_in_dim :invars [pos-scalar] :outvars [pos-4d] :attrs {:broadcast_dimensions [] :target_shape [1 1 1 kv-len]}}
+             iota-1d (gen-id "iota_1d" counter)
+             iota-1d-eqn {:op :stablehlo/iota :outvars [iota-1d] :attrs {:len kv-len :dtype :i32 :iota_dimension 0}}
+             iota-4d (gen-id "iota_4d" counter)
+             iota-4d-eqn {:op :stablehlo/broadcast_in_dim :invars [iota-1d] :outvars [iota-4d] :attrs {:broadcast_dimensions [3] :target_shape [1 1 1 kv-len]}}
+             cmp-fut (gen-id "cmp_fut" counter)
+             cmp-fut-eqn {:op :stablehlo/compare :invars [iota-4d pos-4d] :outvars [cmp-fut] :attrs {:comparison_direction "GT"}}
+             _ (swap! eqns-atom conj pos-s-eqn pos-4d-eqn iota-1d-eqn iota-4d-eqn cmp-fut-eqn)
+             cmp-final (if window
+                         (let [c-win (gen-id "c_win" counter)
+                               c-win-eqn {:op :stablehlo/constant :value (int window) :type [:tensor [] :i32] :outvars [c-win]}
+                               p-sub-win (gen-id "p_sub_w" counter)
+                               p-sub-eqn {:op :stablehlo/subtract :invars [pos-scalar c-win] :outvars [p-sub-win]}
+                               c-one (gen-id "c_one" counter)
+                               c-one-eqn {:op :stablehlo/constant :value 1 :type [:tensor [] :i32] :outvars [c-one]}
+                               min-p (gen-id "min_p" counter)
+                               min-p-eqn {:op :stablehlo/add :invars [p-sub-win c-one] :outvars [min-p]}
+                               min-p-4d (gen-id "min_p_4d" counter)
+                               min-p-4d-eqn {:op :stablehlo/broadcast_in_dim :invars [min-p] :outvars [min-p-4d] :attrs {:broadcast_dimensions [] :target_shape [1 1 1 kv-len]}}
+                               cmp-old (gen-id "cmp_old" counter)
+                               cmp-old-eqn {:op :stablehlo/compare :invars [iota-4d min-p-4d] :outvars [cmp-old] :attrs {:comparison_direction "LT"}}
+                               cmp-comb (gen-id "cmp_comb" counter)
+                               cmp-comb-eqn {:op :stablehlo/or :invars [cmp-fut cmp-old] :outvars [cmp-comb]}]
+                           (swap! eqns-atom conj c-win-eqn p-sub-eqn c-one-eqn min-p-eqn min-p-4d-eqn cmp-old-eqn cmp-comb-eqn)
+                           cmp-comb)
+                         cmp-fut)
+             c-neg (gen-id "c_neg" counter)
+             c-neg-eqn {:op :stablehlo/constant :value -10000.0 :type [:tensor [] :f32] :outvars [c-neg]}
+             c-neg-4d (gen-id "c_neg_4d" counter)
+             c-neg-4d-eqn {:op :stablehlo/broadcast_in_dim :invars [c-neg] :outvars [c-neg-4d] :attrs {:broadcast_dimensions [] :target_shape [1 1 1 kv-len]}}
+             c-zero (gen-id "c_zero" counter)
+             c-zero-eqn {:op :stablehlo/constant :value 0.0 :type [:tensor [] :f32] :outvars [c-zero]}
+             c-zero-4d (gen-id "c_zero_4d" counter)
+             c-zero-4d-eqn {:op :stablehlo/broadcast_in_dim :invars [c-zero] :outvars [c-zero-4d] :attrs {:broadcast_dimensions [] :target_shape [1 1 1 kv-len]}}
+             dyn-mask (gen-id "c_dyn_mask" counter)
+             dyn-mask-eqn {:op :stablehlo/select :invars [cmp-final c-neg-4d c-zero-4d] :outvars [dyn-mask]}
+             mask-broad (gen-id "c_mask_bcast" counter)
+             mask-broad-eqn {:op :stablehlo/broadcast_in_dim :invars [dyn-mask] :outvars [mask-broad] :attrs {:broadcast_dimensions [0 1 2 3] :target_shape [batch num-heads q-len kv-len]}}
+             masked-eqn {:op :stablehlo/add :invars [f32-in-var mask-broad] :outvars [masked-var]}]
+         (swap! eqns-atom conj c-neg-eqn c-neg-4d-eqn c-zero-eqn c-zero-4d-eqn dyn-mask-eqn mask-broad-eqn masked-eqn))
+       (let [mask-rows (vec (for [i (range q-len)]
+                              (vec (for [j (range kv-len)]
+                                     (if (or (> j i) (and window (>= (- i j) (long window))))
+                                       -10000.0
+                                       0.0)))))
+             c-mask (gen-id "c_mask" counter)
+             c-mask-eqn {:op :stablehlo/constant
+                         :value [[mask-rows]]
+                         :type [:tensor [1 1 q-len kv-len] :f32]
+                         :outvars [c-mask]}
+             masked-eqn {:op :stablehlo/add :invars [f32-in-var c-mask] :outvars [masked-var]}]
+         (swap! eqns-atom conj c-mask-eqn masked-eqn)))
+     (let [max-var (gen-id "t_smax" counter)
+           max-eqn {:op :stablehlo/reduce_max :invars [masked-var] :outvars [max-var] :attrs {:axes [-1] :keep_dims true}}
+           diff-var (gen-id "t_sdiff" counter)
+           diff-eqn {:op :stablehlo/subtract :invars [masked-var max-var] :outvars [diff-var]}
+           exp-var (gen-id "t_sexp" counter)
+           exp-eqn {:op :stablehlo/exp :invars [diff-var] :outvars [exp-var]}
+           sum-var (gen-id "t_ssum" counter)
+           sum-eqn {:op :stablehlo/reduce_sum :invars [exp-var] :outvars [sum-var] :attrs {:axes [-1] :keep_dims true}}
+           f32-div-var (if needs-f32? (gen-id "t_sdiv" counter) final-out-var)
+           div-eqn {:op :stablehlo/divide :invars [exp-var sum-var] :outvars [f32-div-var]}
+           conv-out-eqn (when needs-f32?
+                          {:op :stablehlo/convert :invars [f32-div-var] :outvars [final-out-var] :attrs {:target_dtype orig-dtype}})]
+       (swap! eqns-atom conj max-eqn diff-eqn exp-eqn sum-eqn div-eqn)
+       (when needs-f32? (swap! eqns-atom conj conv-out-eqn))))))
 
 (defn- lower-rms-norm! [eqns-atom counter _head in-term weight-term attrs final-out-var]
   (let [in-name (first in-term)
@@ -354,17 +412,17 @@
         eps (or (:eps attrs) 1e-5)
         sq-var (gen-id "rms_sq" counter)
         sq-eqn {:op :stablehlo/multiply :invars [in-name in-name] :outvars [sq-var]}
-        ms-var (gen-id "rms_ms" counter)
-        ms-eqn {:op :stablehlo/reduce_mean :invars [sq-var] :outvars [ms-var] :attrs {:axes [-1] :keep_dims true}}
+        mean-var (gen-id "rms_mean" counter)
+        mean-eqn {:op :stablehlo/reduce_mean :invars [sq-var] :outvars [mean-var] :attrs {:axes [-1] :keep_dims true}}
         c-eps (gen-id "rms_eps" counter)
         c-eps-eqn {:op :stablehlo/constant :value (double eps) :outvars [c-eps]}
-        ms-eps-var (gen-id "rms_ms_eps" counter)
-        ms-eps-eqn {:op :stablehlo/add :invars [ms-var c-eps] :outvars [ms-eps-var]}
-        std-var (gen-id "rms_std" counter)
-        std-eqn {:op :stablehlo/sqrt :invars [ms-eps-var] :outvars [std-var]}
+        mean-eps-var (gen-id "rms_mean_eps" counter)
+        mean-eps-eqn {:op :stablehlo/add :invars [mean-var c-eps] :outvars [mean-eps-var]}
+        rsqrt-var (gen-id "rms_rsqrt" counter)
+        rsqrt-eqn {:op :stablehlo/rsqrt :invars [mean-eps-var] :outvars [rsqrt-var]}
         xhat-var (if weight-name (gen-id "rms_xhat" counter) final-out-var)
-        xhat-eqn {:op :stablehlo/divide :invars [in-name std-var] :outvars [xhat-var]}]
-    (swap! eqns-atom conj sq-eqn ms-eqn c-eps-eqn ms-eps-eqn std-eqn xhat-eqn)
+        xhat-eqn {:op :stablehlo/multiply :invars [in-name rsqrt-var] :outvars [xhat-var]}]
+    (swap! eqns-atom conj sq-eqn mean-eqn c-eps-eqn mean-eps-eqn rsqrt-eqn xhat-eqn)
     (when weight-name
       (let [w-var (if gemma?
                     (let [c-one (gen-id "rms_one" counter)
@@ -396,14 +454,18 @@
          half-dim (quot effective-rot-dim 2)
          theta (double (or (:theta attrs) (:theta-base attrs) 10000.0))
 
+         dynamic? (and (= seq-len 1) (:pos attrs))
+         pos-var (when dynamic? (:pos attrs))
+         table-len (if dynamic? (long (or (:max-seq-len attrs) 2048)) seq-len)
+
          freqs (vec (for [i (range half-dim)]
                       (Math/pow theta (/ (* -2.0 i) (double effective-rot-dim)))))
-         cos-rows (vec (for [idx (range seq-len)]
+         cos-rows (vec (for [idx (range table-len)]
                          (let [pos idx
                                half (vec (for [i (range half-dim)]
                                            (Math/cos (* (double pos) (nth freqs i)))))]
                            (vec (concat half half)))))
-         sin-rows (vec (for [idx (range seq-len)]
+         sin-rows (vec (for [idx (range table-len)]
                          (let [pos idx
                                half (vec (for [i (range half-dim)]
                                            (Math/sin (* (double pos) (nth freqs i)))))]
@@ -454,17 +516,49 @@
          rot-var (gen-id "rope_rot" counter)
          rot-eqn {:op :stablehlo/concatenate :invars [neg-x2-var x1-var] :outvars [rot-var] :attrs {:dimension 3}}
 
-         c-cos-var (gen-id "rope_cos" counter)
+         c-cos-table (gen-id "rope_cos" counter)
          c-cos-eqn {:op :stablehlo/constant
                     :value [[cos-rows]]
-                    :type [:tensor [1 1 seq-len effective-rot-dim] dtype]
-                    :outvars [c-cos-var]}
+                    :type [:tensor [1 1 table-len effective-rot-dim] dtype]
+                    :outvars [c-cos-table]}
 
-         c-sin-var (gen-id "rope_sin" counter)
+         c-sin-table (gen-id "rope_sin" counter)
          c-sin-eqn {:op :stablehlo/constant
                     :value [[sin-rows]]
-                    :type [:tensor [1 1 seq-len effective-rot-dim] dtype]
-                    :outvars [c-sin-var]}
+                    :type [:tensor [1 1 table-len effective-rot-dim] dtype]
+                    :outvars [c-sin-table]}
+
+         [c-cos-var c-sin-var]
+         (if dynamic?
+           (let [cos-sl (gen-id "rope_cos_sl" counter)
+                 cos-sl-eqn {:op :stablehlo/dynamic_slice
+                             :invars [c-cos-table]
+                             :outvars [cos-sl]
+                             :attrs {:slice_sizes [1 1 1 effective-rot-dim]
+                                     :start_indices [0 0 pos-var 0]}}
+                 sin-sl (gen-id "rope_sin_sl" counter)
+                 sin-sl-eqn {:op :stablehlo/dynamic_slice
+                             :invars [c-sin-table]
+                             :outvars [sin-sl]
+                             :attrs {:slice_sizes [1 1 1 effective-rot-dim]
+                                     :start_indices [0 0 pos-var 0]}}
+                 cos-bc (gen-id "rope_cos_bc" counter)
+                 cos-bc-eqn {:op :stablehlo/broadcast_in_dim
+                             :invars [cos-sl]
+                             :outvars [cos-bc]
+                             :attrs {:broadcast_dimensions [0 1 2 3]
+                                     :target_shape [batch n-heads 1 effective-rot-dim]}}
+                 sin-bc (gen-id "rope_sin_bc" counter)
+                 sin-bc-eqn {:op :stablehlo/broadcast_in_dim
+                             :invars [sin-sl]
+                             :outvars [sin-bc]
+                             :attrs {:broadcast_dimensions [0 1 2 3]
+                                     :target_shape [batch n-heads 1 effective-rot-dim]}}]
+             (swap! eqns-atom conj c-cos-eqn c-sin-eqn cos-sl-eqn sin-sl-eqn cos-bc-eqn sin-bc-eqn)
+             [cos-bc sin-bc])
+           (do
+             (swap! eqns-atom conj c-cos-eqn c-sin-eqn)
+             [c-cos-table c-sin-table]))
 
          x-cos-var (gen-id "rope_x_cos" counter)
          x-cos-eqn {:op :stablehlo/multiply :invars [x-rope-var c-cos-var] :outvars [x-cos-var]}
@@ -486,7 +580,7 @@
      (swap! eqns-atom conj r4d-eqn trans-eqn)
      (when partial?
        (swap! eqns-atom conj slice-rot-eqn slice-pass-eqn))
-     (swap! eqns-atom conj x1-eqn x2-eqn neg-x2-eqn rot-eqn c-cos-eqn c-sin-eqn x-cos-eqn x-sin-eqn add-rot-eqn)
+     (swap! eqns-atom conj x1-eqn x2-eqn neg-x2-eqn rot-eqn x-cos-eqn x-sin-eqn add-rot-eqn)
      (when partial?
        (swap! eqns-atom conj concat-pass-eqn))
      (swap! eqns-atom conj back-trans-eqn final-eqn))))
@@ -551,6 +645,9 @@
 
           (= op :dynamic-slice)
           (lower-dynamic-slice! eqns-atom head (first body) attrs final-var)
+
+          (= op :dynamic-update-slice)
+          (lower-dynamic-update-slice! eqns-atom head (first body) (second body) attrs final-var)
 
           (= op :reshape)
           (lower-reshape! eqns-atom head (first body) attrs final-var)

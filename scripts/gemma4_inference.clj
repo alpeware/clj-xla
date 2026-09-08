@@ -23,7 +23,7 @@
    :top-k 10
    :backend :cpu
    :precision :bf16
-   :method :tensor-logic
+   :method :kv-cache
    :compare false
    :verbose false
    :quiet false
@@ -400,6 +400,72 @@
       (println "Compiling Tensor Logic graph to native XLA PjRtLoadedExecutable..."))
     (xla/compile-graph ctx graph)))
 
+(defn build-gemma4-kv-invars
+  "Constructs EDN SSA signature invars for single-token Gemma 4 forward pass with KV Cache."
+  [config max-seq-len]
+  (let [{:keys [num-layers num-kv-shared-layers weight-dtype is-int8 layer-configs]} config
+        norm-dtype (if is-int8 :bf16 weight-dtype)
+        num-layers (long (or num-layers 35))
+        num-kv-shared (long (or num-kv-shared-layers 0))
+        num-unshared (- num-layers num-kv-shared)
+        kv-invars (mapcat (fn [i]
+                            (let [cfg (if (seq layer-configs) (nth layer-configs i nil) nil)
+                                  is-global? (zero? (mod (inc i) 5))
+                                  h-dim (or (:head-dim cfg) (if is-global? 512 256))
+                                  n-kv (or (:num-kv-heads cfg) 1)]
+                              [[(keyword (str "k_cache_in_" i)) [:tensor [1 max-seq-len n-kv h-dim] norm-dtype]]
+                               [(keyword (str "v_cache_in_" i)) [:tensor [1 max-seq-len n-kv h-dim] norm-dtype]]]))
+                          (range num-unshared))
+        weight-invars (subvec (build-tensor-logic-invars (assoc config :last-token-only? true) max-seq-len) 2)]
+    (vec (concat [[:x [:tensor [1 1] :i32]]
+                  [:pos [:tensor [1] :i32]]]
+                 kv-invars
+                 weight-invars))))
+
+(defn build-gemma4-kv-outvars
+  "Constructs output variable list for Gemma 4 KV Cache step: [:logits k_cache_out_0 v_cache_out_0 ...]."
+  [config]
+  (let [num-layers (long (or (:num-layers config) 35))
+        num-kv-shared (long (or (:num-kv-shared-layers config) 0))
+        num-unshared (- num-layers num-kv-shared)
+        out-kv-heads (mapcat (fn [i]
+                               [(keyword (str "k_cache_out_" i))
+                                (keyword (str "v_cache_out_" i))])
+                             (range num-unshared))]
+    (vec (into [:logits] out-kv-heads))))
+
+(defn allocate-kv-cache-buffers
+  "Allocates initial zero-filled device VRAM buffers for KV cache of unshared layers."
+  [{:keys [ctx config]} max-seq-len]
+  (let [num-layers (long (or (:num-layers config) 35))
+        num-kv-shared (long (or (:num-kv-shared-layers config) 0))
+        num-unshared (- num-layers num-kv-shared)
+        norm-enum (or (:norm-enum config) 13)]
+    (vec (mapcat (fn [i]
+                   (let [c (if (seq (:layer-configs config)) (nth (:layer-configs config) i nil) nil)
+                         is-global? (zero? (mod (inc i) 5))
+                         n-kv (long (or (:num-kv-heads c) 1))
+                         h-dim (long (or (:head-dim c) (if is-global? 512 256)))
+                         zeros (float-array (* max-seq-len n-kv h-dim))]
+                     [(pjrt/buffer-from-host-buffer ctx (:client ctx) zeros [1 max-seq-len n-kv h-dim] norm-enum)
+                      (pjrt/buffer-from-host-buffer ctx (:client ctx) zeros [1 max-seq-len n-kv h-dim] norm-enum)]))
+                 (range num-unshared)))))
+
+(defn compile-gemma4-kv-executable
+  "Compiles single-step Gemma 4 KV-Cache AST into a native StableHLO MLIR executable."
+  [{:keys [ctx config opts]} max-seq-len]
+  (let [cfg (assoc config :max-seq-len max-seq-len :last-token-only? true)
+        invars (build-gemma4-kv-invars cfg max-seq-len)
+        targets (build-gemma4-kv-outvars cfg)
+        ast (gemma-logic/gemma4-kv-model-ast cfg)
+        _ (when-not (:quiet opts)
+            (println (format "Lowering declarative Tensor Logic Gemma 4 KV Cache Step (%d layers, max-seq-len=%d) to StableHLO..."
+                             (:num-layers config) max-seq-len)))
+        graph (lower/ast->graph "gemma4_kv_step" invars ast targets)]
+    (when-not (:quiet opts)
+      (println "Compiling Gemma 4 KV Cache step graph to native XLA PjRtLoadedExecutable..."))
+    (xla/compile-graph ctx graph)))
+
 (def GEMMA4-STOP-TOKEN-IDS
   "Special token IDs marking end-of-turn or end-of-generation in Gemma 4."
   #{1 106 49 50})
@@ -641,16 +707,114 @@
          (println "------------------------------------------------------------------\n")))
      @cur-tokens)))
 
+(defn run-cached-kv-generation
+  "Executes autoregressive generation with in-VRAM KV-Cache using single-token step executable."
+  ([session exec device-weights prompt-ids]
+   (run-cached-kv-generation session exec device-weights prompt-ids nil))
+  ([{:keys [ctx opts config tokenizer] :as session} exec device-weights prompt-ids max-seq-len]
+   (let [{:keys [max-new-tokens quiet mode]} opts
+         is-agent? (= mode :agent)
+         seq-len (long (or max-seq-len (:max-seq-len config) 512))
+         vocab-size (long (or (:vocab-size config) 262144))
+         weight-dt (get config :weight-dtype :bf16)
+         num-layers (long (or (:num-layers config) 35))
+         num-kv-shared (long (or (:num-kv-shared-layers config) 0))
+         num-unshared (- num-layers num-kv-shared)
+         num-outs (inc (* 2 num-unshared))
+         prompt-count (count prompt-ids)
+         initial-kv (allocate-kv-cache-buffers session seq-len)
+         kv-buffers-atom (atom initial-kv)
+         x-arr (int-array 1)
+         pos-arr (int-array 1)
+         t0 (System/nanoTime)]
+     (try
+       ;; Phase 1: Prefill prompt tokens sequentially into KV cache
+       (let [last-logits
+             (loop [p 0
+                    cur-logits nil]
+               (if (< p prompt-count)
+                 (let [tok (int (nth prompt-ids p))
+                       _ (aset x-arr 0 tok)
+                       _ (aset pos-arr 0 p)
+                       x-b (xla/buffer-from-host-buffer ctx (:client ctx) x-arr [1 1] 4)
+                       pos-b (xla/buffer-from-host-buffer ctx (:client ctx) pos-arr [1] 4)
+                       step-inputs (into [x-b pos-b] (concat @kv-buffers-atom device-weights))
+                       outs (pjrt/execute-executable ctx (or (:handle exec) exec) step-inputs num-outs)
+                       _ (xla/destroy-buffer! ctx x-b)
+                       _ (xla/destroy-buffer! ctx pos-b)
+                       outs-vec (if (vector? outs) outs [outs])
+                       new-logits (first outs-vec)
+                       new-kv (vec (subvec outs-vec 1))
+                       old-kv @kv-buffers-atom]
+                   (when cur-logits (xla/destroy-buffer! ctx cur-logits))
+                   (doseq [b old-kv] (xla/destroy-buffer! ctx b))
+                   (reset! kv-buffers-atom new-kv)
+                   (recur (inc p) new-logits))
+                 cur-logits))
+             cur-tokens (atom (vec prompt-ids))
+             max-tokens (long (or max-new-tokens 256))]
+         ;; Phase 2: Autoregressive decode loop
+         (loop [step prompt-count
+                cur-logits last-logits]
+           (if (or (>= (- (count @cur-tokens) prompt-count) max-tokens)
+                   (>= step (dec seq-len)))
+             (when cur-logits (xla/destroy-buffer! ctx cur-logits))
+             (let [logits-data (xla/to-host-slice cur-logits 0 vocab-size vocab-size weight-dt)
+                   _ (xla/destroy-buffer! ctx cur-logits)
+                   next-id (sample-next-token logits-data opts prompt-ids (subvec @cur-tokens prompt-count))]
+               (swap! cur-tokens conj next-id)
+               (when (and (not quiet) (not is-agent?))
+                 (print (decode tokenizer [next-id]))
+                 (flush))
+               (if (or (contains? GEMMA4-STOP-TOKEN-IDS next-id) (= next-id (eos-id tokenizer)))
+                 nil
+                 (let [_ (aset x-arr 0 (int next-id))
+                       _ (aset pos-arr 0 step)
+                       x-b (xla/buffer-from-host-buffer ctx (:client ctx) x-arr [1 1] 4)
+                       pos-b (xla/buffer-from-host-buffer ctx (:client ctx) pos-arr [1] 4)
+                       step-inputs (into [x-b pos-b] (concat @kv-buffers-atom device-weights))
+                       outs (pjrt/execute-executable ctx (or (:handle exec) exec) step-inputs num-outs)
+                       _ (xla/destroy-buffer! ctx x-b)
+                       _ (xla/destroy-buffer! ctx pos-b)
+                       outs-vec (if (vector? outs) outs [outs])
+                       new-logits (first outs-vec)
+                       new-kv (vec (subvec outs-vec 1))
+                       old-kv @kv-buffers-atom]
+                   (doseq [b old-kv] (xla/destroy-buffer! ctx b))
+                   (reset! kv-buffers-atom new-kv)
+                   (recur (inc step) new-logits))))))
+         (let [t1 (System/nanoTime)
+               total-ms (/ (- t1 t0) 1e6)
+               gen-count (- (count @cur-tokens) (count prompt-ids))
+               tok-s (if (pos? total-ms) (/ (* gen-count 1000.0) total-ms) 0.0)]
+           (when-not quiet
+             (println)
+             (println "\n------------------------------------------------------------------")
+             (println "  Telemetry Benchmark Metrics (Tensor Logic KV-Cache):")
+             (println (format "    • Total Generation Latency    : %8.2f ms (%d tokens)" total-ms gen-count))
+             (println (format "    • Generation Speed            : %8.2f tok/s (%6.2f ms/tok)" tok-s (if (pos? gen-count) (/ total-ms gen-count) 0.0)))
+             (println "------------------------------------------------------------------\n"))
+           @cur-tokens))
+       (finally
+         (doseq [b @kv-buffers-atom] (xla/destroy-buffer! ctx b)))))))
+
 (defn run-autoregressive-generation
-  "Executes autoregressive generation either via in-VRAM while loop or host sampling loop."
+  "Executes autoregressive generation either via in-VRAM while loop, cached KV generation, or full sequence recomputation."
   ([session exec device-weights prompt-ids]
    (run-autoregressive-generation session exec device-weights prompt-ids nil))
   ([session exec device-weights prompt-ids max-seq-len]
    (let [{:keys [opts]} session
-         vram-loop? (or (:vram-loop? opts) (= (:mode opts) :agent) (:vram-session? session))]
-     (if vram-loop?
+         method (or (:method opts) (if (:vram-loop? session) :vram-loop :kv-cache))
+         vram-loop? (or (= method :vram-loop) (:vram-loop? opts))]
+     (cond
+       vram-loop?
        (run-vram-loop-generation session exec device-weights prompt-ids (or max-seq-len (:max-seq-len session) 128))
-       (run-autoregressive-generation-logic session exec device-weights prompt-ids max-seq-len)))))
+
+       (= method :tensor-logic-full)
+       (run-autoregressive-generation-logic session exec device-weights prompt-ids max-seq-len)
+
+       :else
+       (run-cached-kv-generation session exec device-weights prompt-ids (or max-seq-len (:max-seq-len session) 512))))))
 
 (def compile-executable compile-tensor-logic-executable)
 
@@ -684,8 +848,9 @@
                       (str "[" (str/join " " (take 10 prompt-ids)) " ... " (str/join " " (take-last 5 prompt-ids)) "]")
                       (str prompt-ids))]
         (println (format "Prompt: \"%s\"" prompt-str))
-        (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d, precision=%s, method=tensor-logic"
-                         max-new-tokens temperature top-k (name (get-in session [:config :weight-dtype]))))
+        (println (format "Generation Options: max-new-tokens=%d, temperature=%.2f, top-k=%d, precision=%s, method=%s"
+                         max-new-tokens temperature top-k (name (get-in session [:config :weight-dtype]))
+                         (name (or (:method opts) :kv-cache))))
         (println (format "Encoded Token IDs (%d tokens): %s" prompt-len tok-str))))
 
     (let [metrics-atom (or (:metrics-atom session) (atom {}))
@@ -701,9 +866,15 @@
                  (if reuse-exec?
                    (:executable session)
                    (profile/with-profile metrics-atom "graph_compilation"
-                     (if (or (:vram-loop? opts) (= (:mode opts) :agent) (:vram-session? session))
+                     (cond
+                       (:vram-loop? opts)
                        (compile-in-vram-loop-executable session max-seq-len)
-                       (compile-tensor-logic-executable session max-seq-len)))))]
+
+                       (= (:method opts) :tensor-logic-full)
+                       (compile-tensor-logic-executable session max-seq-len)
+
+                       :else
+                       (compile-gemma4-kv-executable session max-seq-len)))))]
       (when-not quiet
         (println "\nGenerating tokens autoregressively with pure Tensor Logic Gemma 4 Kernel..."))
       (let [final-context (binding [profile/*active-trace-spans* trace-spans-atom]
@@ -742,21 +913,28 @@
 
 (defn init-agent-vram-session
   "Initializes a persistent VRAM session for agent loops.
-   Pre-allocates weights in device memory and compiles the in-VRAM while-loop forward graph once."
+   Pre-allocates weights in device memory and compiles the KV-Cache step (or in-VRAM loop) executable once."
   ([opts]
    (init-agent-vram-session opts (long (or (:max-seq-len opts) 1024))))
   ([opts max-seq-len]
-   (let [opts (assoc opts :mode :agent :max-seq-len max-seq-len :vram-loop? true)
+   (let [vram-loop? (get opts :vram-loop? false)
+         opts (assoc opts :mode :agent :max-seq-len max-seq-len)
          session (init-inference-session opts)
          _ (when-not (:quiet opts) (println "Pinning Gemma 4 weights in PJRT VRAM..."))
          device-weights (allocate-device-weights session)
-         _ (when-not (:quiet opts) (println (format "Pre-compiling Gemma 4 In-VRAM StableHLO graph (max-seq-len=%d)..." max-seq-len)))
-         exec (compile-in-vram-loop-executable session max-seq-len)]
+         _ (when-not (:quiet opts)
+             (println (format "Pre-compiling Gemma 4 %s graph (max-seq-len=%d)..."
+                              (if vram-loop? "In-VRAM While Loop" "KV-Cache")
+                              max-seq-len)))
+         exec (if vram-loop?
+                (compile-in-vram-loop-executable session max-seq-len)
+                (compile-gemma4-kv-executable session max-seq-len))]
      (assoc session
             :device-weights device-weights
             :executable exec
             :max-seq-len max-seq-len
-            :vram-session? true))))
+            :vram-session? true
+            :vram-loop? vram-loop?))))
 
 (defn close-agent-session!
   "Releases VRAM resources for an agent session."
