@@ -33,3 +33,19 @@
                   [:not [:not_out] [:step_lt]]
                   [:and [out-n] [:step_lt] [:not_out]]])))
 
+(defspec prop-body-node-satisfies-schema
+  50
+  (prop/for-all [out-n (gen/fmap #(keyword (str "out_" %)) (gen/choose 1 100))
+                 arg-n (gen/fmap #(keyword (str "arg_" %)) (gen/choose 1 100))]
+                (ast/valid-node?
+                 [:body [out-n] {:args [arg-n]}
+                  [:+ [out-n] [arg-n] [arg-n]]])))
+
+(defspec prop-argmax-node-satisfies-schema
+  50
+  (prop/for-all [out-n (gen/fmap #(keyword (str "out_" %)) (gen/choose 1 100))
+                 in-n (gen/fmap #(keyword (str "in_" %)) (gen/choose 1 100))]
+                (ast/valid-node?
+                 [:argmax [out-n] [in-n] {:axis -1}])))
+
+

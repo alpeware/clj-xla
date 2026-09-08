@@ -41,6 +41,14 @@
    [:? [:map-of :keyword :any]]
    [:* [:or [:vector :any] :keyword number? string?]]])
 
+(def BodyNodeSchema
+  "Schema for while-loop body nodes [:body head ?attrs & children]."
+  [:cat
+   [:enum :body]
+   [:vector :any]
+   [:? [:map-of :keyword :any]]
+   [:* [:or [:vector :any] :keyword number? string?]]])
+
 (def ContainerNodeSchema
   "Schema for container nodes [:tag ?attrs & children]."
   [:cat [:or :keyword :symbol]
@@ -48,8 +56,8 @@
    [:* [:or [:vector :any] :keyword number? string?]]])
 
 (def NodeSchema
-  "General Malli schema for Tensor Logic Hiccup nodes (equations, lowering hooks, while loops, cond nodes, and containers)."
-  [:or EquationSchema HookNodeSchema WhileNodeSchema CondNodeSchema ContainerNodeSchema])
+  "General Malli schema for Tensor Logic Hiccup nodes (equations, lowering hooks, while loops, cond nodes, body nodes, and containers)."
+  [:or EquationSchema HookNodeSchema WhileNodeSchema CondNodeSchema BodyNodeSchema ContainerNodeSchema])
 
 (defn valid-node?
   "Validates whether node matches the general Hiccup NodeSchema."

@@ -165,6 +165,84 @@
     (is (= 7 val))
     (xla/destroy-buffer! out-buf)))
 
+(defspec prop-lower-argmax-produces-valid-graph
+  50
+  (prop/for-all [b (gen/choose 1 4)
+                 v (gen/choose 16 128)]
+                (let [invars [[:logits [:tensor [b v] :f32]]]
+                      ast [:argmax [:out] [:logits] {:axis 1}]
+                      graph (lower/ast->graph "argmax_graph" invars ast #{:out})]
+                  (and (shlo/validate-graph graph)
+                       (= [:out] (:outvars graph))
+                       (boolean (some #(= :stablehlo/argmax (:op %)) (:eqns graph)))))))
+
+(deftest test-end-to-end-argmax-execution
+  (let [ctx (xla/get-context)
+        invars [[:logits [:tensor [2 4] :f32]]]
+        ast [:argmax [:out] [:logits] {:axis 1}]
+        graph (lower/ast->graph "e2e_argmax" invars ast #{:out})
+        compiled (xla/compile-graph ctx graph)
+        logits-data (float-array [1.0 9.0 2.0 3.0
+                                  0.5 1.5 8.5 2.5])
+        out-buf (xla/execute compiled logits-data)
+        res (xla/to-host-slice out-buf 0 2 8)
+        idx0 (Float/floatToIntBits (nth res 0))
+        idx1 (Float/floatToIntBits (nth res 1))]
+    (is (= 1 idx0))
+    (is (= 2 idx1))
+    (xla/destroy-buffer! out-buf)))
+
+(defspec prop-lower-while-with-body-ast-produces-valid-graph
+  50
+  (prop/for-all [_lim (gen/choose 1 100)]
+                (let [invars [[:init [:tensor [] :i32]]
+                              [:max_step [:tensor [] :i32]]
+                              [:false_c [:tensor [] :i1]]]
+                      cond-ast [:cond [:cond_out] {:args [:cur_step :target_max :cur_stopped]}
+                                [:compare [:step_lt] [:cur_step] [:target_max] {:direction "LT"}]
+                                [:not [:not_stopped] [:cur_stopped]]
+                                [:and [:cond_out] [:step_lt] [:not_stopped]]]
+                      body-ast [:body [:next_step :target_max :cur_stopped]
+                                {:args [:cur_step :target_max :cur_stopped]}
+                                [:constant [:c_one] {:value 1 :type [:tensor [] :i32] :shape []}]
+                                [:+ [:next_step] [:cur_step] [:c_one]]]
+                      loop-ast [:while [:final_step :final_max :final_stopped]
+                                [:init :max_step :false_c]
+                                cond-ast
+                                body-ast]
+                      graph (lower/ast->graph "while_body_graph" invars loop-ast [:final_step])]
+                  (and (shlo/validate-graph graph)
+                       (= [:final_step] (:outvars graph))
+                       (boolean (some #(= :stablehlo/while (:op %)) (:eqns graph)))))))
+
+(deftest test-end-to-end-while-declarative-body-execution
+  (let [ctx (xla/get-context)
+        invars [[:init [:tensor [] :i32]]
+                [:max_step [:tensor [] :i32]]
+                [:false_c [:tensor [] :i1]]]
+        cond-ast [:cond [:cond_out] {:args [:cur_step :target_max :cur_stopped]}
+                  [:compare [:step_lt] [:cur_step] [:target_max] {:direction "LT"}]
+                  [:not [:not_stopped] [:cur_stopped]]
+                  [:and [:cond_out] [:step_lt] [:not_stopped]]]
+        body-ast [:body [:next_step :target_max :cur_stopped]
+                  {:args [:cur_step :target_max :cur_stopped]}
+                  [:constant [:c_one] {:value 1 :type [:tensor [] :i32] :shape []}]
+                  [:+ [:next_step] [:cur_step] [:c_one]]]
+        loop-ast [:while [:final_step :final_max :final_stopped]
+                  [:init :max_step :false_c]
+                  cond-ast
+                  body-ast]
+        graph (lower/ast->graph "e2e_while_body" invars loop-ast [:final_step])
+        compiled (xla/compile-graph ctx graph)
+        init-data (int-array [0])
+        max-data (int-array [10])
+        false-data (byte-array [0])
+        out-buf (xla/execute compiled init-data max-data false-data)
+        res (xla/to-host-slice out-buf 0 1 4)
+        val (Float/floatToIntBits (first res))]
+    (is (= 10 val))
+    (xla/destroy-buffer! out-buf)))
+
 (defspec prop-lower-dynamic-update-slice-produces-valid-graph
   50
   (prop/for-all [b (gen/choose 1 2)

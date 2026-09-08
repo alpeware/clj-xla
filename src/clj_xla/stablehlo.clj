@@ -252,6 +252,17 @@
                                 "tensor<i1>")]
                     (assoc acc (first outvars) out-t))
 
+                  (= op :stablehlo/argmax)
+                  (let [in-t (get acc (first in-vars) "tensor<1x262144xf32>")
+                        [in-dims _] (or (parse-tensor-dims in-t) [[1 262144] "f32"])
+                        raw-axis (long (or (:axis attrs) (:dimension attrs) (dec (count in-dims))))
+                        axis (if (neg? raw-axis) (+ (count in-dims) raw-axis) raw-axis)
+                        out-dims (vec (concat (subvec (vec in-dims) 0 axis) (subvec (vec in-dims) (inc axis))))
+                        out-t (if (seq out-dims)
+                                (str "tensor<" (str/join "x" out-dims) "xi32>")
+                                "tensor<i32>")]
+                    (assoc acc (first outvars) out-t))
+
                   (= op :stablehlo/while)
                   (reduce (fn [a [inv outv]]
                             (if (and inv outv)
@@ -276,9 +287,10 @@
 (defn format-while-region
   "Formats an SSA sub-graph as an MLIR basic block region for stablehlo.while."
   [graph var-types]
-  (let [{:keys [invars outvars eqns]} graph
+  (let [{:keys [invars outvars eqns carry-invars]} graph
+        bb-invars (or carry-invars invars)
         sub-types (merge var-types (infer-var-types invars eqns))
-        bb-args (str/join ", " (map (fn [[v t]] (str "%" (name v) ": " (type->mlir-string t))) invars))
+        bb-args (str/join ", " (map (fn [[v t]] (str "%" (name v) ": " (type->mlir-string t))) bb-invars))
         eq-lines (map #(format-equation % sub-types) eqns)
         ret-vars (str/join ", " (map #(str "%" (name %)) outvars))
         ret-types (str/join ", " (map #(get sub-types % "tensor<1xi32>") outvars))]
@@ -538,6 +550,32 @@
                "      \"stablehlo.return\"(%arg_res) : (tensor<" in-dtype ">) -> ()\n"
                "    }) {dimensions = array<i64: " axes-str ">} : (" in-type ", tensor<" in-dtype ">) -> " red-type "\n"
                "    %" (name out-var) " = stablehlo.reshape %" (name out-var) "_red : (" red-type ") -> " out-type)))
+
+      (= op :stablehlo/argmax)
+      (let [in-var (first invars)
+            in-type (get var-types in-var "tensor<1x262144xf32>")
+            [in-dims in-dtype] (or (parse-tensor-dims in-type) [[1 262144] "f32"])
+            raw-axis (long (or (:axis attrs) (:dimension attrs) (dec (count in-dims))))
+            axis-idx (if (neg? raw-axis) (+ (count in-dims) raw-axis) raw-axis)
+            iota-type (str "tensor<" (str/join "x" in-dims) "xi32>")
+            out-dims (vec (concat (subvec (vec in-dims) 0 axis-idx) (subvec (vec in-dims) (inc axis-idx))))
+            out-val-type (if (seq out-dims) (str "tensor<" (str/join "x" out-dims) "x" in-dtype ">") (str "tensor<" in-dtype ">"))
+            out-idx-type (if (seq out-dims) (str "tensor<" (str/join "x" out-dims) "xi32>") "tensor<i32>")
+            iota-var (str (name out-var) "_iota")
+            c-neg (str (name out-var) "_neg_inf")
+            c-zero (str (name out-var) "_zero_i32")
+            red-val (str (name out-var) "_max_val")
+            red-idx (name out-var)]
+        (str "    %" iota-var " = \"stablehlo.iota\"() {iota_dimension = " axis-idx " : i64} : () -> " iota-type "\n"
+             "    %" c-neg " = stablehlo.constant dense<-1.000000e+30> : tensor<" in-dtype ">\n"
+             "    %" c-zero " = stablehlo.constant dense<0> : tensor<i32>\n"
+             "    %" red-val ", %" red-idx " = \"stablehlo.reduce\"(%" (name in-var) ", %" iota-var ", %" c-neg ", %" c-zero ") ({\n"
+             "    ^bb0(%v1: tensor<" in-dtype ">, %i1: tensor<i32>, %v2: tensor<" in-dtype ">, %i2: tensor<i32>):\n"
+             "      %cmp = \"stablehlo.compare\"(%v1, %v2) {comparison_direction = #stablehlo<comparison_direction GT>} : (tensor<" in-dtype ">, tensor<" in-dtype ">) -> tensor<i1>\n"
+             "      %rv = \"stablehlo.select\"(%cmp, %v1, %v2) : (tensor<i1>, tensor<" in-dtype ">, tensor<" in-dtype ">) -> tensor<" in-dtype ">\n"
+             "      %ri = \"stablehlo.select\"(%cmp, %i1, %i2) : (tensor<i1>, tensor<i32>, tensor<i32>) -> tensor<i32>\n"
+             "      \"stablehlo.return\"(%rv, %ri) : (tensor<" in-dtype ">, tensor<i32>) -> ()\n"
+             "    }) {dimensions = array<i64: " axis-idx ">} : (" in-type ", " iota-type ", tensor<" in-dtype ">, tensor<i32>) -> (" out-val-type ", " out-idx-type ")"))
 
       (= op :stablehlo/custom_call)
       (let [[in0 in1] invars

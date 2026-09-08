@@ -7,7 +7,6 @@
             [clj-xla.profile :as profile]
             [clj-xla.safetensors :as st]
             [clj-xla.sampling :as sampling]
-            [clj-xla.stablehlo :as shlo]
             [clj-xla.tokenizer.core :as tok]
             [clj-xla.tokenizer.protocol :refer [bos-id decode encode eos-id]]
             [clojure.data.json :as json]
@@ -475,16 +474,11 @@
   [{:keys [ctx config opts]} max-seq-len]
   (let [cfg (assoc config :max-seq-len max-seq-len :last-token-only? true)
         vocab-size (long (or (:vocab-size cfg) 262144))
-        weight-dt (get cfg :weight-dtype :bf16)
-        dt-str (name weight-dt)
         invars (build-tensor-logic-invars cfg max-seq-len)
-        ast (gemma-logic/gemma4-model-ast cfg)
+        model-ast (gemma-logic/gemma4-model-ast cfg)
         _ (when-not (:quiet opts)
             (println (format "Lowering declarative Tensor Logic In-VRAM Gemma 4 Loop (%d layers, max-seq-len=%d) to StableHLO..."
                              (:num-layers config) max-seq-len)))
-        graph (lower/ast->graph "gemma4_step" invars ast #{:logits})
-        var-types (shlo/infer-var-types invars (:eqns graph))
-        body-eqns (mapv #(shlo/format-equation % var-types) (:eqns graph))
         weight-invars (subvec invars 2)
 
         cond-ast [:cond [:cond_out] {:args [:cur_step :target_max :cur_toks :cur_stopped]}
@@ -492,52 +486,44 @@
                   [:not [:not_stopped] [:cur_stopped]]
                   [:and [:cond_out] [:step_lt] [:not_stopped]]]
 
-        body-prefix (format "    ^bb0(%%cur_step: tensor<i32>, %%target_max: tensor<i32>, %%cur_toks: tensor<1x%dxi32>, %%cur_stopped: tensor<i1>):
-      %%c_one = stablehlo.constant dense<1> : tensor<i32>
-      %%pos_i32 = stablehlo.subtract %%cur_step, %%c_one : tensor<i32>
-      %%x = stablehlo.reshape %%cur_toks : (tensor<1x%dxi32>) -> tensor<1x%dxi32>
-      %%pos = stablehlo.reshape %%pos_i32 : (tensor<i32>) -> tensor<1xi32>" max-seq-len max-seq-len max-seq-len)
+        body-ast [:body [:next_step :target_max :next_toks :is_stop]
+                  {:args [:cur_step :target_max :cur_toks :cur_stopped]}
 
-        body-suffix (format "      %%logits_2d = stablehlo.reshape %%logits : (tensor<1x1x%dx%s>) -> tensor<1x%dx%s>
-      %%logits_f32 = \"stablehlo.convert\"(%%logits_2d) : (tensor<1x%dx%s>) -> tensor<1x%dxf32>
-      %%iota_2d = \"stablehlo.iota\"() {iota_dimension = 1 : i64} : () -> tensor<1x%dxi32>
-      %%c_neg_inf = stablehlo.constant dense<-1.000000e+30> : tensor<f32>
-      %%c_zero_i32 = stablehlo.constant dense<0> : tensor<i32>
-      %%red_val, %%red_idx = \"stablehlo.reduce\"(%%logits_f32, %%iota_2d, %%c_neg_inf, %%c_zero_i32) ({
-      ^bb0(%%v1: tensor<f32>, %%i1: tensor<i32>, %%v2: tensor<f32>, %%i2: tensor<i32>):
-        %%cmp = \"stablehlo.compare\"(%%v1, %%v2) {comparison_direction = #stablehlo<comparison_direction GT>} : (tensor<f32>, tensor<f32>) -> tensor<i1>
-        %%rv = \"stablehlo.select\"(%%cmp, %%v1, %%v2) : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
-        %%ri = \"stablehlo.select\"(%%cmp, %%i1, %%i2) : (tensor<i1>, tensor<i32>, tensor<i32>) -> tensor<i32>
-        \"stablehlo.return\"(%%rv, %%ri) : (tensor<f32>, tensor<i32>) -> ()
-      }) {dimensions = array<i64: 1>} : (tensor<1x%dxf32>, tensor<1x%dxi32>, tensor<f32>, tensor<i32>) -> (tensor<1xf32>, tensor<1xi32>)
-      %%next_tok_1d = stablehlo.reshape %%red_idx : (tensor<1xi32>) -> tensor<1x1xi32>
-      %%c_zero = stablehlo.constant dense<0> : tensor<i32>
-      %%next_toks = \"stablehlo.dynamic_update_slice\"(%%cur_toks, %%next_tok_1d, %%c_zero, %%cur_step) : (tensor<1x%dxi32>, tensor<1x1xi32>, tensor<i32>, tensor<i32>) -> tensor<1x%dxi32>
-      %%next_step = stablehlo.add %%cur_step, %%c_one : tensor<i32>
-      %%eos_c = stablehlo.constant dense<1> : tensor<1xi32>
-      %%eot_c = stablehlo.constant dense<106> : tensor<1xi32>
-      %%c_eos = \"stablehlo.compare\"(%%red_idx, %%eos_c) {comparison_direction = #stablehlo<comparison_direction EQ>} : (tensor<1xi32>, tensor<1xi32>) -> tensor<1xi1>
-      %%c_eot = \"stablehlo.compare\"(%%red_idx, %%eot_c) {comparison_direction = #stablehlo<comparison_direction EQ>} : (tensor<1xi32>, tensor<1xi32>) -> tensor<1xi1>
-      %%or_stop = \"stablehlo.or\"(%%c_eos, %%c_eot) : (tensor<1xi1>, tensor<1xi1>) -> tensor<1xi1>
-      %%is_stop = stablehlo.reshape %%or_stop : (tensor<1xi1>) -> tensor<i1>
-      \"stablehlo.return\"(%%next_step, %%target_max, %%next_toks, %%is_stop) : (tensor<i32>, tensor<i32>, tensor<1x%dxi32>, tensor<i1>) -> ()"
-                            vocab-size dt-str vocab-size dt-str
-                            vocab-size dt-str vocab-size
-                            vocab-size vocab-size vocab-size
-                            max-seq-len max-seq-len max-seq-len)
+                  ;; 1. Current position & token input bindings
+                  [:constant [:c_one] {:value 1 :type [:tensor [] :i32] :shape []}]
+                  [:- [:pos_i32] [:cur_step] [:c_one]]
+                  [:reshape [:pos] [:pos_i32] {:shape [1]}]
+                  [:reshape [:x :b :s] [:cur_toks :b :s] {:shape [1 max-seq-len]}]
+
+                  ;; 2. Gemma 4 Layer Contractions (pure Tensor Logic AST)
+                  model-ast
+
+                  ;; 3. Suffix: Argmax, Dynamic Update Slice, Step increment, Stop Token check
+                  [:reshape [:logits_2d] [:logits] {:shape [1 vocab-size]}]
+                  [:convert [:logits_f32] [:logits_2d] {:target-dtype :f32}]
+                  [:argmax [:next_tok] [:logits_f32] {:axis 1}]
+                  [:reshape [:next_tok_1d] [:next_tok] {:shape [1 1]}]
+                  [:constant [:c_zero] {:value 0 :type [:tensor [] :i32] :shape []}]
+                  [:dynamic-update-slice [:next_toks] [:cur_toks] [:next_tok_1d] {:start-indices [0 :cur_step]}]
+                  [:+ [:next_step] [:cur_step] [:c_one]]
+                  [:constant [:eos_c] {:value 1 :type [:tensor [1] :i32] :shape [1]}]
+                  [:constant [:eot_c] {:value 106 :type [:tensor [1] :i32] :shape [1]}]
+                  [:compare [:c_eos] [:next_tok] [:eos_c] {:direction "EQ"}]
+                  [:compare [:c_eot] [:next_tok] [:eot_c] {:direction "EQ"}]
+                  [:or [:or_stop] [:c_eos] [:c_eot]]
+                  [:reshape [:is_stop] [:or_stop] {:shape []}]]
 
         loop-ast [:block {}
                   [:constant [:false_c] {:value false :type [:tensor [] :i1] :shape []}]
                   [:while [:final_step :final_max :final_tokens :final_stopped]
                    [:init_step :max_step :init_tokens :false_c]
-                   {:body-mlir (str body-prefix "\n" (str/join "\n" body-eqns) "\n" body-suffix)}
-                   cond-ast]]
+                   cond-ast
+                   body-ast]]
 
         loop-invars (into [[:init_step [:tensor [] :i32]]
                            [:max_step [:tensor [] :i32]]
                            [:init_tokens [:tensor [1 max-seq-len] :i32]]]
                           weight-invars)
-
         loop-graph (lower/ast->graph "gemma4_in_vram_loop" loop-invars loop-ast [:final_step :final_tokens])]
     (when-not (:quiet opts)
       (println "Compiling In-VRAM Loop to native XLA PjRtLoadedExecutable..."))

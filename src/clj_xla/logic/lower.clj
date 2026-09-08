@@ -709,12 +709,79 @@
                                                      in-vars)
                                    cond-ast (vec (into [:block {}] cond-children))]
                                (ast->graph "cond" cond-invars cond-ast [cond-out])))
+                body-node (or (get attrs :body)
+                              (get attrs :body-node)
+                              (get attrs :body-ast)
+                              (first (filter #(and (vector? %) (= (first %) :body)) (drop 3 eqn))))
+                body-graph (when body-node
+                             (let [body-head (second body-node)
+                                   body-outs (if (vector? body-head)
+                                               (mapv #(if (vector? %) (first %) %) body-head)
+                                               [body-head])
+                                   body-children (filter vector?
+                                                         (if (map? (nth body-node 2 nil))
+                                                           (drop 3 body-node)
+                                                           (drop 2 body-node)))
+                                   body-arg-names (or (:body-args attrs)
+                                                      (:args (ast/attrs body-node))
+                                                      in-vars)
+                                   carry-invars (mapv (fn [arg-name in-var]
+                                                        (let [sh (or (get in-shapes in-var)
+                                                                     (get known-shapes in-var)
+                                                                     [])
+                                                              dt (or (get known-dtypes in-var)
+                                                                     (get in-dtypes in-var)
+                                                                     (when (re-find #"(?:step|pos|count|max)" (name in-var)) :i32)
+                                                                     (when (re-find #"(?:stopped|bool|flag|false|true)" (name in-var)) :i1)
+                                                                     :i32)]
+                                                          [arg-name [:tensor sh dt]]))
+                                                      body-arg-names
+                                                      in-vars)
+                                   all-body-invars (into carry-invars invars)
+                                   body-ast (vec (into [:block {}] body-children))
+                                   bg (ast->graph "body" all-body-invars body-ast body-outs)]
+                               (assoc bg :carry-invars carry-invars)))
                 attrs (cond-> attrs
-                        cond-graph (assoc :cond-graph cond-graph))]
+                        cond-graph (assoc :cond-graph cond-graph)
+                        body-graph (assoc :body-graph body-graph))]
             (swap! eqns-atom conj {:op :stablehlo/while
                                    :invars in-vars
                                    :outvars out-vars
                                    :attrs attrs}))
+
+          (or (= op :+) (= op :add))
+          (let [h-name (if (vector? head) (first head) head)]
+            (swap! eqns-atom conj {:op :stablehlo/add
+                                   :invars [(first (first body)) (first (second body))]
+                                   :outvars [h-name]}))
+
+          (or (= op :-) (= op :subtract))
+          (let [h-name (if (vector? head) (first head) head)]
+            (swap! eqns-atom conj {:op :stablehlo/subtract
+                                   :invars [(first (first body)) (first (second body))]
+                                   :outvars [h-name]}))
+
+          (or (= op :*) (= op :multiply))
+          (let [h-name (if (vector? head) (first head) head)]
+            (swap! eqns-atom conj {:op :stablehlo/multiply
+                                   :invars [(first (first body)) (first (second body))]
+                                   :outvars [h-name]}))
+
+          (= op :convert)
+          (let [h-name (if (vector? head) (first head) head)
+                target-dtype (or (:target-dtype attrs) (:target_dtype attrs) :f32)]
+            (swap! eqns-atom conj {:op :stablehlo/convert
+                                   :invars [(first (first body))]
+                                   :outvars [h-name]
+                                   :attrs {:target_dtype target-dtype}}))
+
+          (= op :argmax)
+          (let [h-name (if (vector? head) (first head) head)
+                axis (or (:axis attrs) (:dimension attrs) 1)]
+            (swap! eqns-atom conj {:op :stablehlo/argmax
+                                   :invars [(first (first body))]
+                                   :outvars [h-name]
+                                   :attrs {:axis axis}}))
 
           (= op :compare)
           (let [h-name (if (vector? head) (first head) head)

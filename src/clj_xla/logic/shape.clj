@@ -40,7 +40,14 @@
            (= (first eqn) :not)
            (= (first eqn) :and)
            (= (first eqn) :or)
-           (= (first eqn) :cond))
+           (= (first eqn) :cond)
+           (= (first eqn) :+)
+           (= (first eqn) :-)
+           (= (first eqn) :add)
+           (= (first eqn) :subtract)
+           (= (first eqn) :*)
+           (= (first eqn) :multiply)
+           (= (first eqn) :convert))
        (let [head (ast/head eqn)
              head-name (if (vector? head) (first head) head)
              head-idxs (when (vector? head) (vec (rest head)))
@@ -50,9 +57,24 @@
              first-body-shape (get known-shapes first-body-name [])
              shape (or (:shape attrs)
                        (if (empty? head-idxs)
-                         []
+                         first-body-shape
                          first-body-shape))]
          (assoc known-shapes head-name (vec shape)))
+
+       (= (first eqn) :argmax)
+       (let [head (ast/head eqn)
+             head-name (if (vector? head) (first head) head)
+             attrs (ast/attrs eqn)
+             body (ast/body-terms eqn)
+             in-name (first (first body))
+             in-shape (get known-shapes in-name [1 1])
+             rank (count in-shape)
+             raw-axis (long (or (:axis attrs) (:dimension attrs) (dec rank)))
+             axis (if (neg? raw-axis) (+ rank raw-axis) raw-axis)
+             out-shape (or (:shape attrs)
+                           (vec (concat (subvec (vec in-shape) 0 axis)
+                                        (subvec (vec in-shape) (inc axis)))))]
+         (assoc known-shapes head-name (vec out-shape)))
 
        :else
        (let [body (ast/body-terms eqn)
