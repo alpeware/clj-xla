@@ -3,6 +3,7 @@
   (:require [clj-xla.logic.ast :as ast]
             [clj-xla.logic.generators :as lg]
             [clojure.test.check.clojure-test :refer [defspec]]
+            [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
 
 (defspec prop-primitive-equations-satisfy-schema
@@ -15,3 +16,9 @@
   (prop/for-all [eqn lg/gen-binary-contraction]
                 (and (ast/valid-node? eqn)
                      (ast/eqn? eqn))))
+
+(defspec prop-while-node-satisfies-schema
+  50
+  (prop/for-all [out-n (gen/fmap #(keyword (str "out_" %)) (gen/choose 1 100))
+                 in-n (gen/fmap #(keyword (str "in_" %)) (gen/choose 1 100))]
+                (ast/valid-node? [:while [out-n] [in-n] {:max-iters 10}])))

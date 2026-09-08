@@ -569,6 +569,26 @@
           (= op :rope)
           (lower-rope! eqns-atom counter head (first body) attrs final-var known-shapes default-dtype)
 
+          (= op :while)
+          (let [out-spec (second eqn)
+                in-spec (nth eqn 2)
+                out-vars (mapv #(if (vector? %) (first %) %) (if (vector? out-spec) out-spec [out-spec]))
+                in-vars (mapv #(if (vector? %) (first %) %) (if (vector? in-spec) in-spec [in-spec]))]
+            (swap! eqns-atom conj {:op :stablehlo/while
+                                   :invars in-vars
+                                   :outvars out-vars
+                                   :attrs attrs}))
+
+          (= op :constant)
+          (let [h (second eqn)
+                h-name (if (vector? h) (first h) h)
+                val (get attrs :value false)
+                val-t (or (:type attrs) (if (boolean? val) [:tensor [] :i1] [:tensor [] :f32]))]
+            (swap! eqns-atom conj {:op :stablehlo/constant
+                                   :value val
+                                   :type val-t
+                                   :outvars [h-name]}))
+
           :else
           (throw (ex-info "Unknown AST equation or lowering hook" {:equation eqn :op op})))
 
@@ -583,7 +603,7 @@
               (swap! eqns-atom conj add-eqn)
               (swap! accum-state assoc head {:seen idx :current-var out-var}))))))
 
-    (let [outvars (vec targets)
+    (let [outvars (if (sequential? target-heads) (vec target-heads) (vec targets))
           graph {:name graph-name
                  :invars invars
                  :outvars outvars

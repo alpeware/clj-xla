@@ -420,7 +420,6 @@
         var-types (shlo/infer-var-types invars (:eqns graph))
         body-eqns (mapv #(shlo/format-equation % var-types) (:eqns graph))
         weight-invars (subvec invars 2)
-        weight-params-str (str/join ", " (map (fn [[v t]] (str "%" (name v) ": " (shlo/type->mlir-string t))) weight-invars))
 
         cond-region (format "    ^bb0(%%cur_step: tensor<i32>, %%target_max: tensor<i32>, %%cur_toks: tensor<1x%dxi32>, %%cur_stopped: tensor<i1>):
       %%step_lt = \"stablehlo.compare\"(%%cur_step, %%target_max) {comparison_direction = #stablehlo<comparison_direction LT>} : (tensor<i32>, tensor<i32>) -> tensor<i1>
@@ -462,22 +461,22 @@
                             vocab-size vocab-size vocab-size
                             max-seq-len max-seq-len max-seq-len)
 
-        full-mlir (str "module @gemma4_in_vram_loop {\n"
-                       "  func.func @main(%init_step: tensor<i32>, %max_step: tensor<i32>, %init_tokens: tensor<1x" max-seq-len "xi32>, " weight-params-str ") -> (tensor<i32>, tensor<1x" max-seq-len "xi32>) {\n"
-                       "    %false_c = stablehlo.constant dense<false> : tensor<i1>\n"
-                       "    %loop:4 = \"stablehlo.while\"(%init_step, %max_step, %init_tokens, %false_c) ({\n"
-                       cond-region "\n"
-                       "    }, {\n"
-                       body-prefix "\n"
-                       (str/join "\n" body-eqns) "\n"
-                       body-suffix "\n"
-                       "    }) : (tensor<i32>, tensor<i32>, tensor<1x" max-seq-len "xi32>, tensor<i1>) -> (tensor<i32>, tensor<i32>, tensor<1x" max-seq-len "xi32>, tensor<i1>)\n"
-                       "    return %loop#0, %loop#2 : tensor<i32>, tensor<1x" max-seq-len "xi32>\n"
-                       "  }\n"
-                       "}\n")]
+        loop-ast [:block {}
+                  [:constant [:false_c] {:value false :type [:tensor [] :i1] :shape []}]
+                  [:while [:final_step :final_max :final_tokens :final_stopped]
+                   [:init_step :max_step :init_tokens :false_c]
+                   {:cond-mlir cond-region
+                    :body-mlir (str body-prefix "\n" (str/join "\n" body-eqns) "\n" body-suffix)}]]
+
+        loop-invars (into [[:init_step [:tensor [] :i32]]
+                           [:max_step [:tensor [] :i32]]
+                           [:init_tokens [:tensor [1 max-seq-len] :i32]]]
+                          weight-invars)
+
+        loop-graph (lower/ast->graph "gemma4_in_vram_loop" loop-invars loop-ast [:final_step :final_tokens])]
     (when-not (:quiet opts)
       (println "Compiling In-VRAM Loop to native XLA PjRtLoadedExecutable..."))
-    (pjrt/compile-mlir ctx (:client ctx) full-mlir)))
+    (xla/compile-graph ctx loop-graph)))
 
 (defn run-vram-loop-generation
   "Executes autoregressive token generation entirely within device VRAM using a single OpenXLA while-loop execution."
@@ -503,7 +502,7 @@
             b-toks (xla/buffer-from-host-buffer ctx (:client ctx) in-arr [1 seq-len] 4)
             args (into [b-step b-max b-toks] device-weights)
             t0 (System/nanoTime)
-            outs (pjrt/execute-executable ctx exec args 2)
+            outs (pjrt/execute-executable ctx (or (:handle exec) exec) args 2)
             t1 (System/nanoTime)
             _ (xla/destroy-buffer! ctx b-step)
             _ (xla/destroy-buffer! ctx b-max)

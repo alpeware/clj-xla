@@ -95,3 +95,30 @@
     (is (= 15.0 (nth res 3)))
     (xla/destroy-buffer! out-buf)))
 
+(defspec prop-lower-while-produces-valid-graph
+  50
+  (prop/for-all [_lim (gen/choose 1 100)]
+                (let [invars [[:init [:tensor [1] :i32]]]
+                      ast [:while [:final_step] [:init]
+                           {:cond-mlir "    ^bb0(%s: tensor<1xi32>):\n      %c = stablehlo.constant dense<10> : tensor<1xi32>\n      %cmp = \"stablehlo.compare\"(%s, %c) {comparison_direction = #stablehlo<comparison_direction LT>} : (tensor<1xi32>, tensor<1xi32>) -> tensor<1xi1>\n      %res = stablehlo.reshape %cmp : (tensor<1xi1>) -> tensor<i1>\n      \"stablehlo.return\"(%res) : (tensor<i1>) -> ()"
+                            :body-mlir "    ^bb0(%s: tensor<1xi32>):\n      %one = stablehlo.constant dense<1> : tensor<1xi32>\n      %next = stablehlo.add %s, %one : tensor<1xi32>\n      \"stablehlo.return\"(%next) : (tensor<1xi32>) -> ()"}]
+                      graph (lower/ast->graph "while_graph" invars ast #{:final_step})]
+                  (and (shlo/validate-graph graph)
+                       (= [:final_step] (:outvars graph))
+                       (boolean (some #(= :stablehlo/while (:op %)) (:eqns graph)))))))
+
+(deftest test-end-to-end-while-execution
+  (let [ctx (xla/get-context)
+        invars [[:init [:tensor [1] :i32]]]
+        ast [:while [:final_step] [:init]
+             {:cond-mlir "    ^bb0(%s: tensor<1xi32>):\n      %c = stablehlo.constant dense<5> : tensor<1xi32>\n      %cmp = \"stablehlo.compare\"(%s, %c) {comparison_direction = #stablehlo<comparison_direction LT>} : (tensor<1xi32>, tensor<1xi32>) -> tensor<1xi1>\n      %res = stablehlo.reshape %cmp : (tensor<1xi1>) -> tensor<i1>\n      \"stablehlo.return\"(%res) : (tensor<i1>) -> ()"
+              :body-mlir "    ^bb0(%s: tensor<1xi32>):\n      %one = stablehlo.constant dense<1> : tensor<1xi32>\n      %next = stablehlo.add %s, %one : tensor<1xi32>\n      \"stablehlo.return\"(%next) : (tensor<1xi32>) -> ()"}]
+        graph (lower/ast->graph "e2e_while" invars ast #{:final_step})
+        compiled (xla/compile-graph ctx graph)
+        init-data (int-array [0])
+        out-buf (xla/execute compiled init-data)
+        res (xla/to-host-slice out-buf 0 1 4)
+        val (Float/floatToIntBits (first res))]
+    (is (= 5 val))
+    (xla/destroy-buffer! out-buf)))
+

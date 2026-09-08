@@ -24,6 +24,14 @@
    HeadSchema
    [:* [:or BodyTermSchema [:map-of :keyword :any]]]])
 
+(def WhileNodeSchema
+  "Schema for while loop nodes [:while out-specs in-specs ?attrs]."
+  [:cat
+   [:enum :while]
+   [:vector :any]
+   [:vector :any]
+   [:? [:map-of :keyword :any]]])
+
 (def ContainerNodeSchema
   "Schema for container nodes [:tag ?attrs & children]."
   [:cat [:or :keyword :symbol]
@@ -31,8 +39,8 @@
    [:* [:or [:vector :any] :keyword number? string?]]])
 
 (def NodeSchema
-  "General Malli schema for Tensor Logic Hiccup nodes (equations, lowering hooks, and containers)."
-  [:or EquationSchema HookNodeSchema ContainerNodeSchema])
+  "General Malli schema for Tensor Logic Hiccup nodes (equations, lowering hooks, while loops, and containers)."
+  [:or EquationSchema HookNodeSchema WhileNodeSchema ContainerNodeSchema])
 
 (defn valid-node?
   "Validates whether node matches the general Hiccup NodeSchema."
@@ -49,7 +57,7 @@
        (vector? (second node))))
 
 (defn head
-  "Returns head term [:name & indices] from an equation or hook node."
+  "Returns head term [:name & indices] or output terms from an equation, hook, or while node."
   [node]
   (when (and (vector? node) (>= (count node) 2) (vector? (second node)))
     (second node)))
@@ -61,13 +69,18 @@
     (some #(when (map? %) %) (rest node))))
 
 (defn body-terms
-  "Returns vector of body terms from an equation or hook node."
+  "Returns vector of body terms from an equation, hook, or while node."
   [node]
   (when (and (vector? node) (>= (count node) 2) (vector? (second node)))
-    (let [tail (drop 2 node)]
-      (vec (filter vector? (if (map? (first tail))
-                             (rest tail)
-                             tail))))))
+    (if (= (first node) :while)
+      (let [in-spec (nth node 2)]
+        (if (vector? in-spec)
+          (vec (mapv #(if (vector? %) % [%]) in-spec))
+          [[in-spec]]))
+      (let [tail (drop 2 node)]
+        (vec (filter vector? (if (map? (first tail))
+                               (rest tail)
+                               tail)))))))
 
 (defn eqn
   "Constructs a primitive equation [:= head ?attrs & body-terms]."

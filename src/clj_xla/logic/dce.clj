@@ -2,17 +2,50 @@
   "Backward-chaining dead-code elimination and implicit accumulation grouping for Tensor Logic."
   (:require [clj-xla.logic.ast :as ast]))
 
-(defn- eqn-head-name [eqn]
-  (first (ast/head eqn)))
+(defn- eqn-head-names [eqn]
+  (let [h (ast/head eqn)]
+    (cond
+      (= (first eqn) :while)
+      (let [out-spec (second eqn)]
+        (mapv #(if (vector? %) (first %) %) (if (vector? out-spec) out-spec [out-spec])))
+
+      (= (first eqn) :constant)
+      (let [h (second eqn)]
+        [(if (vector? h) (first h) h)])
+
+      (and (vector? h) (vector? (first h)))
+      (mapv first h)
+
+      (vector? h)
+      [(first h)]
+
+      (keyword? h)
+      [h]
+
+      :else
+      [])))
 
 (defn- eqn-body-names [eqn]
-  (let [body-names (set (map first (ast/body-terms eqn)))
-        attrs (ast/attrs eqn)
-        start-idx-names (when-let [starts (or (:start_indices attrs) (:start-indices attrs))]
-                          (set (filter keyword? starts)))]
-    (if (seq start-idx-names)
-      (into body-names start-idx-names)
-      body-names)))
+  (cond
+    (= (first eqn) :while)
+    (let [in-spec (nth eqn 2)
+          in-names (mapv #(if (vector? %) (first %) %) (if (vector? in-spec) in-spec [in-spec]))
+          attrs (ast/attrs eqn)
+          cond-names (when-let [cg (:cond-graph attrs)] (map first (:invars cg)))
+          body-names (when-let [bg (:body-graph attrs)] (map first (:invars bg)))]
+      (set (concat in-names cond-names body-names)))
+
+    (= (first eqn) :constant)
+    #{}
+
+    :else
+    (let [body-names (set (map first (ast/body-terms eqn)))
+          attrs (ast/attrs eqn)
+          start-idx-names (when-let [starts (or (:start_indices attrs) (:start-indices attrs))]
+                            (set (filter keyword? starts)))]
+      (if (seq start-idx-names)
+        (into body-names start-idx-names)
+        body-names))))
 
 (defn prune-ast
   "Performs backward-chaining dead-code elimination starting from `target-heads`.
@@ -20,14 +53,20 @@
   [equations target-heads]
   (let [target-set (set target-heads)
         ;; Map head names to all defining equations
-        head->eqns (group-by eqn-head-name equations)]
+        head->eqns (reduce (fn [acc eqn]
+                             (reduce (fn [a h]
+                                       (update a h (fnil conj []) eqn))
+                                     acc
+                                     (eqn-head-names eqn)))
+                           {}
+                           equations)]
     (loop [worklist (into [] target-set)
            needed-heads #{}
            visited-heads #{}]
       (if (empty? worklist)
         ;; Filter equations in original order that produce needed heads
         (filterv (fn [eqn]
-                   (contains? needed-heads (eqn-head-name eqn)))
+                   (some #(contains? needed-heads %) (eqn-head-names eqn)))
                  equations)
         (let [curr-head (first worklist)
               rest-worklist (subvec worklist 1)]

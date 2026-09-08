@@ -255,6 +255,23 @@
             initial-types
             eqns)))
 
+(declare format-equation)
+
+(defn format-while-region
+  "Formats an SSA sub-graph as an MLIR basic block region for stablehlo.while."
+  [graph var-types]
+  (let [{:keys [invars outvars eqns]} graph
+        sub-types (merge var-types (infer-var-types invars eqns))
+        bb-args (str/join ", " (map (fn [[v t]] (str "%" (name v) ": " (type->mlir-string t))) invars))
+        eq-lines (map #(format-equation % sub-types) eqns)
+        ret-vars (str/join ", " (map #(str "%" (name %)) outvars))
+        ret-types (str/join ", " (map #(get sub-types % "tensor<1xi32>") outvars))]
+    (str "    ^bb0(" bb-args "):\n"
+         (if (seq (filter seq eq-lines))
+           (str (str/join "\n" (filter seq eq-lines)) "\n")
+           "")
+         "      \"stablehlo.return\"(" ret-vars ") : (" ret-types ") -> ()")))
+
 (defn format-equation
   "Formats an individual tensor equation into StableHLO MLIR instruction text."
   [eqn var-types]
@@ -278,7 +295,10 @@
                 type-1d (str "tensor<" n "x" dtype-str ">")]
             (str "    %" (name out-var) "_1d = " mlir-op " dense<[" val-str "]> : " type-1d "\n"
                  "    %" (name out-var) " = stablehlo.reshape %" (name out-var) "_1d : (" type-1d ") -> " out-type))
-          (let [num-str (if is-int? (str (long (or value 0))) (format "%.6e" (double (or value 0.0))))]
+          (let [num-str (cond
+                          (boolean? value) (str value)
+                          is-int? (str (long (or value 0)))
+                          :else (format "%.6e" (double (or value 0.0))))]
             (str "    %" (name out-var) " = " mlir-op " dense<" num-str "> : " out-type))))
 
       (= op :stablehlo/convert)
@@ -523,8 +543,14 @@
             out-types (mapv #(get var-types % "tensor<1xi32>") outvars)
             out-types-str (str/join ", " out-types)
             num-outs (count outvars)
-            cond-body (get attrs :cond-mlir "      %cond = stablehlo.constant dense<false> : tensor<i1>\n      \"stablehlo.return\"(%cond) : (tensor<i1>) -> ()")
-            body-body (get attrs :body-mlir (str "      \"stablehlo.return\"(" in-args ") : (" in-types-str ") -> ()"))]
+            cond-body (or (get attrs :cond-mlir)
+                          (when-let [cg (get attrs :cond-graph)]
+                            (format-while-region cg var-types))
+                          "      %cond = stablehlo.constant dense<false> : tensor<i1>\n      \"stablehlo.return\"(%cond) : (tensor<i1>) -> ()")
+            body-body (or (get attrs :body-mlir)
+                          (when-let [bg (get attrs :body-graph)]
+                            (format-while-region bg var-types))
+                          (str "      \"stablehlo.return\"(" in-args ") : (" in-types-str ") -> ()"))]
         (if (= 1 num-outs)
           (str "    %" (name (first outvars)) " = \"stablehlo.while\"(" in-args ") ({\n"
                cond-body "\n"
