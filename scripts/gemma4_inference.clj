@@ -473,16 +473,21 @@
          vocab-size (long (or (:vocab-size config) (:vocab_size config) 262144))
          last-token? (get opts :last-token-only? true)
          weight-dt (get config :weight-dtype :bf16)
+         prompt-count (count prompt-ids)
+         in-arr (int-array seq-len)
+         pos-arr (when last-token? (int-array 1))
+         _ (dotimes [i (min prompt-count seq-len)]
+             (aset in-arr i (int (nth prompt-ids i))))
          cur-tokens (atom (vec prompt-ids))
          t0 (System/nanoTime)]
      (loop [step 0]
        (if (>= step max-new-tokens)
          nil
          (let [s-len (count @cur-tokens)
-               in-arr (int-array (take seq-len (concat @cur-tokens (repeat 0))))
+               _ (when last-token? (aset pos-arr 0 (dec s-len)))
                in-b (xla/buffer-from-host-buffer ctx (:client ctx) in-arr [1 seq-len] 4)
                pos-b (when last-token?
-                       (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [(dec s-len)]) [1] 4))
+                       (xla/buffer-from-host-buffer ctx (:client ctx) pos-arr [1] 4))
                args (if last-token?
                       (into [in-b pos-b] device-weights)
                       (into [in-b] device-weights))
@@ -494,6 +499,8 @@
            (xla/destroy-buffer! ctx in-b)
            (when pos-b (xla/destroy-buffer! ctx pos-b))
            (xla/destroy-buffer! ctx out)
+           (when (< s-len seq-len)
+             (aset in-arr s-len (int next-id)))
            (swap! cur-tokens conj next-id)
            (when (and (not quiet) (not is-agent?))
              (print (decode tokenizer [next-id]))

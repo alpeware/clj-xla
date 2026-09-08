@@ -6,14 +6,7 @@
             [sci.core :as sci]))
 
 (def DEFAULT_SYSTEM_PROMPT
-  "You are an autonomous Clojure engineering agent equipped with a live SCI Clojure sandbox.
-When asked to write a function or expression, output an executable Clojure code block:
-```clojure
-(defn first-10 []
-  (range 10))
-(first-10)
-```
-The environment will execute your code and return the result.")
+  "You are a helpful Clojure engineering assistant. Solve programming tasks by writing executable Clojure code enclosed in ```clojure ... ``` code blocks.")
 
 (def DEFAULT_AGENT_OPTS
   {:prompt "Write a Clojure function returning the first 10 integers."
@@ -107,15 +100,7 @@ The environment will execute your code and return the result.")
   "Evaluates `code-str` in the SCI sandbox and returns formatted execution result."
   [sci-ctx code-str]
   (try
-    (let [clean-code (cond
-                       (re-find #"^\(\s*(\d+)\s*\)$" (str/trim code-str))
-                       (let [[_ n] (re-find #"^\(\s*(\d+)\s*\)$" (str/trim code-str))]
-                         (format "(range %s)" n))
-
-                       (re-find #"^\(\s*\d+[\s,]" (str/trim code-str))
-                       (str "(list " (subs (str/trim code-str) 1))
-
-                       :else code-str)
+    (let [clean-code (str/trim code-str)
           out-writer (java.io.StringWriter.)
           eval-res (binding [*out* out-writer]
                      (sci/eval-string* sci-ctx clean-code))
@@ -124,7 +109,7 @@ The environment will execute your code and return the result.")
                           (str printed "\n=> " (pr-str eval-res))
                           (pr-str eval-res))]
       {:status :success :output formatted-res})
-    (catch Exception e
+    (catch Throwable e
       {:status :error :output (str "Execution Exception: " (.getMessage e))})))
 
 (defn parse-agent-cli-args

@@ -44,17 +44,10 @@
           pattern #"(?s)```(?:clojure|clj)?\s*\n?(.*?)(?:```|$)"
           blocks (mapv str/trim (filter #(seq (str/trim %)) (mapv second (re-seq pattern text))))]
       (is (= ["(range 10)"] blocks))))
-  (testing "Normalizing integer sequence or lone range"
-    (let [norm (fn [s]
-                 (cond
-                   (re-find #"^\(\s*(\d+)\s*\)$" (str/trim s))
-                   (let [[_ n] (re-find #"^\(\s*(\d+)\s*\)$" (str/trim s))]
-                     (format "(range %s)" n))
-                   (re-find #"^\(\s*\d+[\s,]" (str/trim s))
-                   (str "(list " (subs (str/trim s) 1))
-                   :else s))]
-      (is (= "(range 10)" (norm "( 10 \n)")))
-      (is (= "(list  10, 20, 30)" (norm "( 10, 20, 30)"))))))
+  (testing "Evaluating invalid code produces genuine SCI error"
+    (let [res (eval-sci-code "( 10)")]
+      (is (= :error (:status res)))
+      (is (clojure.string/includes? (:result res) "cannot be cast to")))))
 
 (deftest test-eval-sci-code-success
   (testing "Evaluating math expressions in SCI sandbox"

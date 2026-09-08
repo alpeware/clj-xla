@@ -234,6 +234,14 @@
                         out-t (str "tensor<" len "x" dt ">")]
                     (assoc acc (first outvars) out-t))
 
+                  (= op :stablehlo/while)
+                  (reduce (fn [a [inv outv]]
+                            (if (and inv outv)
+                              (assoc a outv (get a inv "tensor<1xi32>"))
+                              a))
+                          acc
+                          (map vector in-vars outvars))
+
                   :else
                   (let [target-type (or in-type "tensor<1x128x768xf32>")]
                     (reduce (fn [a v]
@@ -503,6 +511,32 @@
                           "lhs_contracting_dimensions = [" (str/join ", " lhs-c) "], "
                           "rhs_contracting_dimensions = [" (str/join ", " rhs-c) "]>")]
         (str "    %" (name out-var) " = \"stablehlo.dot_general\"(%" (name lhs) ", %" (name rhs) ") {dot_dimension_numbers = " dot-attr ", precision = [#stablehlo<precision DEFAULT>, #stablehlo<precision DEFAULT>]} : (" lhs-type ", " rhs-type ") -> " out-type))
+
+      (= op :stablehlo/while)
+      (let [in-args (str/join ", " (map #(str "%" (name %)) invars))
+            in-types (mapv #(get var-types % "tensor<1xi32>") invars)
+            in-types-str (str/join ", " in-types)
+            out-types (mapv #(get var-types % "tensor<1xi32>") outvars)
+            out-types-str (str/join ", " out-types)
+            num-outs (count outvars)
+            cond-body (get attrs :cond-mlir "      %cond = stablehlo.constant dense<false> : tensor<i1>\n      \"stablehlo.return\"(%cond) : (tensor<i1>) -> ()")
+            body-body (get attrs :body-mlir (str "      \"stablehlo.return\"(" in-args ") : (" in-types-str ") -> ()"))]
+        (if (= 1 num-outs)
+          (str "    %" (name (first outvars)) " = \"stablehlo.while\"(" in-args ") ({\n"
+               cond-body "\n"
+               "    }, {\n"
+               body-body "\n"
+               "    }) : (" in-types-str ") -> (" out-types-str ")")
+          (let [base-var (name (first outvars))]
+            (str "    %" base-var "_while:" num-outs " = \"stablehlo.while\"(" in-args ") ({\n"
+                 cond-body "\n"
+                 "    }, {\n"
+                 body-body "\n"
+                 "    }) : (" in-types-str ") -> (" out-types-str ")\n"
+                 (str/join "\n" (map-indexed (fn [idx outv]
+                                               (let [ot (nth out-types idx)]
+                                                 (str "    %" (name outv) " = stablehlo.reshape %" base-var "_while#" idx " : (" ot ") -> " ot)))
+                                             outvars))))))
 
       :else
       (let [in-types (map #(get var-types % "tensor<1x128x768xf32>") invars)

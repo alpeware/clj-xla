@@ -116,3 +116,19 @@ In agent workloads (`:mode :agent`), per-token stdout flushing is bypassed to av
  :total-session-ms 3222.68}
 ```
 
+---
+
+## 5. ⚖️ Execution Modes: Fused In-VRAM Loop vs. Persistent Agent Session
+
+`clj-xla` provides two complementary VRAM execution architectures:
+
+| Architectural Feature | **Fused In-VRAM Loop (`stablehlo.while`)** | **Persistent VRAM Session + Dynamic Slicing** |
+|---|---|---|
+| **Compilation** | Single fused StableHLO MLIR executable with loop condition & body | Pre-compiled static forward pass graph (`max-seq-len`) |
+| **Weight Placement** | Pinned in device VRAM | Pinned in device VRAM (`init-agent-vram-session`) |
+| **Logit Transfers** | **Zero host transfer** during loop execution | Dynamic slice transfer (~512 KB/tok) via PCIe |
+| **Sampling Logic** | In-graph argmax / categorical sampling via `stablehlo.reduce` | Host CPU sampling with frequency repetition penalty |
+| **Tool Calling Interception** | Post-loop batch parsing | **Immediate per-token stop detection** (`<turn|>`, `<tool_call|>`) |
+| **Best Used For** | Fixed-horizon text completion, unconstrained batch decoding | **Interactive agent loops**, multi-turn SCI execution, tool calling |
+
+

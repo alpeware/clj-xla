@@ -63,3 +63,19 @@
   (testing "Validation failure on invalid EDN graph"
     (is (thrown? Exception (shlo/validate-graph {:invalid true})))
     (is (thrown? Exception (shlo/validate-graph {:name "bad" :invars [] :outvars [] :eqns "not-a-vector"})))))
+
+(deftest test-while-equation-serialization
+  (testing "Serialization of :stablehlo/while into MLIR while block"
+    (let [graph {:name "while_test"
+                 :invars [[:init_i [:tensor [1] :i32]]
+                          [:init_sum [:tensor [1] :i32]]]
+                 :outvars [:final_i :final_sum]
+                 :eqns [{:op :stablehlo/while
+                         :invars [:init_i :init_sum]
+                         :outvars [:final_i :final_sum]
+                         :attrs {:cond-mlir "      %cond = stablehlo.constant dense<true> : tensor<i1>\n      \"stablehlo.return\"(%cond) : (tensor<i1>) -> ()"
+                                 :body-mlir "      \"stablehlo.return\"(%init_i, %init_sum) : (tensor<1xi32>, tensor<1xi32>) -> ()"}}]}
+          mlir (shlo/graph->mlir-text graph)]
+      (is (str/includes? mlir "\"stablehlo.while\""))
+      (is (str/includes? mlir "final_i = stablehlo.reshape"))
+      (is (str/includes? mlir "final_sum = stablehlo.reshape")))))
