@@ -22,3 +22,14 @@
   (prop/for-all [out-n (gen/fmap #(keyword (str "out_" %)) (gen/choose 1 100))
                  in-n (gen/fmap #(keyword (str "in_" %)) (gen/choose 1 100))]
                 (ast/valid-node? [:while [out-n] [in-n] {:max-iters 10}])))
+
+(defspec prop-cond-node-satisfies-schema
+  50
+  (prop/for-all [out-n (gen/fmap #(keyword (str "out_" %)) (gen/choose 1 100))
+                 arg-n (gen/fmap #(keyword (str "arg_" %)) (gen/choose 1 100))]
+                (ast/valid-node?
+                 [:cond [out-n] {:args [arg-n]}
+                  [:compare [:step_lt] [arg-n] [arg-n] {:direction "LT"}]
+                  [:not [:not_out] [:step_lt]]
+                  [:and [out-n] [:step_lt] [:not_out]]])))
+

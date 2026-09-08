@@ -122,6 +122,49 @@
     (is (= 5 val))
     (xla/destroy-buffer! out-buf)))
 
+(defspec prop-lower-while-with-cond-ast-produces-valid-graph
+  50
+  (prop/for-all [_lim (gen/choose 1 100)]
+                (let [invars [[:init [:tensor [] :i32]]
+                              [:max_step [:tensor [] :i32]]
+                              [:false_c [:tensor [] :i1]]]
+                      cond-ast [:cond [:cond_out] {:args [:cur_step :target_max :cur_stopped]}
+                                [:compare [:step_lt] [:cur_step] [:target_max] {:direction "LT"}]
+                                [:not [:not_stopped] [:cur_stopped]]
+                                [:and [:cond_out] [:step_lt] [:not_stopped]]]
+                      loop-ast [:while [:final_step :final_max :final_stopped]
+                                [:init :max_step :false_c]
+                                {:body-mlir "    ^bb0(%s: tensor<i32>, %m: tensor<i32>, %st: tensor<i1>):\n      \"stablehlo.return\"(%s, %m, %st) : (tensor<i32>, tensor<i32>, tensor<i1>) -> ()"}
+                                cond-ast]
+                      graph (lower/ast->graph "while_cond_graph" invars loop-ast [:final_step])]
+                  (and (shlo/validate-graph graph)
+                       (= [:final_step] (:outvars graph))
+                       (boolean (some #(= :stablehlo/while (:op %)) (:eqns graph)))))))
+
+(deftest test-end-to-end-while-cond-ast-execution
+  (let [ctx (xla/get-context)
+        invars [[:init [:tensor [] :i32]]
+                [:max_step [:tensor [] :i32]]
+                [:false_c [:tensor [] :i1]]]
+        cond-ast [:cond [:cond_out] {:args [:cur_step :target_max :cur_stopped]}
+                  [:compare [:step_lt] [:cur_step] [:target_max] {:direction "LT"}]
+                  [:not [:not_stopped] [:cur_stopped]]
+                  [:and [:cond_out] [:step_lt] [:not_stopped]]]
+        loop-ast [:while [:final_step :final_max :final_stopped]
+                  [:init :max_step :false_c]
+                  {:body-mlir "    ^bb0(%s: tensor<i32>, %m: tensor<i32>, %st: tensor<i1>):\n      %one = stablehlo.constant dense<1> : tensor<i32>\n      %next = stablehlo.add %s, %one : tensor<i32>\n      \"stablehlo.return\"(%next, %m, %st) : (tensor<i32>, tensor<i32>, tensor<i1>) -> ()"}
+                  cond-ast]
+        graph (lower/ast->graph "e2e_while_cond" invars loop-ast [:final_step])
+        compiled (xla/compile-graph ctx graph)
+        init-data (int-array [0])
+        max-data (int-array [7])
+        false-data (byte-array [0])
+        out-buf (xla/execute compiled init-data max-data false-data)
+        res (xla/to-host-slice out-buf 0 1 4)
+        val (Float/floatToIntBits (first res))]
+    (is (= 7 val))
+    (xla/destroy-buffer! out-buf)))
+
 (defspec prop-lower-dynamic-update-slice-produces-valid-graph
   50
   (prop/for-all [b (gen/choose 1 2)

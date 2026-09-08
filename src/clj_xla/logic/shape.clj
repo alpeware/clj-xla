@@ -36,6 +36,24 @@
              op-name (first (first body))]
          (assoc known-shapes head-name (get known-shapes op-name)))
 
+       (or (= (first eqn) :compare)
+           (= (first eqn) :not)
+           (= (first eqn) :and)
+           (= (first eqn) :or)
+           (= (first eqn) :cond))
+       (let [head (ast/head eqn)
+             head-name (if (vector? head) (first head) head)
+             head-idxs (when (vector? head) (vec (rest head)))
+             attrs (ast/attrs eqn)
+             body (ast/body-terms eqn)
+             first-body-name (when (seq body) (first (first body)))
+             first-body-shape (get known-shapes first-body-name [])
+             shape (or (:shape attrs)
+                       (if (empty? head-idxs)
+                         []
+                         first-body-shape))]
+         (assoc known-shapes head-name (vec shape)))
+
        :else
        (let [body (ast/body-terms eqn)
              head (ast/head eqn)

@@ -4,7 +4,7 @@
             [malli.core :as m]))
 
 (def TensorType
-  [:cat [:enum :tensor] [:vector :int] [:enum :f32 :f64 :i32 :i64 :f16 :bf16 :i8 :i16 :u8 :u16 :u32 :u64]])
+  [:cat [:enum :tensor] [:vector :int] [:enum :f32 :f64 :i32 :i64 :f16 :bf16 :i8 :i16 :u8 :u16 :u32 :u64 :i1 :bool]])
 
 (def VariableDecl
   [:tuple :keyword TensorType])
@@ -236,6 +236,22 @@
                         out-t (str "tensor<" len "x" dt ">")]
                     (assoc acc (first outvars) out-t))
 
+                  (= op :stablehlo/compare)
+                  (let [in-t (get acc (first in-vars) "tensor<i32>")
+                        [in-dims _] (parse-tensor-dims in-t)
+                        out-t (if (seq in-dims)
+                                (str "tensor<" (str/join "x" in-dims) "xi1>")
+                                "tensor<i1>")]
+                    (assoc acc (first outvars) out-t))
+
+                  (or (= op :stablehlo/not) (= op :stablehlo/and) (= op :stablehlo/or))
+                  (let [in-t (get acc (first in-vars) "tensor<i1>")
+                        [in-dims _] (parse-tensor-dims in-t)
+                        out-t (if (seq in-dims)
+                                (str "tensor<" (str/join "x" in-dims) "xi1>")
+                                "tensor<i1>")]
+                    (assoc acc (first outvars) out-t))
+
                   (= op :stablehlo/while)
                   (reduce (fn [a [inv outv]]
                             (if (and inv outv)
@@ -326,6 +342,20 @@
             false-t (get var-types on-false true-t)
             out-type (get var-types out-var true-t)]
         (str "    %" (name out-var) " = \"stablehlo.select\"(%" (name pred) ", %" (name on-true) ", %" (name on-false) ") : (" pred-t ", " true-t ", " false-t ") -> " out-type))
+
+      (= op :stablehlo/not)
+      (let [in-var (first invars)
+            in-type (get var-types in-var "tensor<i1>")
+            out-type (get var-types out-var in-type)]
+        (str "    %" (name out-var) " = \"stablehlo.not\"(%" (name in-var) ") : (" in-type ") -> " out-type))
+
+      (or (= op :stablehlo/and) (= op :stablehlo/or))
+      (let [[in0 in1] invars
+            in0-t (get var-types in0 "tensor<i1>")
+            in1-t (get var-types in1 in0-t)
+            out-type (get var-types out-var in0-t)
+            mlir-name (if (= op :stablehlo/and) "stablehlo.and" "stablehlo.or")]
+        (str "    %" (name out-var) " = \"" mlir-name "\"(%" (name in0) ", %" (name in1) ") : (" in0-t ", " in1-t ") -> " out-type))
 
       (= op :stablehlo/gather)
       (let [[operand start-indices] invars

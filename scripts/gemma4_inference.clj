@@ -487,11 +487,10 @@
         body-eqns (mapv #(shlo/format-equation % var-types) (:eqns graph))
         weight-invars (subvec invars 2)
 
-        cond-region (format "    ^bb0(%%cur_step: tensor<i32>, %%target_max: tensor<i32>, %%cur_toks: tensor<1x%dxi32>, %%cur_stopped: tensor<i1>):
-      %%step_lt = \"stablehlo.compare\"(%%cur_step, %%target_max) {comparison_direction = #stablehlo<comparison_direction LT>} : (tensor<i32>, tensor<i32>) -> tensor<i1>
-      %%not_stopped = \"stablehlo.not\"(%%cur_stopped) : (tensor<i1>) -> tensor<i1>
-      %%cond = \"stablehlo.and\"(%%step_lt, %%not_stopped) : (tensor<i1>, tensor<i1>) -> tensor<i1>
-      \"stablehlo.return\"(%%cond) : (tensor<i1>) -> ()" max-seq-len)
+        cond-ast [:cond [:cond_out] {:args [:cur_step :target_max :cur_toks :cur_stopped]}
+                  [:compare [:step_lt] [:cur_step] [:target_max] {:direction "LT"}]
+                  [:not [:not_stopped] [:cur_stopped]]
+                  [:and [:cond_out] [:step_lt] [:not_stopped]]]
 
         body-prefix (format "    ^bb0(%%cur_step: tensor<i32>, %%target_max: tensor<i32>, %%cur_toks: tensor<1x%dxi32>, %%cur_stopped: tensor<i1>):
       %%c_one = stablehlo.constant dense<1> : tensor<i32>
@@ -531,8 +530,8 @@
                   [:constant [:false_c] {:value false :type [:tensor [] :i1] :shape []}]
                   [:while [:final_step :final_max :final_tokens :final_stopped]
                    [:init_step :max_step :init_tokens :false_c]
-                   {:cond-mlir cond-region
-                    :body-mlir (str body-prefix "\n" (str/join "\n" body-eqns) "\n" body-suffix)}]]
+                   {:body-mlir (str body-prefix "\n" (str/join "\n" body-eqns) "\n" body-suffix)}
+                   cond-ast]]
 
         loop-invars (into [[:init_step [:tensor [] :i32]]
                            [:max_step [:tensor [] :i32]]
@@ -751,6 +750,7 @@
                    (reset! kv-buffers-atom new-kv)
                    (recur (inc p) new-logits))
                  cur-logits))
+             t-prefill-end (System/nanoTime)
              cur-tokens (atom (vec prompt-ids))
              max-tokens (long (or max-new-tokens 256))]
          ;; Phase 2: Autoregressive decode loop
@@ -785,14 +785,18 @@
                    (recur (inc step) new-logits))))))
          (let [t1 (System/nanoTime)
                total-ms (/ (- t1 t0) 1e6)
+               prefill-ms (/ (- t-prefill-end t0) 1e6)
+               decode-ms (/ (- t1 t-prefill-end) 1e6)
                gen-count (- (count @cur-tokens) (count prompt-ids))
-               tok-s (if (pos? total-ms) (/ (* gen-count 1000.0) total-ms) 0.0)]
+               decode-tok-s (if (pos? decode-ms) (/ (* gen-count 1000.0) decode-ms) 0.0)]
            (when-not quiet
              (println)
              (println "\n------------------------------------------------------------------")
              (println "  Telemetry Benchmark Metrics (Tensor Logic KV-Cache):")
-             (println (format "    • Total Generation Latency    : %8.2f ms (%d tokens)" total-ms gen-count))
-             (println (format "    • Generation Speed            : %8.2f tok/s (%6.2f ms/tok)" tok-s (if (pos? gen-count) (/ total-ms gen-count) 0.0)))
+             (println (format "    • Prefill Latency             : %8.2f ms (%d tokens)" prefill-ms prompt-count))
+             (println (format "    • Decode Latency              : %8.2f ms (%d tokens)" decode-ms gen-count))
+             (println (format "    • Decode Speed                : %8.2f tok/s (%6.2f ms/tok)" decode-tok-s (if (pos? gen-count) (/ decode-ms gen-count) 0.0)))
+             (println (format "    • Total Generation Latency    : %8.2f ms" total-ms))
              (println "------------------------------------------------------------------\n"))
            @cur-tokens))
        (finally
@@ -867,7 +871,7 @@
                    (:executable session)
                    (profile/with-profile metrics-atom "graph_compilation"
                      (cond
-                       (:vram-loop? opts)
+                       (or (:vram-loop? opts) (:vram-loop? session) (= (:method opts) :vram-loop))
                        (compile-in-vram-loop-executable session max-seq-len)
 
                        (= (:method opts) :tensor-logic-full)
@@ -913,12 +917,14 @@
 
 (defn init-agent-vram-session
   "Initializes a persistent VRAM session for agent loops.
-   Pre-allocates weights in device memory and compiles the KV-Cache step (or in-VRAM loop) executable once."
+   Pre-allocates weights in device memory and compiles the In-VRAM While Loop (or KV-Cache step) executable once."
   ([opts]
    (init-agent-vram-session opts (long (or (:max-seq-len opts) 1024))))
   ([opts max-seq-len]
-   (let [vram-loop? (get opts :vram-loop? false)
-         opts (assoc opts :mode :agent :max-seq-len max-seq-len)
+   (let [vram-loop? (if (contains? opts :vram-loop?)
+                      (:vram-loop? opts)
+                      (not= (:method opts) :kv-cache))
+         opts (assoc opts :mode :agent :max-seq-len max-seq-len :vram-loop? vram-loop?)
          session (init-inference-session opts)
          _ (when-not (:quiet opts) (println "Pinning Gemma 4 weights in PJRT VRAM..."))
          device-weights (allocate-device-weights session)

@@ -357,6 +357,26 @@
                            host-data
                            (.allocateFrom arena ValueLayout/JAVA_BYTE ^MemorySegment host-data))
 
+                         (= (int dtype-enum) 1)
+                         (cond
+                           (instance? (Class/forName "[Z") host-data)
+                           (let [^booleans za ^booleans host-data
+                                 num-elems (alength za)
+                                 seg (.allocate arena (long num-elems) (long 64))]
+                             (dotimes [i num-elems]
+                               (.setAtIndex ^MemorySegment seg ValueLayout/JAVA_BYTE (long i) (if (aget za i) (byte 1) (byte 0))))
+                             seg)
+                           (instance? (Class/forName "[B") host-data)
+                           (let [^bytes ba ^bytes host-data
+                                 num-bytes (alength ba)
+                                 seg (.allocate arena (long num-bytes) (long 64))]
+                             (MemorySegment/copy ba 0 seg ValueLayout/JAVA_BYTE (long 0) num-bytes)
+                             seg)
+                           :else
+                           (let [seg (.allocate arena 1 (long 64))]
+                             (.set ^MemorySegment seg ValueLayout/JAVA_BYTE (long 0) (if host-data (byte 1) (byte 0)))
+                             seg))
+
                          (= (int dtype-enum) 4)
                          (let [^ints ia (if (instance? (Class/forName "[I") host-data)
                                           ^ints host-data
@@ -397,7 +417,7 @@
           (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 48) (long num-dims))
           ;; Compute row-major byte strides for dense layout.
           ;; ROCm PJRT requires byte_strides when num_dims > 0.
-          (let [elem-bytes (case (int dtype-enum) 2 1, 4 4, 11 4, 10 2, 13 2, 4)
+          (let [elem-bytes (case (int dtype-enum) 1 1, 2 1, 4 4, 11 4, 10 2, 13 2, 4)
                 strides-seg (when (pos? num-dims)
                               (let [seg (.allocate arena ValueLayout/JAVA_LONG (long num-dims))]
                                 (loop [i (dec num-dims) stride (long elem-bytes)]
