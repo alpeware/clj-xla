@@ -13,4 +13,18 @@ if [ -n "$JSIG" ]; then
   export LD_PRELOAD="$JSIG${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
 
-exec clojure -M:gemma4 "$@"
+MODE="inference"
+SCRIPT_NAME="$(basename "$0")"
+
+if [ "$SCRIPT_NAME" = "gemma4_agent.sh" ] || [ "$SCRIPT_NAME" = "gemma4-agent.sh" ]; then
+  MODE="agent"
+elif [ "$1" = "agent" ] || [ "$1" = "--agent" ]; then
+  MODE="agent"
+  shift
+fi
+
+if [ "$MODE" = "agent" ]; then
+  exec clojure -M:gemma4-agent "$@"
+else
+  exec clojure -M:gemma4 "$@"
+fi

@@ -6,7 +6,13 @@
   (first (ast/head eqn)))
 
 (defn- eqn-body-names [eqn]
-  (set (map first (ast/body-terms eqn))))
+  (let [body-names (set (map first (ast/body-terms eqn)))
+        attrs (ast/attrs eqn)
+        start-idx-names (when-let [starts (or (:start_indices attrs) (:start-indices attrs))]
+                          (set (filter keyword? starts)))]
+    (if (seq start-idx-names)
+      (into body-names start-idx-names)
+      body-names)))
 
 (defn prune-ast
   "Performs backward-chaining dead-code elimination starting from `target-heads`.

@@ -59,3 +59,15 @@
           {:keys [xla-flags]} res]
       (is (= "--custom_only" xla-flags)))))
 
+(deftest test-determine-optimal-xla-flags-rocm-env-vars
+  (testing "determine-optimal-xla-flags sets ROCm environment variables including HSA_OVERRIDE_GFX_VERSION"
+    (let [res (xla/determine-optimal-xla-flags :rocm {} {:gfx-version "11.0.0" :rocr-visible-devices "0" :hip-visible-devices "0"})
+          {:keys [env-vars]} res]
+      (is (= "11.0.0" (get env-vars "HSA_OVERRIDE_GFX_VERSION")))
+      (is (= "0" (get env-vars "ROCR_VISIBLE_DEVICES")))
+      (is (= "0" (get env-vars "HIP_VISIBLE_DEVICES")))
+      (is (= "11.0.0" (System/getProperty "HSA_OVERRIDE_GFX_VERSION")))
+      (is (= "0" (System/getProperty "ROCR_VISIBLE_DEVICES")))
+      (is (= "0" (System/getProperty "HIP_VISIBLE_DEVICES"))))))
+
+

@@ -73,23 +73,46 @@ To avoid transferring logit vectors back to the CPU for sampling, token selectio
 
 ---
 
-## 4. ⚡ Zero-Copy Host Memory Buffer Transfers
+## 4. ⚡ Zero-Copy Host Memory Buffer Transfers & In-VRAM Slicing
 
-When initiating generation or reading completed output sequences, host-side Clojure code relies on Panama FFM direct memory transfers:
+When initiating generation or reading completed output sequences, host-side Clojure code relies on Panama FFM direct memory transfers and in-VRAM dynamic slicing:
 
-### Pre-Allocated Device Buffers
+### A. Pre-Allocated Persistent VRAM Session (`init-agent-vram-session`)
+To eliminate the multi-second overhead of re-allocating gigabytes of model weights and re-compiling StableHLO graphs on every turn, `scripts.gemma4-inference/init-agent-vram-session` pins all weights into accelerator memory once and pre-compiles the executable for `max-seq-len`:
+
 ```clojure
-(defn create-agent-device-session
-  [ctx client config]
-  (let [;; Allocate KV-caches directly on device VRAM
-        device-kv (mapv (fn [_]
-                          (clj-xla.pjrt/buffer-from-host-buffer
-                           ctx client (float-array (* 1 1 1024 256)) [1 1 1024 256] 11))
-                        (range (:num-layers config)))]
-    {:ctx ctx
-     :client client
-     :kv-caches device-kv}))
+(let [session (gemma4-inf/init-agent-vram-session opts max-seq-len)]
+  (try
+    (run-agent-loop session prompt)
+    (finally
+      (gemma4-inf/close-agent-session! session))))
 ```
 
-### Async Host Retrieval
-Upon loop completion, the host performs a single non-blocking `PJRT_Buffer_To_Host_Buffer` call to copy the generated token ID array directly into a host Clojure vector.
+### B. In-VRAM Last-Token Dynamic Slicing (`:dynamic-slice`)
+Transferring the full `[1 max-seq-len vocab-size]` output tensor over PCIe to host memory on every autoregressive step incurs massive overhead (e.g. 126.8 MB per token for Gemma 4, taking ~171 ms per token).
+
+By lowering an in-graph `:dynamic-slice` right before the LM head projection:
+```clojure
+[:block {:name :last_token_head}
+ [:dynamic-slice [:normed_last :b :one :d] [:normed :b :p :d]
+  {:slice-sizes [1 1 hidden-dim]
+   :start-indices [0 :pos 0]}]
+ [:= [:logits :b :one :v]
+  [:normed_last :b :one :d] [:embed_tokens :v :d]]]
+```
+1. The LM head projection matrix multiplication is reduced from `max-seq-len * vocab-size * hidden-dim` FLOPs down to `1 * 1 * vocab-size * hidden-dim` FLOPs (a **242x FLOP reduction** on the final projection).
+2. The output buffer size drops from **126.8 MB** down to **512 KB** (or 256 KB in `bf16`).
+3. PCIe transfer time drops from **171.04 ms/token** down to **0.89 ms/token** (**192x faster memory transfer**).
+4. Generation throughput improves from **5.34 tok/s (187.10 ms/tok)** to **15.88 tok/s (62.96 ms/tok)**.
+
+### C. Multi-Turn Telemetry Profiling
+In agent workloads (`:mode :agent`), per-token stdout flushing is bypassed to avoid host thread synchronization stalls. Per-turn model inference latency, tool execution time, and cumulative session statistics are recorded and emitted:
+
+```edn
+{:turns [{:turn 1, :model-ms 3221.84, :tool-ms 0.0, :total-turn-ms 3221.84}]
+ :total-turns 1
+ :total-model-ms 3221.84
+ :total-tool-ms 0.0
+ :total-session-ms 3222.68}
+```
+

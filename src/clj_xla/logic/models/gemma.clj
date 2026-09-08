@@ -218,47 +218,59 @@
          gated (keyword (str "gated_" i))
          proj-raw (keyword (str "proj_raw_" i))
          ple-normed (keyword (str "ple_normed_" i))
-         res3 (keyword (str "res3_" i))]
+         res3 (keyword (str "res3_" i))
+
+         ;; Layer-scoped symbolic indices to prevent collisions across hybrid layer configurations
+         dh (keyword (str "dh_" i))
+         qd (keyword (str "qd_" i))
+         kvd (keyword (str "kvd_" i))
+         kvh (keyword (str "kvh_" i))
+         g (keyword (str "g_" i))
+         h (keyword (str "h_" i))
+         dff (keyword (str "dff_" i))
+         pld (keyword (str "pld_" i))
+         p-q (keyword (str "p_q_" i))
+         p-k (keyword (str "p_k_" i))]
 
      [:block {:name (keyword (str "gemma4_layer_" i))}
       ;; 1. Pre-Attention RMSNorm
       [:rms-norm [x-norm1 :b :p :d] [h-in :b :p :d] [input-ln-w :d] {:eps 1e-6}]
 
       ;; 2. Q Projection & Reshape
-      [:= [q-raw :b :p :qd] [x-norm1 :b :p :d] [q-w :qd :d]]
-      [:reshape [q-heads-raw :b :p :h :dh] [q-raw :b :p :qd] {:shape [1 max-seq-len num-heads head-dim]}]
-      [:rms-norm [q-normed-4d :b :p :h :dh] [q-heads-raw :b :p :h :dh] [q-norm-w :dh] {:eps 1e-6}]
-      [:reshape [q-normed-3d :b :p :qd] [q-normed-4d :b :p :h :dh] {:shape [1 max-seq-len q-dim]}]
-      [:rope [q-rope :b :p :qd] [q-normed-3d :b :p :qd] {:head-dim head-dim :theta theta :rope-proportion rope-prop}]
-      [:reshape [q-ro :b :p :h :dh] [q-rope :b :p :qd] {:shape [1 max-seq-len num-heads head-dim]}]
+      [:= [q-raw :b :p qd] [x-norm1 :b :p :d] [q-w qd :d]]
+      [:reshape [q-heads-raw :b :p h dh] [q-raw :b :p qd] {:shape [1 max-seq-len num-heads head-dim]}]
+      [:rms-norm [q-normed-4d :b :p h dh] [q-heads-raw :b :p h dh] [q-norm-w dh] {:eps 1e-6}]
+      [:reshape [q-normed-3d :b :p qd] [q-normed-4d :b :p h dh] {:shape [1 max-seq-len q-dim]}]
+      [:rope [q-rope :b :p qd] [q-normed-3d :b :p qd] {:head-dim head-dim :theta theta :rope-proportion rope-prop}]
+      [:reshape [q-ro :b :p h dh] [q-rope :b :p qd] {:shape [1 max-seq-len num-heads head-dim]}]
 
       ;; 3. K, V Projections (computed only if not shared)
       (when-not is-shared?
         [:block {:name (keyword (str "kv_proj_" i))}
-         [:= [k-raw :b :p :kvd] [x-norm1 :b :p :d] [k-w :kvd :d]]
-         [:= [v-raw :b :p :kvd] [x-norm1 :b :p :d] [v-w :kvd :d]]
-         [:rms-norm [v-normed :b :p :kvd] [v-raw :b :p :kvd] {:eps 1e-6}]
-         [:reshape [k-heads-raw :b :p :kvh :dh] [k-raw :b :p :kvd] {:shape [1 max-seq-len num-kv-heads head-dim]}]
-         [:reshape [v-heads :b :p :kvh :dh] [v-normed :b :p :kvd] {:shape [1 max-seq-len num-kv-heads head-dim]}]
-         [:rms-norm [k-normed-4d :b :p :kvh :dh] [k-heads-raw :b :p :kvh :dh] [k-norm-w :dh] {:eps 1e-6}]
-         [:reshape [k-normed-3d :b :p :kvd] [k-normed-4d :b :p :kvh :dh] {:shape [1 max-seq-len kv-dim]}]
-         [:rope [k-rope :b :p :kvd] [k-normed-3d :b :p :kvd] {:head-dim head-dim :theta theta :rope-proportion rope-prop}]
-         [:reshape [k-ro :b :p :kvh :dh] [k-rope :b :p :kvd] {:shape [1 max-seq-len num-kv-heads head-dim]}]])
+         [:= [k-raw :b :p kvd] [x-norm1 :b :p :d] [k-w kvd :d]]
+         [:= [v-raw :b :p kvd] [x-norm1 :b :p :d] [v-w kvd :d]]
+         [:rms-norm [v-normed :b :p kvd] [v-raw :b :p kvd] {:eps 1e-6}]
+         [:reshape [k-heads-raw :b :p kvh dh] [k-raw :b :p kvd] {:shape [1 max-seq-len num-kv-heads head-dim]}]
+         [:reshape [v-heads :b :p kvh dh] [v-normed :b :p kvd] {:shape [1 max-seq-len num-kv-heads head-dim]}]
+         [:rms-norm [k-normed-4d :b :p kvh dh] [k-heads-raw :b :p kvh dh] [k-norm-w dh] {:eps 1e-6}]
+         [:reshape [k-normed-3d :b :p kvd] [k-normed-4d :b :p kvh dh] {:shape [1 max-seq-len kv-dim]}]
+         [:rope [k-rope :b :p kvd] [k-normed-3d :b :p kvd] {:head-dim head-dim :theta theta :rope-proportion rope-prop}]
+         [:reshape [k-ro :b :p kvh dh] [k-rope :b :p kvd] {:shape [1 max-seq-len num-kv-heads head-dim]}]])
 
       ;; 4. Broadcast KV Heads
-      [:= [k-rep :b :p :kvh :g :dh] [actual-k-ro :b :p :kvh :dh] {:shape [1 max-seq-len num-kv-heads group-size head-dim]}]
-      [:reshape [k-heads :b :p :h :dh] [k-rep :b :p :kvh :g :dh] {:shape [1 max-seq-len num-heads head-dim]}]
-      [:= [v-rep :b :p :kvh :g :dh] [actual-v-heads :b :p :kvh :dh] {:shape [1 max-seq-len num-kv-heads group-size head-dim]}]
-      [:reshape [v-rep-heads :b :p :h :dh] [v-rep :b :p :kvh :g :dh] {:shape [1 max-seq-len num-heads head-dim]}]
+      [:= [k-rep :b :p kvh g dh] [actual-k-ro :b :p kvh dh] {:shape [1 max-seq-len num-kv-heads group-size head-dim]}]
+      [:reshape [k-heads :b :p h dh] [k-rep :b :p kvh g dh] {:shape [1 max-seq-len num-heads head-dim]}]
+      [:= [v-rep :b :p kvh g dh] [actual-v-heads :b :p kvh dh] {:shape [1 max-seq-len num-kv-heads group-size head-dim]}]
+      [:reshape [v-rep-heads :b :p h dh] [v-rep :b :p kvh g dh] {:shape [1 max-seq-len num-heads head-dim]}]
 
       ;; 5. Scaled Dot-Product Attention: QK^T -> Softmax (sliding or full) -> probs @ V
-      [:= [scores :b :h :p-q :p-k] {:scale 1.0} [q-ro :b :p-q :h :dh] [k-heads :b :p-k :h :dh]]
-      [:causal-softmax [probs :b :h :p-q :p-k] [scores :b :h :p-q :p-k] (if window {:sliding-window window} {})]
-      [:= [ctx :b :p-q :h :dh] [probs :b :h :p-q :p-k] [v-rep-heads :b :p-k :h :dh]]
-      [:reshape [ctx-flat :b :p :qd] [ctx :b :p-q :h :dh] {:shape [1 max-seq-len q-dim]}]
+      [:= [scores :b h p-q p-k] {:scale 1.0} [q-ro :b p-q h dh] [k-heads :b p-k h dh]]
+      [:causal-softmax [probs :b h p-q p-k] [scores :b h p-q p-k] (if window {:sliding-window window} {})]
+      [:= [ctx :b p-q h dh] [probs :b h p-q p-k] [v-rep-heads :b p-k h dh]]
+      [:reshape [ctx-flat :b :p qd] [ctx :b p-q h dh] {:shape [1 max-seq-len q-dim]}]
 
       ;; 6. Output Projection & Post-Attention RMSNorm
-      [:= [attn-raw :b :p :d] [ctx-flat :b :p :qd] [o-w :d :qd]]
+      [:= [attn-raw :b :p :d] [ctx-flat :b :p qd] [o-w :d qd]]
       [:rms-norm [attn-normed :b :p :d] [attn-raw :b :p :d] [post-attn-ln-w :d] {:eps 1e-6}]
 
       ;; 7. Residual Connection 1
@@ -269,10 +281,10 @@
       [:rms-norm [x-norm2 :b :p :d] [res1 :b :p :d] [pre-mlp-ln-w :d] {:eps 1e-6}]
 
       ;; 9. GeGLU MLP Block: down_proj(gelu(gate_proj(x)) * up_proj(x))
-      [:= [gate :b :p :dff] {:act :gelu} [x-norm2 :b :p :d] [gate-w :dff :d]]
-      [:= [up :b :p :dff] [x-norm2 :b :p :d] [up-w :dff :d]]
-      [:= [mlp-act :b :p :dff] [gate :b :p :dff] [up :b :p :dff]]
-      [:= [mlp-raw :b :p :d] [mlp-act :b :p :dff] [down-w :d :dff]]
+      [:= [gate :b :p dff] {:act :gelu} [x-norm2 :b :p :d] [gate-w dff :d]]
+      [:= [up :b :p dff] [x-norm2 :b :p :d] [up-w dff :d]]
+      [:= [mlp-act :b :p dff] [gate :b :p dff] [up :b :p dff]]
+      [:= [mlp-raw :b :p :d] [mlp-act :b :p dff] [down-w :d dff]]
       [:rms-norm [mlp-normed :b :p :d] [mlp-raw :b :p :d] [post-mlp-ln-w :d] {:eps 1e-6}]
 
       ;; 10. Residual Connection 2
@@ -282,9 +294,9 @@
       ;; 11. Gemma 4 Per-Layer Input (PLE) Gating Sub-block (if has-ple?)
       (when has-ple?
         [:block {:name (keyword (str "ple_gate_" i))}
-         [:= [gate-raw :b :p :pld] {:act :sigmoid} [res2 :b :p :d] [per-layer-gate-w :pld :d]]
-         [:= [gated :b :p :pld] [gate-raw :b :p :pld] [pl-in-var :b :p :pld]]
-         [:= [proj-raw :b :p :d] [gated :b :p :pld] [per-layer-proj-w :d :pld]]
+         [:= [gate-raw :b :p pld] {:act :sigmoid} [res2 :b :p :d] [per-layer-gate-w pld :d]]
+         [:= [gated :b :p pld] [gate-raw :b :p pld] [pl-in-var :b :p pld]]
+         [:= [proj-raw :b :p :d] [gated :b :p pld] [per-layer-proj-w :d pld]]
          [:rms-norm [ple-normed :b :p :d] [proj-raw :b :p :d] [post-per-layer-norm-w :d] {:eps 1e-6}]
          [:= [res3 :b :p :d] [res2 :b :p :d]]
          [:= [res3 :b :p :d] [ple-normed :b :p :d]]])
@@ -357,10 +369,19 @@
      [:rms-norm [:normed :b :p :d] [h-final :b :p :d] [:final_norm_w :d] {:eps 1e-6}]
 
      ;; 5. Tied LM Head with optional final logit softcapping (30.0 * tanh(x / 30.0))
-     [:= [:logits :b :p :v] (if (and (number? final-logit-softcap) (pos? final-logit-softcap))
-                              {:softcap (double final-logit-softcap)}
-                              {})
-      [:normed :b :p :d] [:embed_tokens :v :d]]]))
+     (if (:last-token-only? cfg)
+       [:block {:name :last_token_head}
+        [:dynamic-slice [:normed_last :b :one :d] [:normed :b :p :d]
+         {:slice-sizes [1 1 hidden-dim]
+          :start-indices [0 :pos 0]}]
+        [:= [:logits :b :one :v] (if (and (number? final-logit-softcap) (pos? final-logit-softcap))
+                                   {:softcap (double final-logit-softcap)}
+                                   {})
+         [:normed_last :b :one :d] [:embed_tokens :v :d]]]
+       [:= [:logits :b :p :v] (if (and (number? final-logit-softcap) (pos? final-logit-softcap))
+                                {:softcap (double final-logit-softcap)}
+                                {})
+        [:normed :b :p :d] [:embed_tokens :v :d]])]))
 
 (defn gemma2-layer-ast
   "Generates Tensor Logic Hiccup AST for Gemma 2 Transformer layer block `layer-idx`."
@@ -510,7 +531,16 @@
      [:gemma-rms-norm [:normed :b :p :d] [h-final :b :p :d] [:final_norm_w :d] {:eps norm-eps}]
 
      ;; 4. Tied LM Head with optional final logit softcapping
-     [:= [:logits :b :p :v] (if (and (number? final-logit-softcap) (pos? final-logit-softcap))
-                              {:softcap (double final-logit-softcap)}
-                              {})
-      [:normed :b :p :d] [:embed_tokens :v :d]]]))
+     (if (:last-token-only? cfg)
+       [:block {:name :last_token_head}
+        [:dynamic-slice [:normed_last :b :one :d] [:normed :b :p :d]
+         {:slice-sizes [1 1 hidden-dim]
+          :start-indices [0 :pos 0]}]
+        [:= [:logits :b :one :v] (if (and (number? final-logit-softcap) (pos? final-logit-softcap))
+                                   {:softcap (double final-logit-softcap)}
+                                   {})
+         [:normed_last :b :one :d] [:embed_tokens :v :d]]]
+       [:= [:logits :b :p :v] (if (and (number? final-logit-softcap) (pos? final-logit-softcap))
+                                {:softcap (double final-logit-softcap)}
+                                {})
+        [:normed :b :p :d] [:embed_tokens :v :d]])]))

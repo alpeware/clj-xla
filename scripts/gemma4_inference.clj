@@ -30,10 +30,10 @@
    :chrome-trace-out "scratch/gemma4_chrome_trace.json"})
 
 (def DEFAULT_MODEL_DIRS
-  [".models/gemma-4-E4B-it"
-   ".models/gemma-4-E4B"
-   ".models/gemma-4-E2B-it"
+  [".models/gemma-4-E2B-it"
    ".models/gemma-4-E2B"
+   ".models/gemma-4-E4B-it"
+   ".models/gemma-4-E4B"
    ".models/gemma-4-12B-it"
    ".models/gemma-4-12B"
    ".models/gemma-4-26B-A4B-it"
@@ -109,6 +109,12 @@
 
           (and (= flag "--method") val)
           (recur (subvec remaining 2) (assoc opts :method (keyword (str/replace val #"^:+" ""))))
+
+          (and (= flag "--max-seq-len") val)
+          (recur (subvec remaining 2) (assoc opts :max-seq-len (Long/parseLong val)))
+
+          (and (= flag "--mode") val)
+          (recur (subvec remaining 2) (assoc opts :mode (keyword (str/replace val #"^:+" ""))))
 
           (and (= flag "--compare") val)
           (recur (subvec remaining 2) (assoc opts :compare (Boolean/parseBoolean val)))
@@ -293,11 +299,13 @@
 (defn build-tensor-logic-invars
   "Constructs EDN SSA signature invars for full Gemma 4 model forward pass."
   [config max-seq-len]
-  (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim num-layers weight-dtype is-int8 layer-configs]} config
+  (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim num-layers weight-dtype is-int8 layer-configs last-token-only?]} config
         norm-dtype (if is-int8 :bf16 weight-dtype)
         has-ple? (pos? total-pl-dim)]
-    (vec (concat [[:x [:tensor [1 max-seq-len] :i32]]
-                  [:embed_tokens [:tensor [vocab-size hidden-dim] norm-dtype]]]
+    (vec (concat [[:x [:tensor [1 max-seq-len] :i32]]]
+                 (when last-token-only?
+                   [[:pos [:tensor [1] :i32]]])
+                 [[:embed_tokens [:tensor [vocab-size hidden-dim] norm-dtype]]]
                  (when has-ple?
                    [[:embed_tokens_per_layer [:tensor [vocab-size total-pl-dim] norm-dtype]]
                     [:per_layer_model_projection [:tensor [total-pl-dim hidden-dim] norm-dtype]]
@@ -378,11 +386,13 @@
 (defn compile-tensor-logic-executable
   "Compiles Gemma 4 model AST into a native StableHLO MLIR executable."
   [{:keys [ctx config opts]} max-seq-len]
-  (let [invars (build-tensor-logic-invars config max-seq-len)
-        ast (gemma-logic/gemma4-model-ast (assoc config :max-seq-len max-seq-len))
+  (let [last-token? (get opts :last-token-only? true)
+        config-with-len (assoc config :max-seq-len max-seq-len :last-token-only? last-token?)
+        invars (build-tensor-logic-invars config-with-len max-seq-len)
+        ast (gemma-logic/gemma4-model-ast config-with-len)
         _ (when-not (:quiet opts)
-            (println (format "Lowering declarative Tensor Logic Gemma 4 AST (%d layers, max-seq-len=%d) to StableHLO..."
-                             (:num-layers config) max-seq-len)))
+            (println (format "Lowering declarative Tensor Logic Gemma 4 AST (%d layers, max-seq-len=%d, last-token-only=%s) to StableHLO..."
+                             (:num-layers config) max-seq-len (str last-token?))))
         graph (lower/ast->graph "gemma4_tensor_logic" invars ast #{:logits})]
     (when-not (:quiet opts)
       (println "Compiling Tensor Logic graph to native XLA PjRtLoadedExecutable..."))
@@ -426,9 +436,12 @@
   ([session exec device-weights prompt-ids]
    (run-autoregressive-generation-logic session exec device-weights prompt-ids nil))
   ([{:keys [ctx opts config tokenizer]} exec device-weights prompt-ids max-seq-len]
-   (let [{:keys [max-new-tokens quiet]} opts
+   (let [{:keys [max-new-tokens quiet mode]} opts
+         is-agent? (= mode :agent)
          seq-len (long (or max-seq-len (:max-seq-len config) 128))
          vocab-size (long (or (:vocab-size config) (:vocab_size config) 262144))
+         last-token? (get opts :last-token-only? true)
+         weight-dt (get config :weight-dtype :bf16)
          cur-tokens (atom (vec prompt-ids))
          t0 (System/nanoTime)]
      (loop [step 0]
@@ -437,14 +450,21 @@
          (let [s-len (count @cur-tokens)
                in-arr (int-array (take seq-len (concat @cur-tokens (repeat 0))))
                in-b (xla/buffer-from-host-buffer ctx (:client ctx) in-arr [1 seq-len] 4)
-               args (into [in-b] device-weights)
+               pos-b (when last-token?
+                       (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [(dec s-len)]) [1] 4))
+               args (if last-token?
+                      (into [in-b pos-b] device-weights)
+                      (into [in-b] device-weights))
                out (xla/execute exec args)
-               logits (xla/to-host-slice out (dec s-len) vocab-size (* seq-len vocab-size) (get config :weight-dtype :bf16))
+               logits (if last-token?
+                        (xla/to-host-slice out 0 vocab-size vocab-size weight-dt)
+                        (xla/to-host-slice out (dec s-len) vocab-size (* seq-len vocab-size) weight-dt))
                next-id (sample-next-token logits opts prompt-ids (subvec @cur-tokens (count prompt-ids)))]
            (xla/destroy-buffer! ctx in-b)
+           (when pos-b (xla/destroy-buffer! ctx pos-b))
            (xla/destroy-buffer! ctx out)
            (swap! cur-tokens conj next-id)
-           (when-not quiet
+           (when (and (not quiet) (not is-agent?))
              (print (decode tokenizer [next-id]))
              (flush))
            (if (or (= next-id 1) (= next-id (eos-id tokenizer)))
@@ -487,7 +507,7 @@
                          (vec raw-ids)
                          (vec (cons (bos-id tokenizer) raw-ids)))))
         prompt-len (count prompt-ids)
-        max-seq-len (long (or (:max-seq-len opts) (min 2048 (+ prompt-len max-new-tokens 16))))]
+        max-seq-len (long (or (:max-seq-len session) (:max-seq-len opts) (min 2048 (+ prompt-len max-new-tokens 16))))]
     (when-not quiet
       (let [prompt-str (if (> (count clean-prompt) 200)
                          (str (subs clean-prompt 0 100) " ... [truncated " (count clean-prompt) " chars] ... " (subs clean-prompt (- (count clean-prompt) 100)))
@@ -500,23 +520,31 @@
                          max-new-tokens temperature top-k (name (get-in session [:config :weight-dtype]))))
         (println (format "Encoded Token IDs (%d tokens): %s" prompt-len tok-str))))
 
-    (let [metrics-atom (atom {})
-          trace-spans-atom (atom [])
+    (let [metrics-atom (or (:metrics-atom session) (atom {}))
+          trace-spans-atom (or (:trace-spans-atom session) (atom []))
+          reuse-weights? (some? (:device-weights session))
+          reuse-exec? (some? (:executable session))
           device-weights (binding [profile/*active-trace-spans* trace-spans-atom]
-                           (profile/with-profile metrics-atom "weight_transfer"
-                             (allocate-device-weights session)))
+                           (if reuse-weights?
+                             (:device-weights session)
+                             (profile/with-profile metrics-atom "weight_transfer"
+                               (allocate-device-weights session))))
           exec (binding [profile/*active-trace-spans* trace-spans-atom]
-                 (profile/with-profile metrics-atom "graph_compilation"
-                   (compile-tensor-logic-executable session max-seq-len)))]
+                 (if reuse-exec?
+                   (:executable session)
+                   (profile/with-profile metrics-atom "graph_compilation"
+                     (compile-tensor-logic-executable session max-seq-len))))]
       (when-not quiet
         (println "\nGenerating tokens autoregressively with pure Tensor Logic Gemma 4 Kernel..."))
       (let [final-context (binding [profile/*active-trace-spans* trace-spans-atom]
                             (profile/with-profile metrics-atom "autoregressive_generation"
                               (run-autoregressive-generation session exec device-weights prompt-ids max-seq-len)))
             generated-str (decode tokenizer final-context)]
-        (println)
-        (println generated-str)
-        (doseq [w device-weights] (xla/destroy-buffer! (:ctx session) w))
+        (when-not quiet
+          (println)
+          (println generated-str))
+        (when-not reuse-weights?
+          (doseq [w device-weights] (xla/destroy-buffer! (:ctx session) w)))
         (when-let [out-path (:out opts)]
           (spit out-path generated-str)
           (when-not quiet
@@ -541,6 +569,30 @@
   (let [{:keys [tokenizer]} session
         final-context (generate-text session prompt)]
     (decode tokenizer final-context)))
+
+(defn init-agent-vram-session
+  "Initializes a persistent VRAM session for agent loops.
+   Pre-allocates weights in device memory and compiles the forward graph once."
+  ([opts]
+   (init-agent-vram-session opts (long (or (:max-seq-len opts) 512))))
+  ([opts max-seq-len]
+   (let [opts (assoc opts :mode :agent :max-seq-len max-seq-len)
+         session (init-inference-session opts)
+         _ (when-not (:quiet opts) (println "Pinning Gemma 4 weights in PJRT VRAM..."))
+         device-weights (allocate-device-weights session)
+         _ (when-not (:quiet opts) (println (format "Pre-compiling Gemma 4 StableHLO graph (max-seq-len=%d)..." max-seq-len)))
+         exec (compile-tensor-logic-executable session max-seq-len)]
+     (assoc session
+            :device-weights device-weights
+            :executable exec
+            :max-seq-len max-seq-len))))
+
+(defn close-agent-session!
+  "Releases VRAM resources for an agent session."
+  [{:keys [ctx device-weights]}]
+  (when (seq device-weights)
+    (doseq [w device-weights]
+      (xla/destroy-buffer! ctx w))))
 
 (defn- find-libjsig
   "Searches standard JDK paths for libjsig.so."

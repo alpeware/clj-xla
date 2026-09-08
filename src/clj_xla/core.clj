@@ -33,6 +33,24 @@
               (.invokeWithArguments handle [k-seg v-seg (int 1)]))))))
     (catch Exception _ nil)))
 
+(defn- getenv-native [^String k]
+  (try
+    (let [linker (java.lang.foreign.Linker/nativeLinker)
+          default-lookup (.defaultLookup linker)
+          getenv-opt (.find default-lookup "getenv")]
+      (when (.isPresent getenv-opt)
+        (let [getenv-ptr ^java.lang.foreign.MemorySegment (.get getenv-opt)
+              fd (java.lang.foreign.FunctionDescriptor/of java.lang.foreign.ValueLayout/ADDRESS
+                                                          (into-array java.lang.foreign.MemoryLayout
+                                                                      [java.lang.foreign.ValueLayout/ADDRESS]))
+              handle (.downcallHandle linker getenv-ptr fd (make-array java.lang.foreign.Linker$Option 0))]
+          (with-open [arena (java.lang.foreign.Arena/ofConfined)]
+            (let [k-seg (.allocateFrom arena k)
+                  res-ptr ^java.lang.foreign.MemorySegment (.invokeWithArguments handle [k-seg])]
+              (when (and res-ptr (not (.equals res-ptr java.lang.foreign.MemorySegment/NULL)))
+                (.getString (.reinterpret res-ptr Long/MAX_VALUE) 0)))))))
+    (catch Exception _ nil)))
+
 (defn determine-optimal-xla-flags
   "Pure function computing optimal XLA compiler flags and environment variables based on hardware target and user options."
   ([target] (determine-optimal-xla-flags target {} {}))
@@ -114,13 +132,31 @@
              env-vars (cond-> {"TF_CPP_MIN_LOG_LEVEL" "3"
                                "GLOG_minloglevel" "3"}
                         (= target-kw :rocm)
-                        (assoc "HSA_OVERRIDE_GFX_VERSION" (or (System/getenv "HSA_OVERRIDE_GFX_VERSION") "11.0.0")
-                               "ROCR_VISIBLE_DEVICES" (or (System/getenv "ROCR_VISIBLE_DEVICES") "0")
-                               "HIP_VISIBLE_DEVICES" (or (System/getenv "HIP_VISIBLE_DEVICES") "0"))
+                        (assoc "HSA_OVERRIDE_GFX_VERSION" (or (:hsa-override-gfx-version opts)
+                                                              (:gfx-version opts)
+                                                              (getenv-native "HSA_OVERRIDE_GFX_VERSION")
+                                                              (System/getenv "HSA_OVERRIDE_GFX_VERSION")
+                                                              "11.0.0")
+                               "ROCR_VISIBLE_DEVICES" (or (:rocr-visible-devices opts)
+                                                          (:gpu-device opts)
+                                                          (getenv-native "ROCR_VISIBLE_DEVICES")
+                                                          (System/getenv "ROCR_VISIBLE_DEVICES")
+                                                          "0")
+                               "HIP_VISIBLE_DEVICES" (or (:hip-visible-devices opts)
+                                                         (:gpu-device opts)
+                                                         (getenv-native "HIP_VISIBLE_DEVICES")
+                                                         (System/getenv "HIP_VISIBLE_DEVICES")
+                                                         "0"))
                         (some? cache-dir)
                         (assoc "TF_XLA_HSACO_CACHE_DIR" cache-dir)
                         (some? xla-cache-dir)
                         (assoc "XLA_PERSISTENT_COMPILATION_CACHE_DIR" xla-cache-dir))]
+         (doseq [[k v] env-vars]
+           (System/setProperty k v)
+           (setenv-native k v))
+         (when-not (str/blank? all-flags-str)
+           (System/setProperty "XLA_FLAGS" all-flags-str)
+           (setenv-native "XLA_FLAGS" all-flags-str))
          {:xla-flags all-flags-str
           :env-vars env-vars
           :autotune-level autotune-level

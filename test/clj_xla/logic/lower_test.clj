@@ -3,7 +3,10 @@
   (:require [clj-xla.core :as xla]
             [clj-xla.logic.lower :as lower]
             [clj-xla.stablehlo :as shlo]
-            [clojure.test :refer [deftest is]]))
+            [clojure.test :refer [deftest is]]
+            [clojure.test.check.clojure-test :refer [defspec]]
+            [clojure.test.check.generators :as gen]
+            [clojure.test.check.properties :as prop]))
 
 (deftest test-lower-gemm-produces-valid-ssa-graph
   (let [invars [[:x [:tensor [2 16 32] :f32]]
@@ -58,3 +61,37 @@
     (is (= 12.0 (nth res 2)))
     (is (= 14.0 (nth res 3)))
     (xla/destroy-buffer! out-buf)))
+
+(defspec prop-lower-dynamic-slice-produces-valid-graph
+  50
+  (prop/for-all [b (gen/choose 1 4)
+                 s (gen/choose 16 128)
+                 d (gen/choose 32 256)]
+                (let [invars [[:x [:tensor [b s d] :f32]]
+                              [:pos [:tensor [1] :i32]]]
+                      ast [:dynamic-slice [:y :b :one :d] [:x :b :p :d]
+                           {:slice-sizes [1 1 d] :start-indices [0 :pos 0]}]
+                      graph (lower/ast->graph "ds_graph" invars ast #{:y})]
+                  (and (shlo/validate-graph graph)
+                       (= [:y] (:outvars graph))
+                       (boolean (some #(= :stablehlo/dynamic_slice (:op %)) (:eqns graph)))))))
+
+(deftest test-end-to-end-dynamic-slice-execution
+  (let [ctx (xla/get-context)
+        invars [[:x [:tensor [1 10 4] :f32]]
+                [:pos [:tensor [1] :i32]]]
+        ast [:dynamic-slice [:y :b :one :d] [:x :b :p :d]
+             {:slice-sizes [1 1 4] :start-indices [0 :pos 0]}]
+        graph (lower/ast->graph "e2e_ds" invars ast #{:y})
+        compiled (xla/compile-graph ctx graph)
+        x-data (float-array (range 40))
+        pos-data (int-array [3])
+        out-buf (xla/execute compiled x-data pos-data)
+        res (xla/to-host-slice out-buf 0 4 4)]
+    ;; At pos=3, elements for slice [1 1 4] starting at [0 3 0] are [12.0, 13.0, 14.0, 15.0]
+    (is (= 12.0 (nth res 0)))
+    (is (= 13.0 (nth res 1)))
+    (is (= 14.0 (nth res 2)))
+    (is (= 15.0 (nth res 3)))
+    (xla/destroy-buffer! out-buf)))
+

@@ -15,6 +15,8 @@
            head-idxs (vec (rest head))
            attrs (ast/attrs eqn)
            explicit-shape (or (:shape attrs)
+                              (:slice_sizes attrs)
+                              (:slice-sizes attrs)
                               (when (and (= (first eqn) :slice)
                                          (or (:limit attrs) (:limit_indices attrs))
                                          (or (:start attrs) (:start_indices attrs)))
