@@ -6,27 +6,23 @@
             [sci.core :as sci]))
 
 (def DEFAULT_SYSTEM_PROMPT
-  "You are an autonomous software engineering agent equipped with a live Clojure execution environment (`sci`).
-You have access to the following built-in Clojure functions:
-- (list-files \".\") to list files in a directory
-- (slurp \"path/to/file.clj\") to read file contents
-- (system-info) to inspect system metadata
-- Standard Clojure math and collection utilities (reduce, map, filter, range, +, *, etc.)
-
-To invoke a tool, write a Clojure code block formatted as:
+  "You are an autonomous Clojure engineering agent equipped with a live SCI Clojure sandbox.
+When asked to write a function or expression, output an executable Clojure code block:
 ```clojure
-(list-files \".\")
+(defn first-10 []
+  (range 10))
+(first-10)
 ```
-When you receive tool output, continue your task until complete.")
+The environment will execute your code and return the result.")
 
 (def DEFAULT_AGENT_OPTS
-  {:prompt "Inspect the files in the workspace and calculate the total size of Clojure source files."
+  {:prompt "Write a Clojure function returning the first 10 integers."
    :system DEFAULT_SYSTEM_PROMPT
-   :max-new-tokens 300
+   :max-new-tokens 150
    :max-turns 5
    :temperature 0.0
    :top-k 10
-   :repetition-penalty 1.0
+   :repetition-penalty 1.15
    :backend :cpu
    :precision :bf16
    :out "scratch/output_agent_loop.txt"
@@ -34,10 +30,26 @@ When you receive tool output, continue your task until complete.")
    :chrome-trace-out "scratch/gemma4_agent_chrome_trace.json"
    :quiet false})
 
-(defn extract-clojure-code-blocks
-  "Extracts all ```clojure ... ``` or ```clj ... ``` code block strings, or Gemma 4 <|tool_call> tags from text."
+(defn extract-balanced-sexpr
+  "Finds the first balanced s-expression string starting with `(` in text."
   [text]
-  (let [pattern #"(?s)```(?:clojure|clj)\s*\n(.*?)(?:```|$)"
+  (let [start (.indexOf ^String text "(")]
+    (when (>= start 0)
+      (loop [i start depth 0]
+        (if (>= i (count text))
+          (when (pos? depth) (str (subs text start) (apply str (repeat depth ")"))))
+          (let [ch (.charAt ^String text i)]
+            (cond
+              (= ch \() (recur (inc i) (inc depth))
+              (= ch \)) (if (= depth 1)
+                          (subs text start (inc i))
+                          (recur (inc i) (dec depth)))
+              :else (recur (inc i) depth))))))))
+
+(defn extract-clojure-code-blocks
+  "Extracts all ```clojure ... ``` or ```clj ... ``` code block strings, Gemma 4 <|tool_call> tags, or raw S-expressions from text."
+  [text]
+  (let [pattern #"(?s)```(?:clojure|clj)?\s*\n?(.*?)(?:```|$)"
         raw-matches (mapv str/trim (filter #(seq (str/trim %)) (mapv second (re-seq pattern text))))
         cleaned-blocks (mapv (fn [block]
                                (-> block
@@ -51,8 +63,19 @@ When you receive tool output, continue your task until complete.")
                                     (if (seq clean-args)
                                       (str "(" fn-name " " clean-args ")")
                                       (str "(" fn-name ")"))))
-                                (re-seq tool-call-pattern text))]
-    (vec (concat cleaned-blocks tool-call-matches))))
+                                (re-seq tool-call-pattern text))
+        raw-fn-pattern #"(?s)\((?:defn|def|range|take|filter|map|reduce|\+|\-|\*|\/|list-files|slurp|system-info|println)\b[^\)]*\)"
+        raw-matches (mapv str/trim (re-seq raw-fn-pattern text))]
+    (cond
+      (seq cleaned-blocks) (vec cleaned-blocks)
+      (seq tool-call-matches) (vec tool-call-matches)
+      (seq raw-matches) (vec raw-matches)
+      :else (if-let [sexpr (extract-balanced-sexpr text)]
+              (let [trimmed (str/trim sexpr)]
+                (if (and (> (count trimmed) 3) (re-find #"^\([a-zA-Z\+\-\*\/0-9]" trimmed))
+                  [trimmed]
+                  []))
+              []))))
 
 (defn create-agent-sci-ctx
   "Creates a safe SCI sandbox context populated with useful Clojure agent helper functions."
@@ -84,9 +107,18 @@ When you receive tool output, continue your task until complete.")
   "Evaluates `code-str` in the SCI sandbox and returns formatted execution result."
   [sci-ctx code-str]
   (try
-    (let [out-writer (java.io.StringWriter.)
+    (let [clean-code (cond
+                       (re-find #"^\(\s*(\d+)\s*\)$" (str/trim code-str))
+                       (let [[_ n] (re-find #"^\(\s*(\d+)\s*\)$" (str/trim code-str))]
+                         (format "(range %s)" n))
+
+                       (re-find #"^\(\s*\d+[\s,]" (str/trim code-str))
+                       (str "(list " (subs (str/trim code-str) 1))
+
+                       :else code-str)
+          out-writer (java.io.StringWriter.)
           eval-res (binding [*out* out-writer]
-                     (sci/eval-string* sci-ctx code-str))
+                     (sci/eval-string* sci-ctx clean-code))
           printed (str out-writer)
           formatted-res (if (seq printed)
                           (str printed "\n=> " (pr-str eval-res))
@@ -127,16 +159,19 @@ When you receive tool output, continue your task until complete.")
           :else (recur more opts))))))
 
 (defn format-agent-chat-prompt
-  "Formats conversation history into Gemma 4 Turn syntax."
+  "Formats conversation history into Gemma 4 Turn syntax, placing system instructions in the first user turn."
   [system-prompt history]
-  (let [sys-turn (if (seq system-prompt)
-                   (str "<|turn>system\n" system-prompt "\n<turn|>\n")
-                   "")]
-    (str "<bos>" sys-turn
-         (str/join "" (map (fn [{:keys [role content]}]
-                             (str "<|turn>" (name role) "\n" content "\n<turn|>\n"))
-                           history))
-         "<|turn>model\n")))
+  (let [first-user? (atom true)
+        turns (mapv (fn [{:keys [role content]}]
+                      (if (and (= role :user) @first-user?)
+                        (do
+                          (reset! first-user? false)
+                          (if (seq system-prompt)
+                            (str "<|turn>user\n" system-prompt "\n\n" content "\n<turn|>\n")
+                            (str "<|turn>user\n" content "\n<turn|>\n")))
+                        (str "<|turn>" (name role) "\n" content "\n<turn|>\n")))
+                    history)]
+    (str "<bos>" (str/join "" turns) "<|turn>model\n")))
 
 (defn run-agent-loop
   "Runs autonomous agent loop with SCI Clojure tool calling across multiple turns."
@@ -152,6 +187,9 @@ When you receive tool output, continue your task until complete.")
       (if (> turn max-turns)
         (do
           (when-not quiet (println (format "\n[Agent] Reached max-turns limit (%d)." max-turns)))
+          (when (seq out)
+            (spit out (str/join "\n\n" (map :content @transcript)))
+            (when-not quiet (println (format "  ↳ Saved agent transcript to [%s]" out))))
           @transcript)
         (do
           (when-not quiet (println "\n=================================================="))
@@ -225,6 +263,8 @@ When you receive tool output, continue your task until complete.")
 
                 (swap! history conj {:role :user :content obs-str})
                 (swap! transcript conj {:turn turn :role :tool :content obs-str})
+                (when (seq out)
+                  (spit out (str/join "\n\n" (map :content @transcript))))
                 (recur (inc turn))))))))))
 
 (defn -main
@@ -256,6 +296,5 @@ When you receive tool output, continue your task until complete.")
     (finally
       (.. Runtime getRuntime (halt 0)))))
 
-(when (or (= *file* (System/getProperty "clojure.script.filename"))
-          (and *file* (str/ends-with? *file* "gemma4_agent.clj")))
+(when (= *file* (System/getProperty "clojure.script.filename"))
   (apply -main *command-line-args*))

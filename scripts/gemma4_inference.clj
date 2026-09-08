@@ -398,6 +398,10 @@
       (println "Compiling Tensor Logic graph to native XLA PjRtLoadedExecutable..."))
     (xla/compile-graph ctx graph)))
 
+(def GEMMA4-STOP-TOKEN-IDS
+  "Special token IDs marking end-of-turn or end-of-generation in Gemma 4."
+  #{1 106 49 50})
+
 (defn argmax-host
   "Finds the index of the maximum float value in float array `arr`."
   [^floats arr]
@@ -412,24 +416,51 @@
             (recur (inc i) max-idx max-val)))
         max-idx))))
 
+(defn argmax-with-penalty
+  "Selects the token with maximum logit value while penalizing repetitive tokens and suppressing runaway consecutive whitespace."
+  [^floats logits-arr gen-ids rep-pen]
+  (let [n (alength logits-arr)
+        freqs (frequencies gen-ids)
+        last-tok (last gen-ids)
+        too-many-ws? (and (or (= last-tok 107) (= last-tok 236743) (= last-tok 108))
+                          (let [prior (last (butlast gen-ids))]
+                            (or (= prior 107) (= prior 236743) (= prior 108))))]
+    (loop [i 0
+           max-idx 0
+           max-val Float/NEGATIVE_INFINITY]
+      (if (< i n)
+        (let [raw-v (aget logits-arr i)
+              c (get freqs i 0)
+              v (cond
+                  (and too-many-ws? (or (= i 107) (= i 236743) (= i 108)))
+                  Float/NEGATIVE_INFINITY
+
+                  (pos? c)
+                  (let [pen (Math/pow (double rep-pen) (double (min c 5)))]
+                    (if (pos? raw-v) (/ raw-v pen) (* raw-v pen)))
+
+                  :else raw-v)]
+          (if (> v max-val)
+            (recur (inc i) i (float v))
+            (recur (inc i) max-idx max-val)))
+        max-idx))))
+
 (defn sample-next-token
   "Selects next token from float array `logits-arr` using sampling options and repetition penalty."
-  [^floats logits-arr opts prompt-ids gen-ids]
+  [^floats logits-arr opts _prompt-ids gen-ids]
   (let [{:keys [temperature top-k top-p repetition-penalty]
          :or {temperature 0.0 top-k 10 top-p 1.0 repetition-penalty 1.15}} opts
         rep-pen (double (or repetition-penalty 1.15))]
     (if (or (nil? temperature) (<= temperature 0.0))
-      (if (and (number? rep-pen) (> rep-pen 1.0) (seq (concat prompt-ids gen-ids)))
-        (let [penalized (sampling/apply-repetition-penalty (vec logits-arr) (concat prompt-ids gen-ids) rep-pen)]
-          (first (apply max-key second (map-indexed vector penalized))))
+      (if (and (number? rep-pen) (> rep-pen 1.0))
+        (argmax-with-penalty logits-arr gen-ids rep-pen)
         (argmax-host logits-arr))
-      (let [logits-vec (vec logits-arr)
-            seen-ids (vec (concat prompt-ids gen-ids))]
+      (let [logits-vec (vec logits-arr)]
         (sampling/sample-logits logits-vec {:temperature temperature
                                             :top-k top-k
                                             :top-p top-p
                                             :repetition-penalty rep-pen
-                                            :seen-ids seen-ids})))))
+                                            :seen-ids gen-ids})))))
 
 (defn run-autoregressive-generation-logic
   "Executes autoregressive token generation using pure Tensor Logic Gemma 4 executable."
@@ -467,7 +498,7 @@
            (when (and (not quiet) (not is-agent?))
              (print (decode tokenizer [next-id]))
              (flush))
-           (if (or (= next-id 1) (= next-id (eos-id tokenizer)))
+           (if (or (contains? GEMMA4-STOP-TOKEN-IDS next-id) (= next-id (eos-id tokenizer)))
              nil
              (recur (inc step))))))
      (let [t1 (System/nanoTime)
