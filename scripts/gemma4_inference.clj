@@ -3,9 +3,11 @@
   (:require [clj-xla.core :as xla]
             [clj-xla.logic.lower :as lower]
             [clj-xla.logic.models.gemma :as gemma-logic]
+            [clj-xla.pjrt :as pjrt]
             [clj-xla.profile :as profile]
             [clj-xla.safetensors :as st]
             [clj-xla.sampling :as sampling]
+            [clj-xla.stablehlo :as shlo]
             [clj-xla.tokenizer.core :as tok]
             [clj-xla.tokenizer.protocol :refer [bos-id decode encode eos-id]]
             [clojure.data.json :as json]
@@ -402,6 +404,134 @@
   "Special token IDs marking end-of-turn or end-of-generation in Gemma 4."
   #{1 106 49 50})
 
+(defn compile-in-vram-loop-executable
+  "Compiles an end-to-end in-VRAM autoregressive generation loop using StableHLO while-loop lowering."
+  [{:keys [ctx config opts]} max-seq-len]
+  (let [cfg (assoc config :max-seq-len max-seq-len :last-token-only? true)
+        vocab-size (long (or (:vocab-size cfg) 262144))
+        weight-dt (get cfg :weight-dtype :bf16)
+        dt-str (name weight-dt)
+        invars (build-tensor-logic-invars cfg max-seq-len)
+        ast (gemma-logic/gemma4-model-ast cfg)
+        _ (when-not (:quiet opts)
+            (println (format "Lowering declarative Tensor Logic In-VRAM Gemma 4 Loop (%d layers, max-seq-len=%d) to StableHLO..."
+                             (:num-layers config) max-seq-len)))
+        graph (lower/ast->graph "gemma4_step" invars ast #{:logits})
+        var-types (shlo/infer-var-types invars (:eqns graph))
+        body-eqns (mapv #(shlo/format-equation % var-types) (:eqns graph))
+        weight-invars (subvec invars 2)
+        weight-params-str (str/join ", " (map (fn [[v t]] (str "%" (name v) ": " (shlo/type->mlir-string t))) weight-invars))
+
+        cond-region (format "    ^bb0(%%cur_step: tensor<i32>, %%target_max: tensor<i32>, %%cur_toks: tensor<1x%dxi32>, %%cur_stopped: tensor<i1>):
+      %%step_lt = \"stablehlo.compare\"(%%cur_step, %%target_max) {comparison_direction = #stablehlo<comparison_direction LT>} : (tensor<i32>, tensor<i32>) -> tensor<i1>
+      %%not_stopped = \"stablehlo.not\"(%%cur_stopped) : (tensor<i1>) -> tensor<i1>
+      %%cond = \"stablehlo.and\"(%%step_lt, %%not_stopped) : (tensor<i1>, tensor<i1>) -> tensor<i1>
+      \"stablehlo.return\"(%%cond) : (tensor<i1>) -> ()" max-seq-len)
+
+        body-prefix (format "    ^bb0(%%cur_step: tensor<i32>, %%target_max: tensor<i32>, %%cur_toks: tensor<1x%dxi32>, %%cur_stopped: tensor<i1>):
+      %%c_one = stablehlo.constant dense<1> : tensor<i32>
+      %%pos_i32 = stablehlo.subtract %%cur_step, %%c_one : tensor<i32>
+      %%x = stablehlo.reshape %%cur_toks : (tensor<1x%dxi32>) -> tensor<1x%dxi32>
+      %%pos = stablehlo.reshape %%pos_i32 : (tensor<i32>) -> tensor<1xi32>" max-seq-len max-seq-len max-seq-len)
+
+        body-suffix (format "      %%logits_2d = stablehlo.reshape %%logits : (tensor<1x1x%dx%s>) -> tensor<1x%dx%s>
+      %%logits_f32 = \"stablehlo.convert\"(%%logits_2d) : (tensor<1x%dx%s>) -> tensor<1x%dxf32>
+      %%iota_2d = \"stablehlo.iota\"() {iota_dimension = 1 : i64} : () -> tensor<1x%dxi32>
+      %%c_neg_inf = stablehlo.constant dense<-1.000000e+30> : tensor<f32>
+      %%c_zero_i32 = stablehlo.constant dense<0> : tensor<i32>
+      %%red_val, %%red_idx = \"stablehlo.reduce\"(%%logits_f32, %%iota_2d, %%c_neg_inf, %%c_zero_i32) ({
+      ^bb0(%%v1: tensor<f32>, %%i1: tensor<i32>, %%v2: tensor<f32>, %%i2: tensor<i32>):
+        %%cmp = \"stablehlo.compare\"(%%v1, %%v2) {comparison_direction = #stablehlo<comparison_direction GT>} : (tensor<f32>, tensor<f32>) -> tensor<i1>
+        %%rv = \"stablehlo.select\"(%%cmp, %%v1, %%v2) : (tensor<i1>, tensor<f32>, tensor<f32>) -> tensor<f32>
+        %%ri = \"stablehlo.select\"(%%cmp, %%i1, %%i2) : (tensor<i1>, tensor<i32>, tensor<i32>) -> tensor<i32>
+        \"stablehlo.return\"(%%rv, %%ri) : (tensor<f32>, tensor<i32>) -> ()
+      }) {dimensions = array<i64: 1>} : (tensor<1x%dxf32>, tensor<1x%dxi32>, tensor<f32>, tensor<i32>) -> (tensor<1xf32>, tensor<1xi32>)
+      %%next_tok_1d = stablehlo.reshape %%red_idx : (tensor<1xi32>) -> tensor<1x1xi32>
+      %%c_zero = stablehlo.constant dense<0> : tensor<i32>
+      %%next_toks = \"stablehlo.dynamic_update_slice\"(%%cur_toks, %%next_tok_1d, %%c_zero, %%cur_step) : (tensor<1x%dxi32>, tensor<1x1xi32>, tensor<i32>, tensor<i32>) -> tensor<1x%dxi32>
+      %%next_step = stablehlo.add %%cur_step, %%c_one : tensor<i32>
+      %%eos_c = stablehlo.constant dense<1> : tensor<1xi32>
+      %%eot_c = stablehlo.constant dense<106> : tensor<1xi32>
+      %%c_eos = \"stablehlo.compare\"(%%red_idx, %%eos_c) {comparison_direction = #stablehlo<comparison_direction EQ>} : (tensor<1xi32>, tensor<1xi32>) -> tensor<1xi1>
+      %%c_eot = \"stablehlo.compare\"(%%red_idx, %%eot_c) {comparison_direction = #stablehlo<comparison_direction EQ>} : (tensor<1xi32>, tensor<1xi32>) -> tensor<1xi1>
+      %%or_stop = \"stablehlo.or\"(%%c_eos, %%c_eot) : (tensor<1xi1>, tensor<1xi1>) -> tensor<1xi1>
+      %%is_stop = stablehlo.reshape %%or_stop : (tensor<1xi1>) -> tensor<i1>
+      \"stablehlo.return\"(%%next_step, %%target_max, %%next_toks, %%is_stop) : (tensor<i32>, tensor<i32>, tensor<1x%dxi32>, tensor<i1>) -> ()"
+                            vocab-size dt-str vocab-size dt-str
+                            vocab-size dt-str vocab-size
+                            vocab-size vocab-size vocab-size
+                            max-seq-len max-seq-len max-seq-len)
+
+        full-mlir (str "module @gemma4_in_vram_loop {\n"
+                       "  func.func @main(%init_step: tensor<i32>, %max_step: tensor<i32>, %init_tokens: tensor<1x" max-seq-len "xi32>, " weight-params-str ") -> (tensor<i32>, tensor<1x" max-seq-len "xi32>) {\n"
+                       "    %false_c = stablehlo.constant dense<false> : tensor<i1>\n"
+                       "    %loop:4 = \"stablehlo.while\"(%init_step, %max_step, %init_tokens, %false_c) ({\n"
+                       cond-region "\n"
+                       "    }, {\n"
+                       body-prefix "\n"
+                       (str/join "\n" body-eqns) "\n"
+                       body-suffix "\n"
+                       "    }) : (tensor<i32>, tensor<i32>, tensor<1x" max-seq-len "xi32>, tensor<i1>) -> (tensor<i32>, tensor<i32>, tensor<1x" max-seq-len "xi32>, tensor<i1>)\n"
+                       "    return %loop#0, %loop#2 : tensor<i32>, tensor<1x" max-seq-len "xi32>\n"
+                       "  }\n"
+                       "}\n")]
+    (when-not (:quiet opts)
+      (println "Compiling In-VRAM Loop to native XLA PjRtLoadedExecutable..."))
+    (pjrt/compile-mlir ctx (:client ctx) full-mlir)))
+
+(defn run-vram-loop-generation
+  "Executes autoregressive token generation entirely within device VRAM using a single OpenXLA while-loop execution."
+  [session exec device-weights prompt-ids max-seq-len]
+  (let [{:keys [ctx opts]} session
+        {:keys [max-new-tokens quiet]} opts
+        seq-len (long max-seq-len)
+        raw-p-count (count prompt-ids)
+        safe-p-count (min raw-p-count (max 0 (- seq-len 2)))
+        clamped-prompt-ids (if (< safe-p-count raw-p-count)
+                             (subvec (vec prompt-ids) (- raw-p-count safe-p-count))
+                             prompt-ids)
+        p-count (count clamped-prompt-ids)
+        max-new (long (max 1 (min (- seq-len p-count 1) (or max-new-tokens 150))))
+        target-max (long (+ p-count max-new))]
+    (if (>= p-count (dec seq-len))
+      clamped-prompt-ids
+      (let [in-arr (int-array seq-len)
+            _ (dotimes [i p-count]
+                (aset in-arr i (int (nth clamped-prompt-ids i))))
+            b-step (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [p-count]) [] 4)
+            b-max (xla/buffer-from-host-buffer ctx (:client ctx) (int-array [target-max]) [] 4)
+            b-toks (xla/buffer-from-host-buffer ctx (:client ctx) in-arr [1 seq-len] 4)
+            args (into [b-step b-max b-toks] device-weights)
+            t0 (System/nanoTime)
+            outs (pjrt/execute-executable ctx exec args 2)
+            t1 (System/nanoTime)
+            _ (xla/destroy-buffer! ctx b-step)
+            _ (xla/destroy-buffer! ctx b-max)
+            _ (xla/destroy-buffer! ctx b-toks)
+            [out-step out-toks] outs
+            step-floats (pjrt/buffer-to-host-buffer ctx out-step 1 :f32)
+            step-val (int (Float/floatToIntBits (aget step-floats 0)))
+            toks-floats (pjrt/buffer-to-host-buffer ctx out-toks seq-len :f32)
+            _ (xla/destroy-buffer! ctx out-step)
+            _ (xla/destroy-buffer! ctx out-toks)
+            actual-step (min (max p-count step-val) seq-len)
+            final-ids (mapv #(Float/floatToIntBits %) (take actual-step (vec toks-floats)))
+            cleaned-ids (if (and (> (count final-ids) p-count)
+                                 (contains? GEMMA4-STOP-TOKEN-IDS (last final-ids)))
+                          (subvec final-ids 0 (dec (count final-ids)))
+                          final-ids)
+            total-ms (/ (- t1 t0) 1e6)
+            gen-count (- (count cleaned-ids) p-count)
+            tok-s (if (pos? total-ms) (/ (* gen-count 1000.0) total-ms) 0.0)]
+        (when-not quiet
+          (println)
+          (println "\n------------------------------------------------------------------")
+          (println "  Telemetry Benchmark Metrics (In-VRAM While-Loop Execution):")
+          (println (format "    • Total Generation Latency    : %8.2f ms (%d tokens)" total-ms gen-count))
+          (println (format "    • Generation Speed            : %8.2f tok/s (%6.2f ms/tok)" tok-s (if (pos? gen-count) (/ total-ms gen-count) 0.0)))
+          (println "------------------------------------------------------------------\n"))
+        cleaned-ids))))
+
 (defn argmax-host
   "Finds the index of the maximum float value in float array `arr`."
   [^floats arr]
@@ -417,29 +547,20 @@
         max-idx))))
 
 (defn argmax-with-penalty
-  "Selects the token with maximum logit value while penalizing repetitive tokens and suppressing runaway consecutive whitespace."
+  "Selects the token with maximum logit value with sliding window linear repetition penalty."
   [^floats logits-arr gen-ids rep-pen]
   (let [n (alength logits-arr)
-        freqs (frequencies gen-ids)
-        last-tok (last gen-ids)
-        too-many-ws? (and (or (= last-tok 107) (= last-tok 236743) (= last-tok 108))
-                          (let [prior (last (butlast gen-ids))]
-                            (or (= prior 107) (= prior 236743) (= prior 108))))]
+        recent-ids (take-last 32 gen-ids)
+        penalty-set (disj (set recent-ids) 107 108 236743)
+        pen (double (or rep-pen 1.15))]
     (loop [i 0
            max-idx 0
            max-val Float/NEGATIVE_INFINITY]
       (if (< i n)
         (let [raw-v (aget logits-arr i)
-              c (get freqs i 0)
-              v (cond
-                  (and too-many-ws? (or (= i 107) (= i 236743) (= i 108)))
-                  Float/NEGATIVE_INFINITY
-
-                  (pos? c)
-                  (let [pen (Math/pow (double rep-pen) (double (min c 5)))]
-                    (if (pos? raw-v) (/ raw-v pen) (* raw-v pen)))
-
-                  :else raw-v)]
+              v (if (contains? penalty-set i)
+                  (if (pos? raw-v) (/ raw-v pen) (* raw-v pen))
+                  raw-v)]
           (if (> v max-val)
             (recur (inc i) i (float v))
             (recur (inc i) max-idx max-val)))
@@ -521,7 +642,17 @@
          (println "------------------------------------------------------------------\n")))
      @cur-tokens)))
 
-(def run-autoregressive-generation run-autoregressive-generation-logic)
+(defn run-autoregressive-generation
+  "Executes autoregressive generation either via in-VRAM while loop or host sampling loop."
+  ([session exec device-weights prompt-ids]
+   (run-autoregressive-generation session exec device-weights prompt-ids nil))
+  ([session exec device-weights prompt-ids max-seq-len]
+   (let [{:keys [opts]} session
+         vram-loop? (or (:vram-loop? opts) (= (:mode opts) :agent) (:vram-session? session))]
+     (if vram-loop?
+       (run-vram-loop-generation session exec device-weights prompt-ids (or max-seq-len (:max-seq-len session) 128))
+       (run-autoregressive-generation-logic session exec device-weights prompt-ids max-seq-len)))))
+
 (def compile-executable compile-tensor-logic-executable)
 
 (defn generate-text
@@ -571,7 +702,9 @@
                  (if reuse-exec?
                    (:executable session)
                    (profile/with-profile metrics-atom "graph_compilation"
-                     (compile-tensor-logic-executable session max-seq-len))))]
+                     (if (or (:vram-loop? opts) (= (:mode opts) :agent) (:vram-session? session))
+                       (compile-in-vram-loop-executable session max-seq-len)
+                       (compile-tensor-logic-executable session max-seq-len)))))]
       (when-not quiet
         (println "\nGenerating tokens autoregressively with pure Tensor Logic Gemma 4 Kernel..."))
       (let [final-context (binding [profile/*active-trace-spans* trace-spans-atom]
@@ -610,20 +743,21 @@
 
 (defn init-agent-vram-session
   "Initializes a persistent VRAM session for agent loops.
-   Pre-allocates weights in device memory and compiles the forward graph once."
+   Pre-allocates weights in device memory and compiles the in-VRAM while-loop forward graph once."
   ([opts]
-   (init-agent-vram-session opts (long (or (:max-seq-len opts) 512))))
+   (init-agent-vram-session opts (long (or (:max-seq-len opts) 1024))))
   ([opts max-seq-len]
-   (let [opts (assoc opts :mode :agent :max-seq-len max-seq-len)
+   (let [opts (assoc opts :mode :agent :max-seq-len max-seq-len :vram-loop? true)
          session (init-inference-session opts)
          _ (when-not (:quiet opts) (println "Pinning Gemma 4 weights in PJRT VRAM..."))
          device-weights (allocate-device-weights session)
-         _ (when-not (:quiet opts) (println (format "Pre-compiling Gemma 4 StableHLO graph (max-seq-len=%d)..." max-seq-len)))
-         exec (compile-tensor-logic-executable session max-seq-len)]
+         _ (when-not (:quiet opts) (println (format "Pre-compiling Gemma 4 In-VRAM StableHLO graph (max-seq-len=%d)..." max-seq-len)))
+         exec (compile-in-vram-loop-executable session max-seq-len)]
      (assoc session
             :device-weights device-weights
             :executable exec
-            :max-seq-len max-seq-len))))
+            :max-seq-len max-seq-len
+            :vram-session? true))))
 
 (defn close-agent-session!
   "Releases VRAM resources for an agent session."

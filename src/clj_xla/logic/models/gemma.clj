@@ -294,7 +294,7 @@
       ;; 11. Gemma 4 Per-Layer Input (PLE) Gating Sub-block (if has-ple?)
       (when has-ple?
         [:block {:name (keyword (str "ple_gate_" i))}
-         [:= [gate-raw :b :p pld] {:act :sigmoid} [res2 :b :p :d] [per-layer-gate-w pld :d]]
+         [:= [gate-raw :b :p pld] {:act :gelu} [res2 :b :p :d] [per-layer-gate-w pld :d]]
          [:= [gated :b :p pld] [gate-raw :b :p pld] [pl-in-var :b :p pld]]
          [:= [proj-raw :b :p :d] [gated :b :p pld] [per-layer-proj-w :d pld]]
          [:rms-norm [ple-normed :b :p :d] [proj-raw :b :p :d] [post-per-layer-norm-w :d] {:eps 1e-6}]

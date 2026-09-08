@@ -67,7 +67,9 @@
                        [0 0]))
                    types))))
 
-(defn- infer-var-types [invars eqns]
+(defn infer-var-types
+  "Infers StableHLO tensor types for each variable in the equation list."
+  [invars eqns]
   (let [initial-types (into {} (map (fn [[v t]] [v (type->mlir-string t)]) invars))]
     (reduce (fn [acc {:keys [op invars outvars attrs call_target_name] :as eqn}]
               (let [in-vars (or invars [])
@@ -253,7 +255,9 @@
             initial-types
             eqns)))
 
-(defn- format-equation [eqn var-types]
+(defn format-equation
+  "Formats an individual tensor equation into StableHLO MLIR instruction text."
+  [eqn var-types]
   (let [{:keys [op invars outvars value attrs call_target_name]} (assoc eqn :invars (or (:invars eqn) []))
         mlir-op (format-op-name op)
         out-var (first outvars)

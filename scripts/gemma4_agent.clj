@@ -6,12 +6,13 @@
             [sci.core :as sci]))
 
 (def DEFAULT_SYSTEM_PROMPT
-  "You are a helpful Clojure engineering assistant. Solve programming tasks by writing executable Clojure code enclosed in ```clojure ... ``` code blocks.")
+  "You are an autonomous Clojure engineering assistant with a live SCI Clojure sandbox. Directly solve programming tasks by outputting executable Clojure code (Lisp s-expressions with parentheses, e.g. (defn ...)) enclosed in ```clojure ... ``` code blocks. Never use JavaScript or Python.")
 
 (def DEFAULT_AGENT_OPTS
   {:prompt "Write a Clojure function returning the first 10 integers."
    :system DEFAULT_SYSTEM_PROMPT
-   :max-new-tokens 150
+   :max-new-tokens 256
+   :max-seq-len 1024
    :max-turns 5
    :temperature 0.0
    :top-k 10
@@ -110,7 +111,7 @@
                           (pr-str eval-res))]
       {:status :success :output formatted-res})
     (catch Throwable e
-      {:status :error :output (str "Execution Exception: " (.getMessage e))})))
+      {:status :error :output (str "Execution Exception: " (.getMessage e) " -- Please output valid Clojure s-expressions.")})))
 
 (defn parse-agent-cli-args
   "Parses CLI flags for gemma4_agent."
@@ -144,19 +145,31 @@
           :else (recur more opts))))))
 
 (defn format-agent-chat-prompt
-  "Formats conversation history into Gemma 4 Turn syntax, placing system instructions in the first user turn."
-  [system-prompt history]
-  (let [first-user? (atom true)
-        turns (mapv (fn [{:keys [role content]}]
-                      (if (and (= role :user) @first-user?)
-                        (do
-                          (reset! first-user? false)
-                          (if (seq system-prompt)
-                            (str "<|turn>user\n" system-prompt "\n\n" content "\n<turn|>\n")
-                            (str "<|turn>user\n" content "\n<turn|>\n")))
-                        (str "<|turn>" (name role) "\n" content "\n<turn|>\n")))
-                    history)]
-    (str "<bos>" (str/join "" turns) "<|turn>model\n")))
+  "Formats conversation history into Gemma 4 Turn syntax, placing system instructions in the first user turn.
+   Applies sliding window context retention for long histories to preserve the initial task and alternating turns."
+  ([system-prompt history]
+   (format-agent-chat-prompt system-prompt history 8))
+  ([system-prompt history max-recent-turns]
+   (let [history-vec (vec history)
+         trimmed (if (<= (count history-vec) (inc max-recent-turns))
+                   history-vec
+                   (let [initial (first history-vec)
+                         tail-candidates (take-last max-recent-turns (rest history-vec))
+                         clean-tail (if (= (:role (first tail-candidates)) :user)
+                                      (vec (rest tail-candidates))
+                                      (vec tail-candidates))]
+                     (into [initial] clean-tail)))
+         first-user? (atom true)
+         turns (mapv (fn [{:keys [role content]}]
+                       (if (and (= role :user) @first-user?)
+                         (do
+                           (reset! first-user? false)
+                           (if (seq system-prompt)
+                             (str "<|turn>user\n" system-prompt "\n\n" content "\n<turn|>\n")
+                             (str "<|turn>user\n" content "\n<turn|>\n")))
+                         (str "<|turn>" (name role) "\n" content "\n<turn|>\n")))
+                     trimmed)]
+     (str "<bos>" (str/join "" turns) "<|turn>model\n"))))
 
 (defn run-agent-loop
   "Runs autonomous agent loop with SCI Clojure tool calling across multiple turns."
@@ -264,7 +277,7 @@
             _ (when-not (and model-dir (.exists (io/file model-dir)))
                 (println "Error: Gemma 4 model directory not found:" model-dir)
                 (System/exit 1))
-            max-seq-len (long (or (:max-seq-len opts) 512))
+            max-seq-len (long (or (:max-seq-len opts) 1024))
             opts (assoc opts :model-dir model-dir :model model-dir :mode :agent :max-seq-len max-seq-len)
             metrics-atom (atom {})
             trace-spans-atom (atom [])
