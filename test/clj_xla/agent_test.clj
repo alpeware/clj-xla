@@ -5,7 +5,8 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
-            [sci.core :as sci]))
+            [sci.core :as sci]
+            [scripts.gemma4-agent :as agent]))
 
 (defn extract-clojure-code-blocks
   "Extracts all ```clojure ... ``` code block strings from text, including unclosed blocks up to EOF."
@@ -69,3 +70,29 @@
                       res (eval-sci-code code)]
                   (and (= :success (:status res))
                        (= (str (+ a b)) (str/trim (:result res)))))))
+
+(deftest test-format-agent-chat-prompt-native-system
+  (testing "Formatting prompt produces native Gemma 4 <|turn>system turn"
+    (let [sys "You are an assistant."
+          history [{:role :user :content "Hello"}
+                   {:role :model :content "Hi there"}
+                   {:role :user :content "Write code"}]
+          prompt (agent/format-agent-chat-prompt sys history)]
+      (is (str/starts-with? prompt "<bos><|turn>system\nYou are an assistant.<turn|>\n"))
+      (is (str/includes? prompt "<|turn>user\nHello<turn|>\n"))
+      (is (str/includes? prompt "<|turn>model\nHi there<turn|>\n"))
+      (is (str/ends-with? prompt "<|turn>model\n"))))
+  (testing "Formatting prompt with empty system prompt omits system turn"
+    (let [history [{:role :user :content "Hello"}]
+          prompt (agent/format-agent-chat-prompt "" history)]
+      (is (str/starts-with? prompt "<bos><|turn>user\nHello<turn|>\n")))))
+
+(defspec prop-format-agent-chat-prompt-invariants
+  50
+  (prop/for-all [sys (gen/not-empty gen/string-alphanumeric)
+                 user-msg (gen/not-empty gen/string-alphanumeric)]
+                (let [prompt (agent/format-agent-chat-prompt sys [{:role :user :content user-msg}])]
+                  (and (str/starts-with? prompt "<bos><|turn>system\n")
+                       (str/includes? prompt (str "<|turn>user\n" user-msg "<turn|>\n"))
+                       (str/ends-with? prompt "<|turn>model\n")))))
+

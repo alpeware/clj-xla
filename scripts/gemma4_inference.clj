@@ -795,7 +795,9 @@
   ([session exec device-weights prompt-ids max-seq-len]
    (let [{:keys [opts]} session
          method (or (:method opts) (if (:vram-loop? session) :vram-loop :kv-cache))
-         vram-loop? (or (= method :vram-loop) (:vram-loop? opts))]
+         vram-loop? (if (contains? opts :vram-loop?)
+                      (:vram-loop? opts)
+                      (= method :vram-loop))]
      (cond
        vram-loop?
        (run-vram-loop-generation session exec device-weights prompt-ids (or max-seq-len (:max-seq-len session) 128))
@@ -907,10 +909,14 @@
   ([opts]
    (init-agent-vram-session opts (long (or (:max-seq-len opts) 1024))))
   ([opts max-seq-len]
-   (let [vram-loop? (if (contains? opts :vram-loop?)
+   (let [method (or (:method opts)
+                    (if (and (number? (:temperature opts)) (> (:temperature opts) 0.0))
+                      :kv-cache
+                      :vram-loop))
+         vram-loop? (if (contains? opts :vram-loop?)
                       (:vram-loop? opts)
-                      (not= (:method opts) :kv-cache))
-         opts (assoc opts :mode :agent :max-seq-len max-seq-len :vram-loop? vram-loop?)
+                      (= method :vram-loop))
+         opts (assoc opts :mode :agent :max-seq-len max-seq-len :method method :vram-loop? vram-loop?)
          session (init-inference-session opts)
          _ (when-not (:quiet opts) (println "Pinning Gemma 4 weights in PJRT VRAM..."))
          device-weights (allocate-device-weights session)

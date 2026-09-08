@@ -6,7 +6,17 @@
             [sci.core :as sci]))
 
 (def DEFAULT_SYSTEM_PROMPT
-  "You are an autonomous Clojure engineering assistant with a live SCI Clojure sandbox. Directly solve programming tasks by outputting executable Clojure code (Lisp s-expressions with parentheses, e.g. (defn ...)) enclosed in ```clojure ... ``` code blocks. Never use JavaScript or Python.")
+  "You are an autonomous Clojure engineering assistant with access to a live SCI Clojure sandbox environment.
+Solve programming tasks methodically:
+1. When you need to test, run, or verify code, output executable Clojure s-expressions enclosed in a single ```clojure ... ``` code block.
+2. The environment will execute your code in SCI and return the evaluation result in a Tool Execution Observation.
+3. If an error occurs, inspect the error message and output revised Clojure code in a ```clojure ... ``` block to fix it.
+4. When the observation demonstrates that your code has successfully solved the task, provide your final response to the user as plain text explaining the solution, without any code blocks. Never use JavaScript or Python.
+
+Clojure syntax rules:
+- Always use square brackets for parameter lists and bindings: `(defn f [x] ...)`, `(fn [x] ...)`, `(let [x 1] ...)`, `(loop [i 0] ...)`. Never use `lambda` or double parentheses `((var val))`.
+- For vectors, use `[...]`, `(vec ...)`, or `(filterv ...)`.
+- To generate integer sequences, use `(range start end)` or `(range n)`.")
 
 (def DEFAULT_AGENT_OPTS
   {:prompt "Write a Clojure function returning the first 10 integers."
@@ -17,6 +27,7 @@
    :temperature 0.0
    :top-k 10
    :repetition-penalty 1.15
+   :method nil
    :backend :cpu
    :precision :bf16
    :out "scratch/output_agent_loop.txt"
@@ -141,11 +152,12 @@
           (or (= arg "--model") (= arg "--model-dir"))
           (let [m (first more)]
             (recur (rest more) (assoc opts :model m :model-dir m)))
+          (= arg "--method") (recur (rest more) (assoc opts :method (keyword (first more))))
           (= arg "--quiet") (recur more (assoc opts :quiet true))
           :else (recur more opts))))))
 
 (defn format-agent-chat-prompt
-  "Formats conversation history into Gemma 4 Turn syntax, placing system instructions in the first user turn.
+  "Formats conversation history into Gemma 4 Turn syntax, placing system instructions in a native system turn.
    Applies sliding window context retention for long histories to preserve the initial task and alternating turns."
   ([system-prompt history]
    (format-agent-chat-prompt system-prompt history 8))
@@ -159,17 +171,12 @@
                                       (vec (rest tail-candidates))
                                       (vec tail-candidates))]
                      (into [initial] clean-tail)))
-         first-user? (atom true)
+         system-turn (when (seq system-prompt)
+                       (str "<|turn>system\n" (str/trim system-prompt) "<turn|>\n"))
          turns (mapv (fn [{:keys [role content]}]
-                       (if (and (= role :user) @first-user?)
-                         (do
-                           (reset! first-user? false)
-                           (if (seq system-prompt)
-                             (str "<|turn>user\n" system-prompt "\n\n" content "\n<turn|>\n")
-                             (str "<|turn>user\n" content "\n<turn|>\n")))
-                         (str "<|turn>" (name role) "\n" content "\n<turn|>\n")))
+                       (str "<|turn>" (name role) "\n" (str/trim content) "<turn|>\n"))
                      trimmed)]
-     (str "<bos>" (str/join "" turns) "<|turn>model\n"))))
+     (str "<bos>" system-turn (str/join "" turns) "<|turn>model\n"))))
 
 (defn run-agent-loop
   "Runs autonomous agent loop with SCI Clojure tool calling across multiple turns."
@@ -250,7 +257,10 @@
                     t-tool-1 (System/nanoTime)
                     tool-ms (/ (- t-tool-1 t-tool-0) 1e6)
                     turn-total-ms (+ gen-ms tool-ms)
-                    obs-str (str "Tool Execution Observation:\n" (:output eval-res))]
+                    obs-str (if (= (:status eval-res) :success)
+                              (str "Tool Execution Observation:\n" (:output eval-res)
+                                   "\n[Note: If this output answers the request, provide your final response in plain text without code blocks.]")
+                              (str "Tool Execution Observation:\n" (:output eval-res)))]
 
                 (swap! turn-telemetry conj {:turn turn :model-ms gen-ms :tool-ms tool-ms :total-turn-ms turn-total-ms})
                 (when-not quiet
