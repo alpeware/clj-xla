@@ -47,7 +47,9 @@
            (= (first eqn) :subtract)
            (= (first eqn) :*)
            (= (first eqn) :multiply)
-           (= (first eqn) :convert))
+           (= (first eqn) :convert)
+           (= (first eqn) :fwht)
+           (= (first eqn) :rht))
        (let [head (ast/head eqn)
              head-name (if (vector? head) (first head) head)
              head-idxs (when (vector? head) (vec (rest head)))
@@ -60,6 +62,21 @@
                          first-body-shape
                          first-body-shape))]
          (assoc known-shapes head-name (vec shape)))
+
+       (= (first eqn) :quip-dequant)
+       (let [head (ast/head eqn)
+             head-name (if (vector? head) (first head) head)
+             attrs (ast/attrs eqn)
+             body (ast/body-terms eqn)
+             codes-name (first (first body))
+             cb-name (first (second body))
+             codes-shape (get known-shapes codes-name [1 1])
+             cb-shape (get known-shapes cb-name [256 8])
+             k (first codes-shape)
+             n8 (second codes-shape)
+             dim8 (if (>= (count cb-shape) 2) (second cb-shape) 8)
+             out-shape (or (:shape attrs) [k (* n8 dim8)])]
+         (assoc known-shapes head-name (vec out-shape)))
 
        (= (first eqn) :argmax)
        (let [head (ast/head eqn)

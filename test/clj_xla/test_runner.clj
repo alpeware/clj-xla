@@ -23,6 +23,7 @@
             [clj-xla.logic.index-test]
             [clj-xla.logic.lower-test]
             [clj-xla.logic.nn-test]
+            [clj-xla.logic.quip-test]
             [clj-xla.logic.shape-test]
             [clj-xla.logic.smollm-test]
             [clj-xla.opt-test]
@@ -76,6 +77,7 @@
                            'clj-xla.logic.index-test
                            'clj-xla.logic.lower-test
                            'clj-xla.logic.nn-test
+                           'clj-xla.logic.quip-test
                            'clj-xla.logic.shape-test
                            'clj-xla.logic.smollm-test
                            'clj-xla.core-test)

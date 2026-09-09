@@ -588,6 +588,118 @@
        (swap! eqns-atom conj concat-pass-eqn))
      (swap! eqns-atom conj back-trans-eqn final-eqn))))
 
+(defn- lower-fwht! [eqns-atom counter _head in-term attrs final-out-var known-shapes]
+  (let [in-name (first in-term)
+        shape (get known-shapes in-name)
+        rank (count shape)
+        raw-axis (long (or (:axis attrs) (dec rank)))
+        axis (if (neg? raw-axis) (+ rank raw-axis) raw-axis)
+        d (nth shape axis)
+        k (long (/ (Math/log d) (Math/log 2)))
+        _ (assert (= d (bit-shift-left 1 k)) (str "FWHT dimension must be a power of 2, got: " d))
+        leading-dims (subvec (vec shape) 0 axis)
+        batch-size (long (reduce * 1 leading-dims))
+        r-in (gen-id "t_fwht_in" counter)
+        r-in-eqn {:op :stablehlo/reshape
+                  :invars [in-name]
+                  :outvars [r-in]
+                  :attrs {:shape [batch-size d]}}
+        _ (swap! eqns-atom conj r-in-eqn)
+        unscaled-var
+        (loop [s 0
+               cur-var r-in]
+          (if (= s k)
+            cur-var
+            (let [stride (bit-shift-left 1 s)
+                  chunks (long (/ d (* 2 stride)))
+                  r1-var (gen-id (str "t_fwht_s" s "_r1") counter)
+                  r1-eqn {:op :stablehlo/reshape
+                          :invars [cur-var]
+                          :outvars [r1-var]
+                          :attrs {:shape [batch-size chunks 2 stride]}}
+                  a-var (gen-id (str "t_fwht_s" s "_a") counter)
+                  a-eqn {:op :stablehlo/slice
+                         :invars [r1-var]
+                         :outvars [a-var]
+                         :attrs {:start_indices [0 0 0 0]
+                                 :limit_indices [batch-size chunks 1 stride]
+                                 :strides [1 1 1 1]}}
+                  b-var (gen-id (str "t_fwht_s" s "_b") counter)
+                  b-eqn {:op :stablehlo/slice
+                         :invars [r1-var]
+                         :outvars [b-var]
+                         :attrs {:start_indices [0 0 1 0]
+                                 :limit_indices [batch-size chunks 2 stride]
+                                 :strides [1 1 1 1]}}
+                  sum-var (gen-id (str "t_fwht_s" s "_sum") counter)
+                  sum-eqn {:op :stablehlo/add :invars [a-var b-var] :outvars [sum-var]}
+                  diff-var (gen-id (str "t_fwht_s" s "_diff") counter)
+                  diff-eqn {:op :stablehlo/subtract :invars [a-var b-var] :outvars [diff-var]}
+                  cat-var (gen-id (str "t_fwht_s" s "_cat") counter)
+                  cat-eqn {:op :stablehlo/concatenate :invars [sum-var diff-var] :outvars [cat-var]
+                           :attrs {:dimension 2}}
+                  r2-var (gen-id (str "t_fwht_s" s "_r2") counter)
+                  r2-eqn {:op :stablehlo/reshape
+                          :invars [cat-var]
+                          :outvars [r2-var]
+                          :attrs {:shape [batch-size d]}}]
+              (swap! eqns-atom conj r1-eqn a-eqn b-eqn sum-eqn diff-eqn cat-eqn r2-eqn)
+              (recur (inc s) r2-var))))
+        normalized? (get attrs :normalized? true)
+        scaled-var (if normalized?
+                     (let [scale (double (or (:scale attrs) (/ 1.0 (Math/sqrt (double d)))))
+                           c-scale (gen-id "c_fwht_scale" counter)
+                           c-eqn {:op :stablehlo/constant :value scale :outvars [c-scale]}
+                           mul-var (gen-id "t_fwht_scaled" counter)
+                           mul-eqn {:op :stablehlo/multiply :invars [unscaled-var c-scale] :outvars [mul-var]}]
+                       (swap! eqns-atom conj c-eqn mul-eqn)
+                       mul-var)
+                     unscaled-var)
+        out-reshape-eqn {:op :stablehlo/reshape
+                         :invars [scaled-var]
+                         :outvars [final-out-var]
+                         :attrs {:shape (vec shape)}}]
+    (swap! eqns-atom conj out-reshape-eqn)))
+
+(defn- lower-rht! [eqns-atom counter head in-term signs-term attrs final-out-var known-shapes]
+  (let [in-name (first in-term)
+        signs-name (first signs-term)
+        inverse? (:inverse? attrs)
+        shape (get known-shapes in-name)]
+    (if inverse?
+      (let [had-var (gen-id "t_rht_had" counter)
+            _ (lower-fwht! eqns-atom counter head in-term attrs had-var known-shapes)
+            mul-eqn {:op :stablehlo/multiply :invars [had-var signs-name] :outvars [final-out-var]}]
+        (swap! eqns-atom conj mul-eqn))
+      (let [scaled-var (gen-id "t_rht_scaled" counter)
+            mul-eqn {:op :stablehlo/multiply :invars [in-name signs-name] :outvars [scaled-var]}
+            _ (swap! eqns-atom conj mul-eqn)]
+        (lower-fwht! eqns-atom counter head [scaled-var] attrs final-out-var (assoc known-shapes scaled-var shape))))))
+
+(defn- lower-quip-dequant! [eqns-atom counter _head codes-term cb-term scales-term _attrs final-out-var known-shapes]
+  (let [codes-name (first codes-term)
+        cb-name (first cb-term)
+        scales-name (when scales-term (first scales-term))
+        codes-shape (get known-shapes codes-name)
+        cb-shape (get known-shapes cb-name)
+        k (first codes-shape)
+        n8 (second codes-shape)
+        dim8 (if (>= (count cb-shape) 2) (second cb-shape) 8)
+        n (* n8 dim8)
+        expanded-shape [k n8 1]
+        r-idx (gen-id "t_quip_idx_r" counter)
+        r-idx-eqn {:op :stablehlo/reshape :invars [codes-name] :outvars [r-idx] :attrs {:shape expanded-shape}}
+        gathered (gen-id "t_quip_gathered" counter)
+        gather-eqn {:op :stablehlo/gather :invars [cb-name r-idx] :outvars [gathered]
+                    :attrs {:offset_dims [2] :collapsed_slice_dims [0] :start_index_map [0]
+                            :index_vector_dim 2 :slice_sizes [1 dim8]}}
+        r-w (if scales-name (gen-id "t_quip_w_flat" counter) final-out-var)
+        r-w-eqn {:op :stablehlo/reshape :invars [gathered] :outvars [r-w] :attrs {:shape [k n]}}]
+    (swap! eqns-atom conj r-idx-eqn gather-eqn r-w-eqn)
+    (when scales-name
+      (let [mul-eqn {:op :stablehlo/multiply :invars [r-w scales-name] :outvars [final-out-var]}]
+        (swap! eqns-atom conj mul-eqn)))))
+
 (defn ast->graph
   "Compiles a Tensor Logic Hiccup AST into a validated EDN SSA graph for OpenXLA compilation.
    Pipeline: expand -> prune (DCE) -> unify shapes -> lower to dot_general & StableHLO ops."
@@ -678,6 +790,15 @@
 
           (= op :rope)
           (lower-rope! eqns-atom counter head (first body) attrs final-var known-shapes default-dtype)
+
+          (= op :fwht)
+          (lower-fwht! eqns-atom counter head (first body) attrs final-var known-shapes)
+
+          (= op :rht)
+          (lower-rht! eqns-atom counter head (first body) (second body) attrs final-var known-shapes)
+
+          (= op :quip-dequant)
+          (lower-quip-dequant! eqns-atom counter head (first body) (second body) (nth body 2 nil) attrs final-var known-shapes)
 
           (= op :while)
           (let [out-spec (second eqn)
