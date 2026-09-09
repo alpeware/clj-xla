@@ -2,6 +2,15 @@
   "Autoregressive token-by-token generation strategy."
   (:require [clj-xla.sampling :as sampling]))
 
+(defn common-prefix-len
+  "Returns the number of leading items shared by sequences xs and ys."
+  [xs ys]
+  (let [n (min (count xs) (count ys))]
+    (loop [i 0]
+      (if (and (< i n) (= (nth xs i) (nth ys i)))
+        (recur (inc i))
+        i))))
+
 (defn init-kv-caches
   "Pre-allocates empty KV-cache descriptors up to `max-seq-len` for `num-layers`."
   ([num-layers _shape]

@@ -222,3 +222,63 @@
       (xla/destroy-buffer! k-out-buf)
       (xla/destroy-buffer! v-out-buf))))
 
+(defspec prop-layer-is-global-schedules 50
+  (prop/for-all [layer-idx (gen/choose 0 41)]
+                (let [e2b-types nil
+                      e4b-types (vec (mapcat (fn [_] (concat (repeat 5 "sliding_attention") ["full_attention"])) (range 7)))
+                      e2b-res (gemma/layer-is-global? e2b-types layer-idx)
+                      e4b-res (gemma/layer-is-global? e4b-types layer-idx)]
+                  (and (= e2b-res (zero? (mod (inc layer-idx) 5)))
+                       (= e4b-res (= 5 (mod layer-idx 6)))))))
+
+(deftest test-gemma4-prefill-lowering
+  (let [num-layers 1
+        max-seq-len 8
+        vocab-size 1000
+        hidden-dim 1536
+        intermediate-dim 6144
+        pl-dim 256
+        total-pl-dim 256
+        config {:vocab-size vocab-size
+                :hidden-dim hidden-dim
+                :intermediate-dim intermediate-dim
+                :pl-dim pl-dim
+                :total-pl-dim total-pl-dim
+                :num-layers num-layers
+                :num-heads 8
+                :num-kv-heads 1
+                :head-dim 256
+                :max-seq-len max-seq-len
+                :last-token-only? true}
+        invars [[:x [:tensor [1 max-seq-len] :i32]]
+                [:pos [:tensor [1] :i32]]
+                [:embed_tokens [:tensor [vocab-size hidden-dim] :f32]]
+                [:embed_tokens_per_layer [:tensor [vocab-size total-pl-dim] :f32]]
+                [:per_layer_model_projection [:tensor [total-pl-dim hidden-dim] :f32]]
+                [:per_layer_projection_norm [:tensor [pl-dim] :f32]]
+                [:final_norm_w [:tensor [hidden-dim] :f32]]
+                [:input_ln_w_0 [:tensor [hidden-dim] :f32]]
+                [:layer_scalar_0 [:tensor [1] :f32]]
+                [:q_w_0 [:tensor [2048 hidden-dim] :f32]]
+                [:k_w_0 [:tensor [256 hidden-dim] :f32]]
+                [:v_w_0 [:tensor [256 hidden-dim] :f32]]
+                [:o_w_0 [:tensor [hidden-dim 2048] :f32]]
+                [:q_norm_w_0 [:tensor [256] :f32]]
+                [:k_norm_w_0 [:tensor [256] :f32]]
+                [:post_attn_ln_w_0 [:tensor [hidden-dim] :f32]]
+                [:pre_mlp_ln_w_0 [:tensor [hidden-dim] :f32]]
+                [:post_mlp_ln_w_0 [:tensor [hidden-dim] :f32]]
+                [:gate_w_0 [:tensor [intermediate-dim hidden-dim] :f32]]
+                [:up_w_0 [:tensor [intermediate-dim hidden-dim] :f32]]
+                [:down_w_0 [:tensor [hidden-dim intermediate-dim] :f32]]
+                [:per_layer_gate_w_0 [:tensor [pl-dim hidden-dim] :f32]]
+                [:per_layer_proj_w_0 [:tensor [hidden-dim pl-dim] :f32]]
+                [:post_per_layer_norm_w_0 [:tensor [hidden-dim] :f32]]]
+        ast (gemma/gemma4-model-ast config)
+        graph (lower/ast->graph "gemma4_prefill" invars ast [:logits :k_ro_0 :v_heads_0])]
+    (is (shlo/validate-graph graph))
+    (is (= [:logits :k_ro_0 :v_heads_0] (:outvars graph)))
+    (let [ctx (xla/get-context)
+          compiled (xla/compile-graph ctx graph)]
+      (is (some? compiled)))))
+

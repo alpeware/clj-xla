@@ -124,13 +124,21 @@
       :per-layer-proj-w       (str prefix "per_layer_projection.weight")
       :post-per-layer-norm-w  (str prefix "post_per_layer_input_norm.weight")})))
 
+(defn layer-is-global?
+  "Determines whether layer `layer-idx` is a full global attention layer or sliding window layer."
+  [layer-types layer-idx]
+  (if (seq layer-types)
+    (let [t (nth layer-types layer-idx nil)]
+      (or (= t "full_attention") (= t :full_attention)))
+    (zero? (mod (inc layer-idx) 5))))
+
 (defn gemma4-layer-ast
   "Generates Tensor Logic Hiccup AST for Gemma 4 Transformer layer block `layer-idx`."
   ([layer-idx max-seq-len config]
    (gemma4-layer-ast layer-idx max-seq-len config {}))
   ([layer-idx max-seq-len config layer-opts]
    (let [i layer-idx
-         {:keys [num-heads num-kv-heads pl-dim total-pl-dim layer-types]} config
+         {:keys [num-heads num-kv-heads pl-dim total-pl-dim layer-types layer-configs]} config
          is-shared? (:is-shared? layer-opts)
          shared-k (:shared-k layer-opts)
          shared-v (:shared-v layer-opts)
@@ -140,13 +148,12 @@
          total-pl-dim (long (or total-pl-dim (* 35 pl-dim)))
          has-ple? (pos? total-pl-dim)
 
-         l-type (if layer-types (nth layer-types i nil) nil)
-         is-global? (or (= l-type "full_attention")
-                        (= l-type :full_attention)
-                        (zero? (mod (inc i) 5)))
-         head-dim (long (if is-global?
-                          (or (:global-head-dim config) 512)
-                          (or (:head-dim config) 256)))
+         is-global? (layer-is-global? layer-types i)
+         head-dim (long (if (seq layer-configs)
+                          (:head-dim (nth layer-configs i))
+                          (if is-global?
+                            (or (:global-head-dim config) 512)
+                            (or (:head-dim config) 256))))
          q-dim (* num-heads head-dim)
          kv-dim (* num-kv-heads head-dim)
          group-size (quot num-heads num-kv-heads)
@@ -308,7 +315,7 @@
   "Generates full Gemma 4 model forward pass in pure Tensor Logic Hiccup AST."
   [config]
   (let [cfg (merge (gemma4-config :e2b) config)
-        {:keys [num-layers max-seq-len hidden-dim pl-dim total-pl-dim final-logit-softcap num-kv-shared-layers]} cfg
+        {:keys [num-layers max-seq-len hidden-dim pl-dim total-pl-dim final-logit-softcap num-kv-shared-layers layer-types]} cfg
         num-layers (long (or num-layers 35))
         num-kv-shared (long (or num-kv-shared-layers 0))
         num-unshared (- num-layers num-kv-shared)
@@ -320,8 +327,8 @@
         has-ple? (pos? total-pl-dim)
         h-final (keyword (str "h" num-layers))
 
-        last-unshared-sliding (when has-shared-kv? (last (filter #(not= (mod (inc %) 5) 0) (range num-unshared))))
-        last-unshared-full (when has-shared-kv? (last (filter #(= (mod (inc %) 5) 0) (range num-unshared))))]
+        last-unshared-sliding (when has-shared-kv? (last (filter #(not (layer-is-global? layer-types %)) (range num-unshared))))
+        last-unshared-full (when has-shared-kv? (last (filter #(layer-is-global? layer-types %) (range num-unshared))))]
     [:block {:name :full_gemma4_model}
      ;; 1. Token Embedding Lookup (scaled by sqrt(hidden-dim))
      [:gather [:tok_embed_raw :b :p :d] [:embed_tokens :v :d] [:x :b :p]]
@@ -351,7 +358,7 @@
      ;; 3. Sequential Transformer Layer Blocks
      (mapv (fn [i]
              (let [is-shared? (and has-shared-kv? (>= i num-unshared))
-                   is-global? (zero? (mod (inc i) 5))
+                   is-global? (layer-is-global? layer-types i)
                    shared-k (when is-shared?
                               (if is-global?
                                 (keyword (str "k_ro_" last-unshared-full))
@@ -390,7 +397,7 @@
    (gemma4-kv-layer-ast layer-idx max-seq-len config {}))
   ([layer-idx max-seq-len config layer-opts]
    (let [i layer-idx
-         {:keys [num-heads num-kv-heads pl-dim total-pl-dim layer-types]} config
+         {:keys [num-heads num-kv-heads pl-dim total-pl-dim layer-types layer-configs]} config
          is-shared? (:is-shared? layer-opts)
          shared-k (:shared-k layer-opts)
          shared-v (:shared-v layer-opts)
@@ -400,13 +407,12 @@
          total-pl-dim (long (or total-pl-dim (* 35 pl-dim)))
          has-ple? (pos? total-pl-dim)
 
-         l-type (if layer-types (nth layer-types i nil) nil)
-         is-global? (or (= l-type "full_attention")
-                        (= l-type :full_attention)
-                        (zero? (mod (inc i) 5)))
-         head-dim (long (if is-global?
-                          (or (:global-head-dim config) 512)
-                          (or (:head-dim config) 256)))
+         is-global? (layer-is-global? layer-types i)
+         head-dim (long (if (seq layer-configs)
+                          (:head-dim (nth layer-configs i))
+                          (if is-global?
+                            (or (:global-head-dim config) 512)
+                            (or (:head-dim config) 256))))
          q-dim (* num-heads head-dim)
          kv-dim (* num-kv-heads head-dim)
          group-size (quot num-heads num-kv-heads)
@@ -578,7 +584,7 @@
   "Generates single-token step Gemma 4 model forward pass with persistent KV-Cache in pure Tensor Logic Hiccup AST."
   [config]
   (let [cfg (merge (gemma4-config :e2b) config)
-        {:keys [num-layers max-seq-len hidden-dim pl-dim total-pl-dim final-logit-softcap num-kv-shared-layers]} cfg
+        {:keys [num-layers max-seq-len hidden-dim pl-dim total-pl-dim final-logit-softcap num-kv-shared-layers layer-types]} cfg
         num-layers (long (or num-layers 35))
         num-kv-shared (long (or num-kv-shared-layers 0))
         num-unshared (- num-layers num-kv-shared)
@@ -590,8 +596,8 @@
         has-ple? (pos? total-pl-dim)
         h-final (keyword (str "h" num-layers))
 
-        last-unshared-sliding (when has-shared-kv? (last (filter #(not= (mod (inc %) 5) 0) (range num-unshared))))
-        last-unshared-full (when has-shared-kv? (last (filter #(= (mod (inc %) 5) 0) (range num-unshared))))]
+        last-unshared-sliding (when has-shared-kv? (last (filter #(not (layer-is-global? layer-types %)) (range num-unshared))))
+        last-unshared-full (when has-shared-kv? (last (filter #(layer-is-global? layer-types %) (range num-unshared))))]
     [:block {:name :gemma4_kv_step_model}
      ;; 1. Token Embedding Lookup for single token [1 1]
      [:gather [:tok_embed_raw :b :p :d] [:embed_tokens :v :d] [:x :b :p]]
@@ -620,7 +626,7 @@
      ;; 3. Sequential Transformer Layer Blocks with KV Cache
      (mapv (fn [i]
              (let [is-shared? (and has-shared-kv? (>= i num-unshared))
-                   is-global? (zero? (mod (inc i) 5))
+                   is-global? (layer-is-global? layer-types i)
                    shared-k (when is-shared?
                               (if is-global?
                                 (keyword (str "k_cache_out_" last-unshared-full))

@@ -205,7 +205,8 @@
   "Initializes PJRT runtime, loads safetensors weights, and prepares model configuration for Gemma 4 REPL/CLI sessions."
   ([opts]
    (let [opts (merge DEFAULT_CLI_OPTS opts)
-         {:keys [backend precision model-dir]} opts
+         {:keys [backend precision]} opts
+         model-dir (or (:model-dir opts) (:model opts))
          ctx (xla/init-backend! (or backend :cpu))
          dirs (if model-dir (cons model-dir DEFAULT_MODEL_DIRS) DEFAULT_MODEL_DIRS)
          resolved-model-dir (find-model-dir dirs)
@@ -290,6 +291,7 @@
                :num-kv-heads num-kv-heads
                :head-dim head-dim
                :max-seq-len max-seq-len
+               :layer-types layer-types-cfg
                :layer-configs layer-configs
                :num-kv-shared-layers num-kv-shared-layers
                :weight-dtype weight-dtype
@@ -402,14 +404,14 @@
 (defn build-gemma4-kv-invars
   "Constructs EDN SSA signature invars for single-token Gemma 4 forward pass with KV Cache."
   [config max-seq-len]
-  (let [{:keys [num-layers num-kv-shared-layers weight-dtype is-int8 layer-configs]} config
+  (let [{:keys [num-layers num-kv-shared-layers weight-dtype is-int8 layer-configs layer-types]} config
         norm-dtype (if is-int8 :bf16 weight-dtype)
         num-layers (long (or num-layers 35))
         num-kv-shared (long (or num-kv-shared-layers 0))
         num-unshared (- num-layers num-kv-shared)
         kv-invars (mapcat (fn [i]
                             (let [cfg (if (seq layer-configs) (nth layer-configs i nil) nil)
-                                  is-global? (zero? (mod (inc i) 5))
+                                  is-global? (if cfg (:is-global? cfg) (gemma-logic/layer-is-global? layer-types i))
                                   h-dim (or (:head-dim cfg) (if is-global? 512 256))
                                   n-kv (or (:num-kv-heads cfg) 1)]
                               [[(keyword (str "k_cache_in_" i)) [:tensor [1 max-seq-len n-kv h-dim] norm-dtype]]
@@ -433,16 +435,46 @@
                              (range num-unshared))]
     (vec (into [:logits] out-kv-heads))))
 
+(defn build-gemma4-prefill-outvars
+  "Constructs output variable list for Gemma 4 prefill: [:logits k_ro_0 v_heads_0 ...]."
+  [config]
+  (let [num-layers (long (or (:num-layers config) 35))
+        num-kv-shared (long (or (:num-kv-shared-layers config) 0))
+        num-unshared (- num-layers num-kv-shared)
+        kv-outs (mapcat (fn [i]
+                          [(keyword (str "k_ro_" i))
+                           (keyword (str "v_heads_" i))])
+                        (range num-unshared))]
+    (vec (into [:logits] kv-outs))))
+
+(defn compile-gemma4-prefill-executable
+  "Compiles Gemma 4 model AST into a native StableHLO MLIR prefill executable that produces
+   the next-token logits and initial populated KV cache tensors in a single parallel step."
+  [{:keys [ctx config opts]} max-seq-len]
+  (let [cfg (assoc config :max-seq-len max-seq-len :last-token-only? true)
+        invars (build-tensor-logic-invars cfg max-seq-len)
+        targets (build-gemma4-prefill-outvars cfg)
+        ast (gemma-logic/gemma4-model-ast cfg)
+        _ (when-not (:quiet opts)
+            (println (format "Lowering declarative Tensor Logic Gemma 4 Prefill (%d layers, max-seq-len=%d) to StableHLO..."
+                             (:num-layers config) max-seq-len)))
+        graph (lower/ast->graph "gemma4_prefill" invars ast targets)]
+    (when-not (:quiet opts)
+      (println "Compiling Gemma 4 Prefill graph to native XLA PjRtLoadedExecutable..."))
+    (xla/compile-graph ctx graph)))
+
 (defn allocate-kv-cache-buffers
   "Allocates initial zero-filled device VRAM buffers for KV cache of unshared layers."
   [{:keys [ctx config]} max-seq-len]
   (let [num-layers (long (or (:num-layers config) 35))
         num-kv-shared (long (or (:num-kv-shared-layers config) 0))
         num-unshared (- num-layers num-kv-shared)
-        norm-enum (or (:norm-enum config) 13)]
+        norm-enum (or (:norm-enum config) 13)
+        layer-configs (:layer-configs config)
+        layer-types (:layer-types config)]
     (vec (mapcat (fn [i]
-                   (let [c (if (seq (:layer-configs config)) (nth (:layer-configs config) i nil) nil)
-                         is-global? (zero? (mod (inc i) 5))
+                   (let [c (if (seq layer-configs) (nth layer-configs i nil) nil)
+                         is-global? (if c (:is-global? c) (gemma-logic/layer-is-global? layer-types i))
                          n-kv (long (or (:num-kv-heads c) 1))
                          h-dim (long (or (:head-dim c) (if is-global? 512 256)))
                          zeros (float-array (* max-seq-len n-kv h-dim))]
@@ -692,11 +724,21 @@
          (println "------------------------------------------------------------------\n")))
      @cur-tokens)))
 
+(defn common-prefix-len
+  "Returns the number of leading items shared by sequences xs and ys."
+  [xs ys]
+  (let [n (min (count xs) (count ys))]
+    (loop [i 0]
+      (if (and (< i n) (= (nth xs i) (nth ys i)))
+        (recur (inc i))
+        i))))
+
 (defn run-cached-kv-generation
-  "Executes autoregressive generation with in-VRAM KV-Cache using single-token step executable."
+  "Executes autoregressive generation with in-VRAM KV-Cache using single-token step executable
+   and 1-shot parallel prefill."
   ([session exec device-weights prompt-ids]
    (run-cached-kv-generation session exec device-weights prompt-ids nil))
-  ([{:keys [ctx opts config tokenizer] :as session} exec device-weights prompt-ids max-seq-len]
+  ([{:keys [ctx opts config tokenizer kv-state prefill-executable] :as session} exec device-weights prompt-ids max-seq-len]
    (let [{:keys [max-new-tokens quiet mode]} opts
          is-agent? (= mode :agent)
          seq-len (long (or max-seq-len (:max-seq-len config) 512))
@@ -706,38 +748,108 @@
          num-kv-shared (long (or (:num-kv-shared-layers config) 0))
          num-unshared (- num-layers num-kv-shared)
          num-outs (inc (* 2 num-unshared))
-         prompt-count (count prompt-ids)
-         initial-kv (allocate-kv-cache-buffers session seq-len)
+         raw-prompt-count (count prompt-ids)
+         safe-prompt-count (min raw-prompt-count (max 0 (- seq-len 2)))
+         clamped-prompt-ids (if (< safe-prompt-count raw-prompt-count)
+                              (subvec (vec prompt-ids) (- raw-prompt-count safe-prompt-count))
+                              (vec prompt-ids))
+         prompt-count (count clamped-prompt-ids)
+         prefill-exec (or prefill-executable (:prefill-executable session))
+         is-persistent? (some? kv-state)
+         prior-cache (when is-persistent? @kv-state)
+         p-match (if (and prior-cache (:cached-tokens prior-cache) (seq (:kv-buffers prior-cache)))
+                   (common-prefix-len (:cached-tokens prior-cache) clamped-prompt-ids)
+                   0)
+         _ (when (and is-persistent? prior-cache (zero? p-match))
+             (doseq [b (:kv-buffers prior-cache)] (xla/destroy-buffer! ctx b))
+             (reset! kv-state nil))
+         initial-kv (cond
+                      (pos? p-match)
+                      (:kv-buffers prior-cache)
+
+                      (some? prefill-exec)
+                      nil
+
+                      :else
+                      (allocate-kv-cache-buffers session seq-len))
          kv-buffers-atom (atom initial-kv)
          x-arr (int-array 1)
          pos-arr (int-array 1)
          t0 (System/nanoTime)]
      (try
-       ;; Phase 1: Prefill prompt tokens sequentially into KV cache
-       (let [last-logits
-             (loop [p 0
-                    cur-logits nil]
-               (if (< p prompt-count)
-                 (let [tok (int (nth prompt-ids p))
-                       _ (aset x-arr 0 tok)
-                       _ (aset pos-arr 0 p)
-                       x-b (xla/buffer-from-host-buffer ctx (:client ctx) x-arr [1 1] 4)
-                       pos-b (xla/buffer-from-host-buffer ctx (:client ctx) pos-arr [1] 4)
-                       step-inputs (into [x-b pos-b] (concat @kv-buffers-atom device-weights))
-                       outs (pjrt/execute-executable ctx (or (:handle exec) exec) step-inputs num-outs)
-                       _ (xla/destroy-buffer! ctx x-b)
-                       _ (xla/destroy-buffer! ctx pos-b)
-                       outs-vec (if (vector? outs) outs [outs])
-                       new-logits (first outs-vec)
-                       new-kv (vec (subvec outs-vec 1))
-                       old-kv @kv-buffers-atom]
-                   (when cur-logits (xla/destroy-buffer! ctx cur-logits))
-                   (doseq [b old-kv] (xla/destroy-buffer! ctx b))
-                   (reset! kv-buffers-atom new-kv)
-                   (recur (inc p) new-logits))
-                 cur-logits))
-             t-prefill-end (System/nanoTime)
-             cur-tokens (atom (vec prompt-ids))
+       ;; Phase 1: Prefill prompt tokens into KV cache
+       (let [[last-logits t-prefill-end]
+             (cond
+               ;; Path A: Cache hit from token 0 to p-match (delta prefill via step executable)
+               (pos? p-match)
+               (let [start-p (if (= p-match prompt-count) (max 0 (dec prompt-count)) p-match)
+                     cur-log (loop [p start-p
+                                    cur-logits nil]
+                               (if (< p prompt-count)
+                                 (let [tok (int (nth clamped-prompt-ids p))
+                                       _ (aset x-arr 0 tok)
+                                       _ (aset pos-arr 0 p)
+                                       x-b (xla/buffer-from-host-buffer ctx (:client ctx) x-arr [1 1] 4)
+                                       pos-b (xla/buffer-from-host-buffer ctx (:client ctx) pos-arr [1] 4)
+                                       step-inputs (into [x-b pos-b] (concat @kv-buffers-atom device-weights))
+                                       outs (pjrt/execute-executable ctx (or (:handle exec) exec) step-inputs num-outs)
+                                       _ (xla/destroy-buffer! ctx x-b)
+                                       _ (xla/destroy-buffer! ctx pos-b)
+                                       outs-vec (if (vector? outs) outs [outs])
+                                       new-logits (first outs-vec)
+                                       new-kv (vec (subvec outs-vec 1))
+                                       old-kv @kv-buffers-atom]
+                                   (when cur-logits (xla/destroy-buffer! ctx cur-logits))
+                                   (when (not= old-kv (:kv-buffers prior-cache))
+                                     (doseq [b old-kv] (xla/destroy-buffer! ctx b)))
+                                   (reset! kv-buffers-atom new-kv)
+                                   (recur (inc p) new-logits))
+                                 cur-logits))]
+                 [cur-log (System/nanoTime)])
+
+               ;; Path B: 1-Shot Parallel Prefill
+               (some? prefill-exec)
+               (let [in-arr (int-array seq-len)
+                     _ (dotimes [i prompt-count] (aset in-arr i (int (nth clamped-prompt-ids i))))
+                     pos-p (int-array [(dec prompt-count)])
+                     in-b (xla/buffer-from-host-buffer ctx (:client ctx) in-arr [1 seq-len] 4)
+                     pos-b (xla/buffer-from-host-buffer ctx (:client ctx) pos-p [1] 4)
+                     step-inputs (into [in-b pos-b] device-weights)
+                     outs (pjrt/execute-executable ctx (or (:handle prefill-exec) prefill-exec) step-inputs num-outs)
+                     _ (xla/destroy-buffer! ctx in-b)
+                     _ (xla/destroy-buffer! ctx pos-b)
+                     outs-vec (if (vector? outs) outs [outs])
+                     prefill-logits (first outs-vec)
+                     prefill-kv (vec (subvec outs-vec 1))]
+                 (reset! kv-buffers-atom prefill-kv)
+                 [prefill-logits (System/nanoTime)])
+
+               ;; Path C: Sequential fallback prefill
+               :else
+               (let [cur-log (loop [p 0
+                                    cur-logits nil]
+                               (if (< p prompt-count)
+                                 (let [tok (int (nth clamped-prompt-ids p))
+                                       _ (aset x-arr 0 tok)
+                                       _ (aset pos-arr 0 p)
+                                       x-b (xla/buffer-from-host-buffer ctx (:client ctx) x-arr [1 1] 4)
+                                       pos-b (xla/buffer-from-host-buffer ctx (:client ctx) pos-arr [1] 4)
+                                       step-inputs (into [x-b pos-b] (concat @kv-buffers-atom device-weights))
+                                       outs (pjrt/execute-executable ctx (or (:handle exec) exec) step-inputs num-outs)
+                                       _ (xla/destroy-buffer! ctx x-b)
+                                       _ (xla/destroy-buffer! ctx pos-b)
+                                       outs-vec (if (vector? outs) outs [outs])
+                                       new-logits (first outs-vec)
+                                       new-kv (vec (subvec outs-vec 1))
+                                       old-kv @kv-buffers-atom]
+                                   (when cur-logits (xla/destroy-buffer! ctx cur-logits))
+                                   (doseq [b old-kv] (xla/destroy-buffer! ctx b))
+                                   (reset! kv-buffers-atom new-kv)
+                                   (recur (inc p) new-logits))
+                                 cur-logits))]
+                 [cur-log (System/nanoTime)]))
+
+             cur-tokens (atom (vec clamped-prompt-ids))
              max-tokens (long (or max-new-tokens 256))]
          ;; Phase 2: Autoregressive decode loop
          (loop [step prompt-count
@@ -747,7 +859,7 @@
              (when cur-logits (xla/destroy-buffer! ctx cur-logits))
              (let [logits-data (xla/to-host-slice cur-logits 0 vocab-size vocab-size weight-dt)
                    _ (xla/destroy-buffer! ctx cur-logits)
-                   next-id (sample-next-token logits-data opts prompt-ids (subvec @cur-tokens prompt-count))]
+                   next-id (sample-next-token logits-data opts clamped-prompt-ids (subvec @cur-tokens prompt-count))]
                (swap! cur-tokens conj next-id)
                (when (and (not quiet) (not is-agent?))
                  (print (decode tokenizer [next-id]))
@@ -769,24 +881,29 @@
                    (doseq [b old-kv] (xla/destroy-buffer! ctx b))
                    (reset! kv-buffers-atom new-kv)
                    (recur (inc step) new-logits))))))
+         (when is-persistent?
+           (reset! kv-state {:cached-tokens @cur-tokens
+                             :kv-buffers @kv-buffers-atom}))
          (let [t1 (System/nanoTime)
                total-ms (/ (- t1 t0) 1e6)
                prefill-ms (/ (- t-prefill-end t0) 1e6)
                decode-ms (/ (- t1 t-prefill-end) 1e6)
-               gen-count (- (count @cur-tokens) (count prompt-ids))
+               gen-count (- (count @cur-tokens) prompt-count)
                decode-tok-s (if (pos? decode-ms) (/ (* gen-count 1000.0) decode-ms) 0.0)]
            (when-not quiet
              (println)
              (println "\n------------------------------------------------------------------")
              (println "  Telemetry Benchmark Metrics (Tensor Logic KV-Cache):")
-             (println (format "    • Prefill Latency             : %8.2f ms (%d tokens)" prefill-ms prompt-count))
+             (println (format "    • Prefill Latency             : %8.2f ms (%d tokens, %d cached, %d new)"
+                              prefill-ms prompt-count p-match (- prompt-count p-match)))
              (println (format "    • Decode Latency              : %8.2f ms (%d tokens)" decode-ms gen-count))
              (println (format "    • Decode Speed                : %8.2f tok/s (%6.2f ms/tok)" decode-tok-s (if (pos? gen-count) (/ decode-ms gen-count) 0.0)))
              (println (format "    • Total Generation Latency    : %8.2f ms" total-ms))
              (println "------------------------------------------------------------------\n"))
            @cur-tokens))
        (finally
-         (doseq [b @kv-buffers-atom] (xla/destroy-buffer! ctx b)))))))
+         (when-not is-persistent?
+           (doseq [b @kv-buffers-atom] (when b (xla/destroy-buffer! ctx b)))))))))
 
 (defn run-autoregressive-generation
   "Executes autoregressive generation either via in-VRAM while loop, cached KV generation, or full sequence recomputation."
@@ -866,12 +983,20 @@
                        (compile-tensor-logic-executable session max-seq-len)
 
                        :else
-                       (compile-gemma4-kv-executable session max-seq-len)))))]
+                       (compile-gemma4-kv-executable session max-seq-len)))))
+          prefill-exec (binding [profile/*active-trace-spans* trace-spans-atom]
+                         (if (:prefill-executable session)
+                           (:prefill-executable session)
+                           (when (and (= (or (:method opts) :kv-cache) :kv-cache)
+                                      (not (or (:vram-loop? opts) (:vram-loop? session))))
+                             (profile/with-profile metrics-atom "graph_compilation"
+                               (compile-gemma4-prefill-executable session max-seq-len)))))
+          active-session (assoc session :prefill-executable prefill-exec)]
       (when-not quiet
         (println "\nGenerating tokens autoregressively with pure Tensor Logic Gemma 4 Kernel..."))
       (let [final-context (binding [profile/*active-trace-spans* trace-spans-atom]
                             (profile/with-profile metrics-atom "autoregressive_generation"
-                              (run-autoregressive-generation session exec device-weights prompt-ids max-seq-len)))
+                              (run-autoregressive-generation active-session exec device-weights prompt-ids max-seq-len)))
             generated-str (decode tokenizer final-context)]
         (when-not quiet
           (println)
@@ -905,7 +1030,7 @@
 
 (defn init-agent-vram-session
   "Initializes a persistent VRAM session for agent loops.
-   Pre-allocates weights in device memory and compiles the In-VRAM While Loop (or KV-Cache step) executable once."
+   Pre-allocates weights in device memory and compiles the In-VRAM While Loop (or KV-Cache step and prefill) executable once."
   ([opts]
    (init-agent-vram-session opts (long (or (:max-seq-len opts) 1024))))
   ([opts max-seq-len]
@@ -926,20 +1051,28 @@
                               max-seq-len)))
          exec (if vram-loop?
                 (compile-in-vram-loop-executable session max-seq-len)
-                (compile-gemma4-kv-executable session max-seq-len))]
+                (compile-gemma4-kv-executable session max-seq-len))
+         prefill-exec (when-not vram-loop?
+                        (compile-gemma4-prefill-executable session max-seq-len))]
      (assoc session
             :device-weights device-weights
             :executable exec
+            :prefill-executable prefill-exec
+            :kv-state (atom nil)
             :max-seq-len max-seq-len
             :vram-session? true
             :vram-loop? vram-loop?))))
 
 (defn close-agent-session!
   "Releases VRAM resources for an agent session."
-  [{:keys [ctx device-weights]}]
+  [{:keys [ctx device-weights kv-state]}]
   (when (seq device-weights)
     (doseq [w device-weights]
-      (xla/destroy-buffer! ctx w))))
+      (xla/destroy-buffer! ctx w)))
+  (when (and kv-state @kv-state)
+    (doseq [b (:kv-buffers @kv-state)]
+      (xla/destroy-buffer! ctx b))
+    (reset! kv-state nil)))
 
 (defn- find-libjsig
   "Searches standard JDK paths for libjsig.so."

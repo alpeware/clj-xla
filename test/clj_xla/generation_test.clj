@@ -36,3 +36,20 @@
                       gen-ids (ar/generate-tokens-cached model-fn prompt-ids {:max-new-tokens max-tokens :eos-token-id 9999})]
                   (= (+ (count prompt-ids) max-tokens) (count gen-ids)))))
 
+(defspec prop-common-prefix-len-reflexive 50
+  (prop/for-all [tokens (gen/vector gen/nat 0 50)]
+                (= (count tokens) (ar/common-prefix-len tokens tokens))))
+
+(defspec prop-common-prefix-len-symmetric 50
+  (prop/for-all [xs (gen/vector gen/nat 0 30)
+                 ys (gen/vector gen/nat 0 30)]
+                (= (ar/common-prefix-len xs ys) (ar/common-prefix-len ys xs))))
+
+(defspec prop-common-prefix-len-prefix-preservation 50
+  (prop/for-all [prefix (gen/vector gen/nat 0 20)
+                 suffix-a (gen/vector gen/nat 0 20)
+                 suffix-b (gen/vector gen/nat 0 20)]
+                (let [xs (vec (concat prefix suffix-a))
+                      ys (vec (concat prefix suffix-b))]
+                  (>= (ar/common-prefix-len xs ys) (count prefix)))))
+
