@@ -22,7 +22,12 @@
 (def OFFSET_CLIENT_ADDRESSABLE_DEVICES "Offset of PJRT_Client_AddressableDevices in PJRT_Api." 168)
 (def OFFSET_CLIENT_COMPILE "Offset of PJRT_Client_Compile in PJRT_Api." 200)
 (def OFFSET_CLIENT_BUFFER_FROM_HOST_BUFFER "Offset of PJRT_Client_BufferFromHostBuffer in PJRT_Api." 216)
+(def OFFSET_EXECUTABLE_DESTROY "Offset of PJRT_Executable_Destroy in PJRT_Api." 360)
+(def OFFSET_EXECUTABLE_SERIALIZE "Offset of PJRT_Executable_Serialize in PJRT_Api." 432)
+(def OFFSET_LOADED_EXECUTABLE_DESTROY "Offset of PJRT_LoadedExecutable_Destroy in PJRT_Api." 440)
+(def OFFSET_LOADED_EXECUTABLE_GET_EXECUTABLE "Offset of PJRT_LoadedExecutable_GetExecutable in PJRT_Api." 448)
 (def OFFSET_LOADED_EXECUTABLE_EXECUTE "Offset of PJRT_LoadedExecutable_Execute in PJRT_Api." 480)
+(def OFFSET_EXECUTABLE_DESERIALIZE_AND_LOAD "Offset of PJRT_Executable_DeserializeAndLoad in PJRT_Api." 488)
 (def OFFSET_BUFFER_DESTROY "Offset of PJRT_Buffer_Destroy in PJRT_Api." 504)
 (def OFFSET_BUFFER_TO_HOST_BUFFER "Offset of PJRT_Buffer_ToHostBuffer in PJRT_Api." 600)
 
@@ -338,6 +343,99 @@
             err (.invokeWithArguments ^MethodHandle compile-handle [compile-args])]
         (check-error! api-ctx err)
         (.get ^MemorySegment compile-args ValueLayout/ADDRESS (long 48))))))
+
+(defn loaded-executable->executable
+  "Extracts underlying PJRT_Executable native handle from `loaded-exec-ptr`."
+  [api-ctx loaded-exec-ptr]
+  (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)
+        ^MemorySegment exec-seg (cond
+                                  (instance? MemorySegment loaded-exec-ptr) loaded-exec-ptr
+                                  :else loaded-exec-ptr)]
+    (with-open [arena (Arena/ofConfined)]
+      (let [get-exec-fn (downcall-ptr linker api-ptr OFFSET_LOADED_EXECUTABLE_GET_EXECUTABLE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+            args (.allocate arena (long 32))]
+        (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 32))
+        (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) exec-seg)
+        (let [err (.invokeWithArguments ^MethodHandle get-exec-fn [args])]
+          (check-error! api-ctx err))
+        (.get ^MemorySegment args ValueLayout/ADDRESS (long 24))))))
+
+(defn destroy-executable!
+  "Destroys un-loaded PJRT_Executable native handle `exec-ptr`."
+  [api-ctx exec-ptr]
+  (when (and (some? exec-ptr) (not= MemorySegment/NULL exec-ptr))
+    (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)]
+      (with-open [arena (Arena/ofConfined)]
+        (let [dest-fn (downcall-ptr linker api-ptr OFFSET_EXECUTABLE_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+              dest-args (.allocate arena (long 24))]
+          (.set ^MemorySegment dest-args ValueLayout/JAVA_LONG (long 0) (long 24))
+          (.set ^MemorySegment dest-args ValueLayout/ADDRESS (long 16) exec-ptr)
+          (let [err (.invokeWithArguments ^MethodHandle dest-fn [dest-args])]
+            (check-error! api-ctx err)))))))
+
+(defn destroy-loaded-executable!
+  "Destroys loaded PJRT_LoadedExecutable native handle `loaded-exec-ptr`."
+  [api-ctx loaded-exec-ptr]
+  (when (and (some? loaded-exec-ptr) (not= MemorySegment/NULL loaded-exec-ptr))
+    (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)]
+      (with-open [arena (Arena/ofConfined)]
+        (let [dest-fn (downcall-ptr linker api-ptr OFFSET_LOADED_EXECUTABLE_DESTROY ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+              dest-args (.allocate arena (long 24))]
+          (.set ^MemorySegment dest-args ValueLayout/JAVA_LONG (long 0) (long 24))
+          (.set ^MemorySegment dest-args ValueLayout/ADDRESS (long 16) loaded-exec-ptr)
+          (let [err (.invokeWithArguments ^MethodHandle dest-fn [dest-args])]
+            (check-error! api-ctx err)))))))
+
+(defn serialize-executable
+  "Serializes a compiled PJRT executable handle (`loaded-exec-ptr` or `exec-ptr`) into a byte array."
+  [api-ctx exec-or-loaded-exec]
+  (let [{:keys [api-ptr linker]} (extract-ctx api-ctx)
+        ^MemorySegment target-seg (cond
+                                    (instance? MemorySegment exec-or-loaded-exec) exec-or-loaded-exec
+                                    :else exec-or-loaded-exec)
+        exec-ptr (try
+                   (loaded-executable->executable api-ctx target-seg)
+                   (catch Exception _
+                     target-seg))]
+    (with-open [arena (Arena/ofConfined)]
+      (let [ser-fn (downcall-ptr linker api-ptr OFFSET_EXECUTABLE_SERIALIZE ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+            args (.allocate arena (long 56))]
+        (.set ^MemorySegment args ValueLayout/JAVA_LONG (long 0) (long 56))
+        (.set ^MemorySegment args ValueLayout/ADDRESS (long 16) exec-ptr)
+        (let [err (.invokeWithArguments ^MethodHandle ser-fn [args])]
+          (check-error! api-ctx err))
+        (let [bytes-ptr (.get ^MemorySegment args ValueLayout/ADDRESS (long 24))
+              bytes-size (.get ^MemorySegment args ValueLayout/JAVA_LONG (long 32))
+              ser-exec-ptr (.get ^MemorySegment args ValueLayout/ADDRESS (long 40))
+              deleter-fn (.get ^MemorySegment args ValueLayout/ADDRESS (long 48))
+              byte-arr (.toArray (.reinterpret ^MemorySegment bytes-ptr bytes-size) ValueLayout/JAVA_BYTE)]
+          (when (and (some? deleter-fn) (not= MemorySegment/NULL deleter-fn))
+            (let [del-desc (FunctionDescriptor/ofVoid (into-array MemoryLayout [ValueLayout/ADDRESS]))
+                  del-handle (.downcallHandle linker deleter-fn del-desc NO_OPTIONS)]
+              (.invokeWithArguments del-handle [ser-exec-ptr])))
+          byte-arr)))))
+
+(defn deserialize-and-load
+  "Deserializes previously serialized executable `byte-arr` into a PJRT_LoadedExecutable handle."
+  ([api-ctx byte-arr]
+   (deserialize-and-load api-ctx nil byte-arr))
+  ([api-ctx client byte-arr]
+   (let [{:keys [api-ptr linker arena]} (extract-ctx api-ctx)
+         cli (extract-client api-ctx client)
+         ^bytes b-arr (cond
+                        (bytes? byte-arr) byte-arr
+                        (instance? MemorySegment byte-arr) (.toArray ^MemorySegment byte-arr ValueLayout/JAVA_BYTE)
+                        :else (byte-array byte-arr))
+         deser-fn (downcall-ptr linker api-ptr OFFSET_EXECUTABLE_DESERIALIZE_AND_LOAD ValueLayout/ADDRESS [ValueLayout/ADDRESS])
+         deser-args (.allocate ^Arena arena (long 72))
+         buf-seg (.allocateFrom ^Arena arena ValueLayout/JAVA_BYTE b-arr)]
+     (.set ^MemorySegment deser-args ValueLayout/JAVA_LONG (long 0) (long 72))
+     (.set ^MemorySegment deser-args ValueLayout/ADDRESS (long 16) cli)
+     (.set ^MemorySegment deser-args ValueLayout/ADDRESS (long 24) buf-seg)
+     (.set ^MemorySegment deser-args ValueLayout/JAVA_LONG (long 32) (long (alength b-arr)))
+     (let [err (.invokeWithArguments ^MethodHandle deser-fn [deser-args])]
+       (check-error! api-ctx err))
+     (.get ^MemorySegment deser-args ValueLayout/ADDRESS (long 40)))))
 
 (defn buffer-from-host-buffer
   "Transfers a host memory buffer (float-array or int-array) to a device PJRT_Buffer."

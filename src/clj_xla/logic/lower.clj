@@ -259,9 +259,12 @@
                            :strides strides}}]
     (swap! eqns-atom conj slice-eqn)))
 
-(defn- lower-dynamic-slice! [eqns-atom _head in-term attrs final-out-var]
+(defn- lower-dynamic-slice! [eqns-atom _head in-term opt-starts attrs final-out-var]
   (let [in-name (first in-term)
-        starts (or (:start_indices attrs) (:start-indices attrs) [0 0 0])
+        starts (or (when (vector? opt-starts) opt-starts)
+                   (:start_indices attrs)
+                   (:start-indices attrs)
+                   [0 0 0])
         slice-sizes (or (:slice_sizes attrs) (:slice-sizes attrs) [1 1 1])
         slice-eqn {:op :stablehlo/dynamic_slice
                    :invars [in-name]
@@ -654,7 +657,7 @@
           (lower-slice! eqns-atom head (first body) attrs final-var)
 
           (= op :dynamic-slice)
-          (lower-dynamic-slice! eqns-atom head (first body) attrs final-var)
+          (lower-dynamic-slice! eqns-atom head (first body) (second body) attrs final-var)
 
           (= op :dynamic-update-slice)
           (lower-dynamic-update-slice! eqns-atom head (first body) (second body) attrs final-var)
