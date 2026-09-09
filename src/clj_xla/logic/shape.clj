@@ -49,7 +49,8 @@
            (= (first eqn) :multiply)
            (= (first eqn) :convert)
            (= (first eqn) :fwht)
-           (= (first eqn) :rht))
+           (= (first eqn) :rht)
+           (= (first eqn) :hadamard-block-128))
        (let [head (ast/head eqn)
              head-name (if (vector? head) (first head) head)
              head-idxs (when (vector? head) (vec (rest head)))
@@ -76,6 +77,18 @@
              n8 (second codes-shape)
              dim8 (if (>= (count cb-shape) 2) (second cb-shape) 8)
              out-shape (or (:shape attrs) [k (* n8 dim8)])]
+         (assoc known-shapes head-name (vec out-shape)))
+
+       (= (first eqn) :exl3-dequant)
+       (let [head (ast/head eqn)
+             head-name (if (vector? head) (first head) head)
+             attrs (ast/attrs eqn)
+             body (ast/body-terms eqn)
+             trellis-name (first (first body))
+             trellis-shape (get known-shapes trellis-name [1 1 48])
+             in-tiles (first trellis-shape)
+             out-tiles (second trellis-shape)
+             out-shape (or (:shape attrs) [(* in-tiles 16) (* out-tiles 16)])]
          (assoc known-shapes head-name (vec out-shape)))
 
        (= (first eqn) :argmax)

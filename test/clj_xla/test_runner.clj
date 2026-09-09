@@ -17,6 +17,7 @@
             [clj-xla.logic.core-test]
             [clj-xla.logic.dce-test]
             [clj-xla.logic.expand-test]
+            [clj-xla.logic.exl3-test]
             [clj-xla.logic.gemma-test]
             [clj-xla.logic.gemma3-test]
             [clj-xla.logic.gpt2-test]
@@ -78,6 +79,7 @@
                            'clj-xla.logic.lower-test
                            'clj-xla.logic.nn-test
                            'clj-xla.logic.quip-test
+                           'clj-xla.logic.exl3-test
                            'clj-xla.logic.shape-test
                            'clj-xla.logic.smollm-test
                            'clj-xla.core-test)

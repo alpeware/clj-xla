@@ -19,3 +19,12 @@
     (let [json-body "{\"siblings\":[{\"rfilename\":\"config.json\"},{\"rpath\":\"model.safetensors\"}]}"
           rpaths (dl/parse-manifest-rpaths json-body)]
       (is (= ["config.json" "model.safetensors"] rpaths)))))
+
+(deftest test-parse-cli-args-revision
+  (testing "Parses repository and revision flags or repo@revision formats."
+    (let [res1 (dl/parse-cli-args ["turboderp/gemma-4-12B-it-exl3" "--revision" "3.00bpw_mul1"])
+          res2 (dl/parse-cli-args ["turboderp/gemma-4-12B-it-exl3@3.00bpw_mul1"])]
+      (is (= "turboderp/gemma-4-12B-it-exl3" (:repo res1)))
+      (is (= "3.00bpw_mul1" (:revision res1)))
+      (is (= "turboderp/gemma-4-12B-it-exl3" (:repo res2)))
+      (is (= "3.00bpw_mul1" (:revision res2))))))

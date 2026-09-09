@@ -700,6 +700,98 @@
       (let [mul-eqn {:op :stablehlo/multiply :invars [r-w scales-name] :outvars [final-out-var]}]
         (swap! eqns-atom conj mul-eqn)))))
 
+(defn- lower-hadamard-block-128! [eqns-atom counter _head in-term signs-term attrs final-out-var known-shapes]
+  (let [in-name (first in-term)
+        signs-name (when signs-term (first signs-term))
+        inverse? (:inverse? attrs)
+        shape (get known-shapes in-name)
+        rank (count shape)
+        raw-axis (long (or (:axis attrs) (dec rank)))
+        axis (if (neg? raw-axis) (+ rank raw-axis) raw-axis)
+        d (nth shape axis)
+        _ (assert (zero? (mod d 128)) (str "Block-128 Hadamard dimension must be divisible by 128, got: " d))
+        num-blocks (quot d 128)
+        leading-dims (subvec (vec shape) 0 axis)
+        batch-size (long (reduce * 1 leading-dims))
+        effective-batch (* batch-size num-blocks)
+        apply-had (fn [source-var dest-var]
+                    (let [r-in (gen-id "t_had128_in" counter)
+                          r-in-eqn {:op :stablehlo/reshape
+                                    :invars [source-var]
+                                    :outvars [r-in]
+                                    :attrs {:shape [effective-batch 128]}}
+                          _ (swap! eqns-atom conj r-in-eqn)
+                          unscaled-var
+                          (loop [s 0 cur-var r-in]
+                            (if (= s 7)
+                              cur-var
+                              (let [stride (bit-shift-left 1 s)
+                                    chunks (long (/ 128 (* 2 stride)))
+                                    r1-var (gen-id (str "t_had128_s" s "_r1") counter)
+                                    r1-eqn {:op :stablehlo/reshape
+                                            :invars [cur-var]
+                                            :outvars [r1-var]
+                                            :attrs {:shape [effective-batch chunks 2 stride]}}
+                                    a-var (gen-id (str "t_had128_s" s "_a") counter)
+                                    a-eqn {:op :stablehlo/slice
+                                           :invars [r1-var]
+                                           :outvars [a-var]
+                                           :attrs {:start_indices [0 0 0 0]
+                                                   :limit_indices [effective-batch chunks 1 stride]
+                                                   :strides [1 1 1 1]}}
+                                    b-var (gen-id (str "t_had128_s" s "_b") counter)
+                                    b-eqn {:op :stablehlo/slice
+                                           :invars [r1-var]
+                                           :outvars [b-var]
+                                           :attrs {:start_indices [0 0 1 0]
+                                                   :limit_indices [effective-batch chunks 2 stride]
+                                                   :strides [1 1 1 1]}}
+                                    sum-var (gen-id (str "t_had128_s" s "_sum") counter)
+                                    sum-eqn {:op :stablehlo/add :invars [a-var b-var] :outvars [sum-var]}
+                                    diff-var (gen-id (str "t_had128_s" s "_diff") counter)
+                                    diff-eqn {:op :stablehlo/subtract :invars [a-var b-var] :outvars [diff-var]}
+                                    cat-var (gen-id (str "t_had128_s" s "_cat") counter)
+                                    cat-eqn {:op :stablehlo/concatenate :invars [sum-var diff-var] :outvars [cat-var]
+                                             :attrs {:dimension 2}}
+                                    r2-var (gen-id (str "t_had128_s" s "_r2") counter)
+                                    r2-eqn {:op :stablehlo/reshape
+                                            :invars [cat-var]
+                                            :outvars [r2-var]
+                                            :attrs {:shape [effective-batch 128]}}]
+                                (swap! eqns-atom conj r1-eqn a-eqn b-eqn sum-eqn diff-eqn cat-eqn r2-eqn)
+                                (recur (inc s) r2-var))))
+                          c-scale (gen-id "c_had128_scale" counter)
+                          scale-val (/ 1.0 (Math/sqrt 128.0))
+                          c-eqn {:op :stablehlo/constant :value scale-val :outvars [c-scale]}
+                          mul-var (gen-id "t_had128_scaled" counter)
+                          mul-eqn {:op :stablehlo/multiply :invars [unscaled-var c-scale] :outvars [mul-var]}
+                          r-out-eqn {:op :stablehlo/reshape
+                                     :invars [mul-var]
+                                     :outvars [dest-var]
+                                     :attrs {:shape (vec shape)}}]
+                      (swap! eqns-atom conj c-eqn mul-eqn r-out-eqn)))]
+    (cond
+      (and signs-name inverse?)
+      (let [had-out (gen-id "t_had128_unscaled" counter)
+            _ (apply-had in-name had-out)
+            mul-eqn {:op :stablehlo/multiply :invars [had-out signs-name] :outvars [final-out-var]}]
+        (swap! eqns-atom conj mul-eqn))
+
+      signs-name
+      (let [scaled-in (gen-id "t_had128_prescaled" counter)
+            mul-eqn {:op :stablehlo/multiply :invars [in-name signs-name] :outvars [scaled-in]}
+            _ (swap! eqns-atom conj mul-eqn)]
+        (apply-had scaled-in final-out-var))
+
+      :else
+      (apply-had in-name final-out-var))))
+
+(defn- lower-exl3-dequant! [eqns-atom _counter _head trellis-term _cb-term _attrs final-out-var known-shapes]
+  (let [trellis-name (first trellis-term)
+        out-shape (get known-shapes final-out-var)
+        reshape-eqn {:op :stablehlo/reshape :invars [trellis-name] :outvars [final-out-var] :attrs {:shape out-shape}}]
+    (swap! eqns-atom conj reshape-eqn)))
+
 (defn ast->graph
   "Compiles a Tensor Logic Hiccup AST into a validated EDN SSA graph for OpenXLA compilation.
    Pipeline: expand -> prune (DCE) -> unify shapes -> lower to dot_general & StableHLO ops."
@@ -797,8 +889,14 @@
           (= op :rht)
           (lower-rht! eqns-atom counter head (first body) (second body) attrs final-var known-shapes)
 
+          (= op :hadamard-block-128)
+          (lower-hadamard-block-128! eqns-atom counter head (first body) (second body) attrs final-var known-shapes)
+
           (= op :quip-dequant)
           (lower-quip-dequant! eqns-atom counter head (first body) (second body) (nth body 2 nil) attrs final-var known-shapes)
+
+          (= op :exl3-dequant)
+          (lower-exl3-dequant! eqns-atom counter head (first body) (second body) attrs final-var known-shapes)
 
           (= op :while)
           (let [out-spec (second eqn)

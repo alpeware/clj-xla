@@ -1,6 +1,7 @@
 (ns scripts.gemma4-inference
   "Top-level runnable integration script and REPL API for end-to-end Gemma 4 text generation via pure XLA execution."
   (:require [clj-xla.core :as xla]
+            [clj-xla.logic.exl3 :as exl3]
             [clj-xla.logic.lower :as lower]
             [clj-xla.logic.models.gemma :as gemma-logic]
             [clj-xla.pjrt :as pjrt]
@@ -31,7 +32,8 @@
    :chrome-trace-out "scratch/gemma4_chrome_trace.json"})
 
 (def DEFAULT_MODEL_DIRS
-  [".models/gemma-4-E2B-it"
+  [".models/gemma-4-12B-it-exl3"
+   ".models/gemma-4-E2B-it"
    ".models/gemma-4-E2B"
    ".models/gemma-4-E4B-it"
    ".models/gemma-4-E4B"
@@ -154,27 +156,80 @@
         (json/read-str (slurp cfg-file) :key-fn keyword)
         (catch Exception _ nil)))))
 
+(defn resolve-weight-shape
+  "Resolves the logical [out-features in-features] shape of a tensor from header,
+   supporting unquantized safetensors, EXL3 trellis tensors (.svh/.suh), and v_proj fallback to k_proj."
+  [header tensor-name default-shape]
+  (or (get-in header [tensor-name "shape"])
+      (let [svh-name (str/replace tensor-name #"\.weight$" ".svh")
+            suh-name (str/replace tensor-name #"\.weight$" ".suh")]
+        (when (contains? header svh-name)
+          [(first (get-in header [svh-name "shape"]))
+           (first (get-in header [suh-name "shape"]))]))
+      (let [k-tensor (str/replace tensor-name #"\.v_proj\." ".k_proj.")
+            svh-name (str/replace k-tensor #"\.weight$" ".svh")
+            suh-name (str/replace k-tensor #"\.weight$" ".suh")]
+        (when (contains? header svh-name)
+          [(first (get-in header [svh-name "shape"]))
+           (first (get-in header [suh-name "shape"]))]))
+      default-shape))
+
 (defn load-weight-buffer
   "Loads a single weight tensor from `weights-mmap` into PJRT device memory in specified precision."
   ([ctx weights-mmap tensor-name shape weight-dtype weight-enum]
    (load-weight-buffer ctx weights-mmap tensor-name shape weight-dtype weight-enum 0.0))
   ([ctx weights-mmap tensor-name shape _weight-dtype weight-enum default-val]
-   (if (or (zero? (reduce * 1 shape))
-           (not (or (contains? (:header weights-mmap) tensor-name)
-                    (contains? (:tensors weights-mmap) tensor-name))))
-     (let [num-elements (reduce * 1 shape)
-           default-f (float default-val)
-           data (if (= weight-enum 11)
-                  (let [arr (float-array num-elements)]
-                    (java.util.Arrays/fill arr default-f)
-                    arr)
-                  (let [arr (short-array num-elements)
-                        bf-bits (short (bit-shift-right (Float/floatToRawIntBits default-f) 16))]
-                    (java.util.Arrays/fill arr bf-bits)
-                    arr))]
-       (xla/buffer-from-host-buffer ctx (:client ctx) data shape weight-enum))
-     (let [slice (st/get-tensor-slice weights-mmap tensor-name)]
-       (xla/buffer-from-host-buffer ctx (:client ctx) slice shape weight-enum)))))
+   (let [header (or (:header weights-mmap) {})
+         trellis-name (when (str/ends-with? tensor-name ".weight")
+                        (str/replace tensor-name #"\.weight$" ".trellis"))
+         actual-trellis-name (when trellis-name
+                               (if (contains? header trellis-name)
+                                 trellis-name
+                                 (let [k-trellis (str/replace trellis-name #"\.v_proj\." ".k_proj.")]
+                                   (if (contains? header k-trellis) k-trellis trellis-name))))
+         actual-tensor-name (if (or (contains? header tensor-name) (contains? (:tensors weights-mmap) tensor-name))
+                              tensor-name
+                              (let [k-name (str/replace tensor-name #"\.v_proj\." ".k_proj.")]
+                                (if (or (contains? header k-name) (contains? (:tensors weights-mmap) k-name))
+                                  k-name
+                                  tensor-name)))]
+     (cond
+       ;; EXL3 trellis quantized tensor
+       (and actual-trellis-name (contains? header actual-trellis-name))
+       (let [base-name (str/replace actual-trellis-name #"\.trellis$" "")
+             suh-name (str base-name ".suh")
+             svh-name (str base-name ".svh")
+             trellis-slice (st/get-tensor-slice weights-mmap actual-trellis-name)
+             suh-slice (st/get-tensor-slice weights-mmap suh-name)
+             svh-slice (st/get-tensor-slice weights-mmap svh-name)
+             in-features (first (get-in header [suh-name "shape"]))
+             out-features (first (get-in header [svh-name "shape"]))
+             trellis-shape (get-in header [actual-trellis-name "shape"])
+             words-per-tile (last trellis-shape)
+             bits (quot words-per-tile 16)
+             target-format (if (= weight-enum 11) :f32 :bf16)
+             dequant-arr (exl3/dequant-exl3-matrix trellis-slice in-features out-features bits suh-slice svh-slice
+                                                   {:as target-format :transpose? true})]
+         (xla/buffer-from-host-buffer ctx (:client ctx) dequant-arr shape weight-enum))
+
+       (or (zero? (reduce * 1 shape))
+           (not (or (contains? header actual-tensor-name)
+                    (contains? (:tensors weights-mmap) actual-tensor-name))))
+       (let [num-elements (reduce * 1 shape)
+             default-f (float default-val)
+             data (if (= weight-enum 11)
+                    (let [arr (float-array num-elements)]
+                      (java.util.Arrays/fill arr default-f)
+                      arr)
+                    (let [arr (short-array num-elements)
+                          bf-bits (short (bit-shift-right (Float/floatToRawIntBits default-f) 16))]
+                      (java.util.Arrays/fill arr bf-bits)
+                      arr))]
+         (xla/buffer-from-host-buffer ctx (:client ctx) data shape weight-enum))
+
+       :else
+       (let [slice (st/get-tensor-slice weights-mmap actual-tensor-name)]
+         (xla/buffer-from-host-buffer ctx (:client ctx) slice shape weight-enum))))))
 
 (defn quantize-bf16-to-int8
   "Quantizes a BF16 short-array to INT8 byte-array with per-tensor symmetric quantization.
@@ -222,10 +277,10 @@
          layer-types-cfg (:layer_types text-cfg)
          num-kv-shared-layers (or (:num_kv_shared_layers text-cfg) 0)
 
-         emb-shape (get-in header [(str prefix-base "embed_tokens.weight") "shape"] [262144 1536])
-         emb-pl-shape (get-in header [(str prefix-base "embed_tokens_per_layer.weight") "shape"] [262144 0])
-         q0-shape (get-in header [(str prefix-base "layers.0.self_attn.q_proj.weight") "shape"] [2048 1536])
-         k0-shape (get-in header [(str prefix-base "layers.0.self_attn.k_proj.weight") "shape"] [256 1536])
+         emb-shape (resolve-weight-shape header (str prefix-base "embed_tokens.weight") [262144 1536])
+         emb-pl-shape (resolve-weight-shape header (str prefix-base "embed_tokens_per_layer.weight") [262144 0])
+         q0-shape (resolve-weight-shape header (str prefix-base "layers.0.self_attn.q_proj.weight") [2048 1536])
+         k0-shape (resolve-weight-shape header (str prefix-base "layers.0.self_attn.k_proj.weight") [256 1536])
 
          vocab-size (nth emb-shape 0 262144)
          hidden-dim (nth emb-shape 1 1536)
@@ -243,10 +298,10 @@
 
          layer-configs (mapv (fn [i]
                                (let [kmap (gemma-logic/gemma4-weight-key-map i (str prefix-base "layers."))
-                                     l-q-dim (first (get-in header [(:q-w kmap) "shape"] [2048 hidden-dim]))
-                                     l-kv-dim (first (get-in header [(:k-w kmap) "shape"] [256 hidden-dim]))
+                                     l-q-dim (first (resolve-weight-shape header (:q-w kmap) [2048 hidden-dim]))
+                                     l-kv-dim (first (resolve-weight-shape header (:k-w kmap) [256 hidden-dim]))
                                      l-head-dim (first (get-in header [(:q-norm-w kmap) "shape"] [head-dim]))
-                                     mlp-dim (first (get-in header [(:gate-w kmap) "shape"] [(* 4 hidden-dim) hidden-dim]))
+                                     mlp-dim (first (resolve-weight-shape header (:gate-w kmap) [(* 4 hidden-dim) hidden-dim]))
                                      l-type-str (or (get layer-types-cfg i)
                                                     (if (= l-head-dim 512) "full_attention" "sliding_attention"))
                                      is-global? (= l-type-str "full_attention")
@@ -1044,11 +1099,6 @@
           trace-spans-atom (or (:trace-spans-atom session) (atom []))
           reuse-weights? (some? (:device-weights session))
           reuse-exec? (some? (:executable session))
-          device-weights (binding [profile/*active-trace-spans* trace-spans-atom]
-                           (if reuse-weights?
-                             (:device-weights session)
-                             (profile/with-profile metrics-atom "weight_transfer"
-                               (allocate-device-weights session))))
           exec (binding [profile/*active-trace-spans* trace-spans-atom]
                  (if reuse-exec?
                    (:executable session)
@@ -1069,7 +1119,12 @@
                                      (:vram-loop? opts) (:vram-loop? session) (= (:method opts) :vram-loop))
                              (profile/with-profile metrics-atom "graph_compilation"
                                (compile-gemma4-prefill-executable session max-seq-len)))))
-          active-session (assoc session :prefill-executable prefill-exec)]
+          active-session (assoc session :prefill-executable prefill-exec)
+          device-weights (binding [profile/*active-trace-spans* trace-spans-atom]
+                           (if reuse-weights?
+                             (:device-weights session)
+                             (profile/with-profile metrics-atom "weight_transfer"
+                               (allocate-device-weights session))))]
       (when-not quiet
         (println "\nGenerating tokens autoregressively with pure Tensor Logic Gemma 4 Kernel..."))
       (let [final-context (binding [profile/*active-trace-spans* trace-spans-atom]
@@ -1121,8 +1176,6 @@
                       (= method :vram-loop))
          opts (assoc opts :mode :agent :max-seq-len max-seq-len :method method :vram-loop? vram-loop?)
          session (init-inference-session opts)
-         _ (when-not (:quiet opts) (println "Pinning Gemma 4 weights in PJRT VRAM..."))
-         device-weights (allocate-device-weights session)
          _ (when-not (:quiet opts)
              (println (format "Pre-compiling Gemma 4 %s graph (max-seq-len=%d)..."
                               (if vram-loop? "In-VRAM While Loop" "KV-Cache")
@@ -1130,7 +1183,9 @@
          exec (if vram-loop?
                 (compile-in-vram-loop-executable session max-seq-len)
                 (compile-gemma4-kv-executable session max-seq-len))
-         prefill-exec (compile-gemma4-prefill-executable session max-seq-len)]
+         prefill-exec (compile-gemma4-prefill-executable session max-seq-len)
+         _ (when-not (:quiet opts) (println "Pinning Gemma 4 weights in PJRT VRAM..."))
+         device-weights (allocate-device-weights session)]
      (assoc session
             :device-weights device-weights
             :executable exec
