@@ -731,3 +731,71 @@
                       max-diff (reduce max 0.0 (map #(Math/abs (double (- %1 %2))) arr-std arr-ring))]
                   (< max-diff 1e-4))))
 
+(defspec prop-gemma4-prefill-ring-buffer-shapes 10
+  (prop/for-all [window (gen/elements [8 16])
+                 mult (gen/elements [2 3])
+                 num-heads (gen/elements [4 8])
+                 num-kv-heads (gen/elements [1 2])
+                 head-dim (gen/elements [16 32])]
+                (let [max-seq-len (* window mult)
+                      hidden-dim (* num-heads head-dim)
+                      intermediate-dim (* 2 hidden-dim)
+                      config {:vocab-size 100
+                              :hidden-dim hidden-dim
+                              :intermediate-dim intermediate-dim
+                              :total-pl-dim 0
+                              :num-layers 2
+                              :num-heads num-heads
+                              :num-kv-heads num-kv-heads
+                              :head-dim head-dim
+                              :sliding-window window
+                              :layer-types [:sliding :sliding]
+                              :max-seq-len max-seq-len
+                              :last-token-only? true}
+                      targets (gemma/gemma4-prefill-outvars config max-seq-len)
+                      ast (gemma/gemma4-model-ast config)]
+                  (and (= targets [:logits :k_ro_sl_0 :v_heads_sl_0 :k_ro_sl_1 :v_heads_sl_1])
+                       (let [invars [[:x [:tensor [1 max-seq-len] :i32]]
+                                     [:pos [:tensor [1] :i32]]
+                                     [:embed_tokens [:tensor [100 hidden-dim] :f32]]
+                                     [:final_norm_w [:tensor [hidden-dim] :f32]]
+                                     [:input_ln_w_0 [:tensor [hidden-dim] :f32]]
+                                     [:layer_scalar_0 [:tensor [1] :f32]]
+                                     [:q_w_0 [:tensor [(* num-heads head-dim) hidden-dim] :f32]]
+                                     [:k_w_0 [:tensor [(* num-kv-heads head-dim) hidden-dim] :f32]]
+                                     [:v_w_0 [:tensor [(* num-kv-heads head-dim) hidden-dim] :f32]]
+                                     [:o_w_0 [:tensor [hidden-dim (* num-heads head-dim)] :f32]]
+                                     [:q_norm_w_0 [:tensor [head-dim] :f32]]
+                                     [:k_norm_w_0 [:tensor [head-dim] :f32]]
+                                     [:post_attn_ln_w_0 [:tensor [hidden-dim] :f32]]
+                                     [:pre_mlp_ln_w_0 [:tensor [hidden-dim] :f32]]
+                                     [:post_mlp_ln_w_0 [:tensor [hidden-dim] :f32]]
+                                     [:gate_w_0 [:tensor [intermediate-dim hidden-dim] :f32]]
+                                     [:up_w_0 [:tensor [intermediate-dim hidden-dim] :f32]]
+                                     [:down_w_0 [:tensor [hidden-dim intermediate-dim] :f32]]
+                                     [:input_ln_w_1 [:tensor [hidden-dim] :f32]]
+                                     [:layer_scalar_1 [:tensor [1] :f32]]
+                                     [:q_w_1 [:tensor [(* num-heads head-dim) hidden-dim] :f32]]
+                                     [:k_w_1 [:tensor [(* num-kv-heads head-dim) hidden-dim] :f32]]
+                                     [:v_w_1 [:tensor [(* num-kv-heads head-dim) hidden-dim] :f32]]
+                                     [:o_w_1 [:tensor [hidden-dim (* num-heads head-dim)] :f32]]
+                                     [:q_norm_w_1 [:tensor [head-dim] :f32]]
+                                     [:k_norm_w_1 [:tensor [head-dim] :f32]]
+                                     [:post_attn_ln_w_1 [:tensor [hidden-dim] :f32]]
+                                     [:pre_mlp_ln_w_1 [:tensor [hidden-dim] :f32]]
+                                     [:post_mlp_ln_w_1 [:tensor [hidden-dim] :f32]]
+                                     [:gate_w_1 [:tensor [intermediate-dim hidden-dim] :f32]]
+                                     [:up_w_1 [:tensor [intermediate-dim hidden-dim] :f32]]
+                                     [:down_w_1 [:tensor [hidden-dim intermediate-dim] :f32]]]
+                             graph (lower/ast->graph "test_prefill_ring" invars ast targets)
+                             k-sl-eqn (first (filter #(some #{:k_ro_sl_0} (:outvars %)) (:eqns graph)))
+                             v-sl-eqn (first (filter #(some #{:v_heads_sl_0} (:outvars %)) (:eqns graph)))
+                             expected-shape [1 window num-kv-heads head-dim]]
+                         (and (shlo/validate-graph graph)
+                              (some? k-sl-eqn)
+                              (some? v-sl-eqn)
+                              (= (get-in k-sl-eqn [:attrs :limit_indices]) expected-shape)
+                              (= (get-in v-sl-eqn [:attrs :limit_indices]) expected-shape)
+                              (let [ctx (xla/init-cpu!)
+                                    exec (xla/compile-graph ctx graph)]
+                                (some? exec))))))))

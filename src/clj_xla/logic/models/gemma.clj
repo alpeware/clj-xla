@@ -186,6 +186,8 @@
          rope-prop (double (or (:rope-proportion cfg) (if is-global? 0.25 1.0)))
          theta (double (or (:theta-base cfg) (if is-global? 1000000.0 10000.0)))
          window (if is-global? nil (long (or (:sliding-window cfg) (:sliding-window config) (:sliding_window config) 512)))
+         layer-seq-len (if window (min max-seq-len window) max-seq-len)
+         ring-buffer? (boolean (and window (> max-seq-len window)))
 
          is-int8? (boolean (or (:is-int8 config) (= (:weight-dtype config) :int8)))
          norm-dtype (get config :norm-dtype (if is-int8? :bf16 (get config :weight-dtype :bf16)))
@@ -274,7 +276,10 @@
          dff (keyword (str "dff_" i))
          pld (keyword (str "pld_" i))
          p-q (keyword (str "p_q_" i))
-         p-k (keyword (str "p_k_" i))]
+         p-k (keyword (str "p_k_" i))
+         k-ro-sl (keyword (str "k_ro_sl_" i))
+         v-heads-sl (keyword (str "v_heads_sl_" i))
+         kv-s (keyword (str "kvs_" i))]
 
      [:block {:name (keyword (str "gemma4_layer_" i))}
       ;; 1. Pre-Attention RMSNorm
@@ -299,7 +304,13 @@
          [:rms-norm [k-normed-4d :b :p kvh dh] [k-heads-raw :b :p kvh dh] [k-norm-w dh] {:eps 1e-6}]
          [:reshape [k-normed-3d :b :p kvd] [k-normed-4d :b :p kvh dh] {:shape [1 max-seq-len kv-dim]}]
          [:rope [k-rope :b :p kvd] [k-normed-3d :b :p kvd] {:head-dim head-dim :theta theta :rope-proportion rope-prop}]
-         [:reshape [k-ro :b :p kvh dh] [k-rope :b :p kvd] {:shape [1 max-seq-len num-kv-heads head-dim]}]])
+         [:reshape [k-ro :b :p kvh dh] [k-rope :b :p kvd] {:shape [1 max-seq-len num-kv-heads head-dim]}]
+         (when ring-buffer?
+           [:slice [k-ro-sl :b kv-s kvh dh] [k-ro :b :p kvh dh]
+            {:start [0 0 0 0] :limit [1 layer-seq-len num-kv-heads head-dim]}])
+         (when ring-buffer?
+           [:slice [v-heads-sl :b kv-s kvh dh] [v-heads :b :p kvh dh]
+            {:start [0 0 0 0] :limit [1 layer-seq-len num-kv-heads head-dim]}])])
 
       ;; 4. Broadcast KV Heads
       [:= [k-rep :b :p kvh g dh] [actual-k-ro :b :p kvh dh] {:shape [1 max-seq-len num-kv-heads group-size head-dim]}]
@@ -426,6 +437,29 @@
                                 {:softcap (double final-logit-softcap)}
                                 {})
         [:normed :b :p :d] [:embed_tokens :v :d]])]))
+
+(defn gemma4-prefill-outvars
+  "Constructs output variable list for Gemma 4 prefill: [:logits (k_ro_sl_i | k_ro_i) (v_heads_sl_i | v_heads_i) ...]."
+  ([config] (gemma4-prefill-outvars config (:max-seq-len config)))
+  ([config max-seq-len]
+   (let [max-seq-len (long (or max-seq-len (:max-seq-len config) 128))
+         num-layers (long (or (:num-layers config) 35))
+         num-kv-shared (long (or (:num-kv-shared-layers config) 0))
+         num-unshared (- num-layers num-kv-shared)
+         layer-configs (:layer-configs config)
+         layer-types (:layer-types config)
+         kv-outs (mapcat (fn [i]
+                           (let [c (if (seq layer-configs) (nth layer-configs i nil) nil)
+                                 is-global? (if c (:is-global? c) (layer-is-global? layer-types i))
+                                 win (when-not is-global? (or (:sliding-window c) (:sliding-window config) (:sliding_window config) 512))
+                                 ring-buffer? (boolean (and win (> max-seq-len win)))]
+                             (if ring-buffer?
+                               [(keyword (str "k_ro_sl_" i))
+                                (keyword (str "v_heads_sl_" i))]
+                               [(keyword (str "k_ro_" i))
+                                (keyword (str "v_heads_" i))])))
+                         (range num-unshared))]
+     (vec (into [:logits] kv-outs)))))
 
 (defn gemma4-kv-layer-ast
   "Generates Tensor Logic Hiccup AST for Gemma 4 Transformer layer `layer-idx` using KV Cache.

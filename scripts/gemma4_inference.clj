@@ -567,16 +567,9 @@
     (vec (into [:logits] out-kv-heads))))
 
 (defn build-gemma4-prefill-outvars
-  "Constructs output variable list for Gemma 4 prefill: [:logits k_ro_0 v_heads_0 ...]."
+  "Constructs output variable list for Gemma 4 prefill: [:logits (k_ro_sl_i | k_ro_i) (v_heads_sl_i | v_heads_i) ...]."
   [config]
-  (let [num-layers (long (or (:num-layers config) 35))
-        num-kv-shared (long (or (:num-kv-shared-layers config) 0))
-        num-unshared (- num-layers num-kv-shared)
-        kv-outs (mapcat (fn [i]
-                          [(keyword (str "k_ro_" i))
-                           (keyword (str "v_heads_" i))])
-                        (range num-unshared))]
-    (vec (into [:logits] kv-outs))))
+  (gemma-logic/gemma4-prefill-outvars config (:max-seq-len config)))
 
 (defn compile-gemma4-prefill-executable
   "Compiles Gemma 4 model AST into a native StableHLO MLIR prefill executable that produces
@@ -980,7 +973,7 @@
                       (pos? p-match)
                       (:kv-buffers prior-cache)
 
-                      (and (some? prefill-exec) (<= seq-len 2048))
+                      (and (some? prefill-exec) (<= seq-len 8192))
                       nil
 
                       :else
@@ -1201,7 +1194,7 @@
                            (:prefill-executable session)
                            (when (and (or (= (or (:method opts) :kv-cache) :kv-cache)
                                           (:vram-loop? opts) (:vram-loop? session) (= (:method opts) :vram-loop))
-                                      (<= max-seq-len 2048))
+                                      (or (<= max-seq-len 8192) (:vram-loop? opts) (:vram-loop? session) (= (:method opts) :vram-loop)))
                              (profile/with-profile metrics-atom "graph_compilation"
                                (compile-gemma4-prefill-executable session max-seq-len)))))
           active-session (assoc session :prefill-executable prefill-exec)
@@ -1268,7 +1261,7 @@
          exec (if vram-loop?
                 (compile-in-vram-loop-executable session max-seq-len)
                 (compile-gemma4-kv-executable session max-seq-len))
-         prefill-exec (when (<= max-seq-len 2048)
+         prefill-exec (when (or (<= max-seq-len 8192) vram-loop?)
                         (compile-gemma4-prefill-executable session max-seq-len))
          _ (when-not (:quiet opts) (println "Pinning Gemma 4 weights in PJRT VRAM..."))
          device-weights (allocate-device-weights session)]
