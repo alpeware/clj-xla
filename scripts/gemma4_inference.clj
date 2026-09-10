@@ -27,6 +27,7 @@
    :compare false
    :verbose false
    :quiet false
+   :thinking false
    :profile true
    :profile-out "scratch/gemma4_profile.edn"
    :chrome-trace-out "scratch/gemma4_chrome_trace.json"})
@@ -124,6 +125,9 @@
 
           (= flag "--verbose")
           (recur (subvec remaining 1) (assoc opts :verbose true))
+
+          (or (= flag "--thinking") (= flag "--think"))
+          (recur (subvec remaining 1) (assoc opts :thinking true))
 
           (= flag "--quiet")
           (do (System/setProperty "clj-xla.quiet" "true")
@@ -1142,8 +1146,12 @@
         prompt-ids (cond
                      (and is-it-model (not is-already-templated))
                      (let [raw-ids (encode tokenizer clean-prompt)
-                           clean-ids (if (= (first raw-ids) (bos-id tokenizer)) (rest raw-ids) raw-ids)]
-                       (vec (concat [(bos-id tokenizer) 105 2364 107] clean-ids [106 107 105 4368 107])))
+                           clean-ids (if (= (first raw-ids) (bos-id tokenizer)) (rest raw-ids) raw-ids)
+                           prefix (if (:thinking opts)
+                                    ;; <bos><|turn>system\n<|think|><turn|>\n<|turn>user\n
+                                    [(bos-id tokenizer) 105 9731 107 98 106 107 105 2364 107]
+                                    [(bos-id tokenizer) 105 2364 107])]
+                       (vec (concat prefix clean-ids [106 107 105 4368 107])))
 
                      :else
                      (let [raw-ids (encode tokenizer clean-prompt)]
