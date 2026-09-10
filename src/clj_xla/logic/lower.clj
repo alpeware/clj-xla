@@ -5,7 +5,8 @@
             [clj-xla.logic.expand :as expand]
             [clj-xla.logic.index :as idx]
             [clj-xla.logic.shape :as shape]
-            [clj-xla.stablehlo :as shlo]))
+            [clj-xla.stablehlo :as shlo]
+            [clojure.set :as set]))
 
 (defn- gen-id [prefix counter]
   (keyword (str prefix "_" (swap! counter inc))))
@@ -94,7 +95,7 @@
       in-var)))
 
 (defn- lower-binary-contraction!
-  [eqns-atom counter head attrs lhs rhs _known-shapes var-dtypes final-out-var]
+  [eqns-atom counter head attrs lhs rhs known-shapes var-dtypes final-out-var]
   (let [head-idxs (vec (rest head))
         lhs-name (first lhs)
         lhs-idxs (vec (rest lhs))
@@ -111,14 +112,27 @@
             primary-idxs (if primary-is-lhs? lhs-idxs rhs-idxs)
             secondary-name (if primary-is-lhs? rhs-name lhs-name)
             secondary-idxs (if primary-is-lhs? rhs-idxs lhs-idxs)
-            secondary-v (if (= (set primary-idxs) (set secondary-idxs))
-                          (if (= primary-idxs secondary-idxs)
-                            secondary-name
-                            (let [rhs-perm (indices->dim-numbers secondary-idxs primary-idxs)
-                                  out-r (gen-id "t_trans_r" counter)
-                                  trans-r {:op :stablehlo/transpose :invars [secondary-name] :outvars [out-r] :attrs {:permutation rhs-perm}}]
-                              (swap! eqns-atom conj trans-r)
-                              out-r))
+            secondary-v (cond
+                          (= primary-idxs secondary-idxs)
+                          secondary-name
+
+                          (= (set primary-idxs) (set secondary-idxs))
+                          (let [rhs-perm (indices->dim-numbers secondary-idxs primary-idxs)
+                                out-r (gen-id "t_trans_r" counter)
+                                trans-r {:op :stablehlo/transpose :invars [secondary-name] :outvars [out-r] :attrs {:permutation rhs-perm}}]
+                            (swap! eqns-atom conj trans-r)
+                            out-r)
+
+                          (set/subset? (set secondary-idxs) (set primary-idxs))
+                          (let [bcast-dims (indices->dim-numbers primary-idxs secondary-idxs)
+                                target-shape (get known-shapes primary-name)
+                                out-b (gen-id "t_bcast_r" counter)
+                                bcast-r {:op :stablehlo/broadcast_in_dim :invars [secondary-name] :outvars [out-b]
+                                         :attrs {:broadcast_dimensions bcast-dims :target_shape target-shape}}]
+                            (swap! eqns-atom conj bcast-r)
+                            out-b)
+
+                          :else
                           secondary-name)
             needs-perm? (not= primary-idxs head-idxs)
             has-post-act? (or (:scale attrs) (:act attrs) (:softcap attrs))

@@ -231,6 +231,55 @@
        (let [slice (st/get-tensor-slice weights-mmap actual-tensor-name)]
          (xla/buffer-from-host-buffer ctx (:client ctx) slice shape weight-enum))))))
 
+(defn load-linear-projection-buffers
+  "Loads a linear projection matrix as either a single unquantized PJRT buffer,
+   or if is-int8 is true, a pair [w-buf scale-buf] with in-graph symmetric per-row INT8 quantization."
+  [ctx weights-mmap tensor-name [rows cols :as shape] is-int8 norm-enum weight-enum]
+  (if-not is-int8
+    [(load-weight-buffer ctx weights-mmap tensor-name shape (if (= weight-enum 11) :f32 :bf16) weight-enum 0.0)]
+    (let [header (or (:header weights-mmap) {})
+          trellis-name (when (str/ends-with? tensor-name ".weight")
+                         (str/replace tensor-name #"\.weight$" ".trellis"))
+          actual-trellis-name (when trellis-name
+                                (if (contains? header trellis-name)
+                                  trellis-name
+                                  (let [k-trellis (str/replace trellis-name #"\.v_proj\." ".k_proj.")]
+                                    (if (contains? header k-trellis) k-trellis trellis-name))))
+          actual-tensor-name (if (or (contains? header tensor-name) (contains? (:tensors weights-mmap) tensor-name))
+                               tensor-name
+                               (let [k-name (str/replace tensor-name #"\.v_proj\." ".k_proj.")]
+                                 (if (or (contains? header k-name) (contains? (:tensors weights-mmap) k-name))
+                                   k-name
+                                   tensor-name)))
+          scale-format (if (= norm-enum 11) :f32 :bf16)
+          raw-arr (cond
+                    (and actual-trellis-name (contains? header actual-trellis-name))
+                    (let [base-name (str/replace actual-trellis-name #"\.trellis$" "")
+                          suh-name (str base-name ".suh")
+                          svh-name (str base-name ".svh")
+                          trellis-slice (st/get-tensor-slice weights-mmap actual-trellis-name)
+                          suh-slice (st/get-tensor-slice weights-mmap suh-name)
+                          svh-slice (st/get-tensor-slice weights-mmap svh-name)
+                          in-features (first (get-in header [suh-name "shape"]))
+                          out-features (first (get-in header [svh-name "shape"]))
+                          trellis-shape (get-in header [actual-trellis-name "shape"])
+                          words-per-tile (last trellis-shape)
+                          bits (quot words-per-tile 16)]
+                      (exl3/dequant-exl3-matrix trellis-slice in-features out-features bits suh-slice svh-slice
+                                                {:as :bf16 :transpose? true}))
+
+                    (or (zero? (reduce * 1 shape))
+                        (not (or (contains? header actual-tensor-name)
+                                 (contains? (:tensors weights-mmap) actual-tensor-name))))
+                    (short-array (* rows cols))
+
+                    :else
+                    (st/get-tensor-floats weights-mmap actual-tensor-name))
+          {:keys [data scales]} (exl3/quantize-weights-per-row-int8 raw-arr rows cols {:as scale-format})
+          w-buf (xla/buffer-from-host-buffer ctx (:client ctx) data shape 2)
+          scale-buf (xla/buffer-from-host-buffer ctx (:client ctx) scales [rows] norm-enum)]
+      [w-buf scale-buf])))
+
 (defn quantize-bf16-to-int8
   "Quantizes a BF16 short-array to INT8 byte-array with per-tensor symmetric quantization.
    Returns {:data byte-array :scale float}."
@@ -376,19 +425,35 @@
                                  mlp-dim (:mlp-dim cfg)]
                              (concat
                               [[(keyword (str "input_ln_w_" i)) [:tensor [hidden-dim] norm-dtype]]
-                               [(keyword (str "layer_scalar_" i)) [:tensor [1] norm-dtype]]
-                               [(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] weight-dtype]]
-                               [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
-                               [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
-                               [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] weight-dtype]]
-                               [(keyword (str "q_norm_w_" i)) [:tensor [head-dim] norm-dtype]]
+                               [(keyword (str "layer_scalar_" i)) [:tensor [1] norm-dtype]]]
+                              (if is-int8
+                                [[(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] :i8]]
+                                 [(keyword (str "q_scale_" i)) [:tensor [q-dim] norm-dtype]]
+                                 [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] :i8]]
+                                 [(keyword (str "k_scale_" i)) [:tensor [kv-dim] norm-dtype]]
+                                 [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] :i8]]
+                                 [(keyword (str "v_scale_" i)) [:tensor [kv-dim] norm-dtype]]
+                                 [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] :i8]]
+                                 [(keyword (str "o_scale_" i)) [:tensor [hidden-dim] norm-dtype]]]
+                                [[(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] weight-dtype]]
+                                 [(keyword (str "k_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
+                                 [(keyword (str "v_w_" i)) [:tensor [kv-dim hidden-dim] weight-dtype]]
+                                 [(keyword (str "o_w_" i)) [:tensor [hidden-dim q-dim] weight-dtype]]])
+                              [[(keyword (str "q_norm_w_" i)) [:tensor [head-dim] norm-dtype]]
                                [(keyword (str "k_norm_w_" i)) [:tensor [head-dim] norm-dtype]]
                                [(keyword (str "post_attn_ln_w_" i)) [:tensor [hidden-dim] norm-dtype]]
                                [(keyword (str "pre_mlp_ln_w_" i)) [:tensor [hidden-dim] norm-dtype]]
-                               [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] norm-dtype]]
-                               [(keyword (str "gate_w_" i)) [:tensor [mlp-dim hidden-dim] weight-dtype]]
-                               [(keyword (str "up_w_" i)) [:tensor [mlp-dim hidden-dim] weight-dtype]]
-                               [(keyword (str "down_w_" i)) [:tensor [hidden-dim mlp-dim] weight-dtype]]]
+                               [(keyword (str "post_mlp_ln_w_" i)) [:tensor [hidden-dim] norm-dtype]]]
+                              (if is-int8
+                                [[(keyword (str "gate_w_" i)) [:tensor [mlp-dim hidden-dim] :i8]]
+                                 [(keyword (str "gate_scale_" i)) [:tensor [mlp-dim] norm-dtype]]
+                                 [(keyword (str "up_w_" i)) [:tensor [mlp-dim hidden-dim] :i8]]
+                                 [(keyword (str "up_scale_" i)) [:tensor [mlp-dim] norm-dtype]]
+                                 [(keyword (str "down_w_" i)) [:tensor [hidden-dim mlp-dim] :i8]]
+                                 [(keyword (str "down_scale_" i)) [:tensor [hidden-dim] norm-dtype]]]
+                                [[(keyword (str "gate_w_" i)) [:tensor [mlp-dim hidden-dim] weight-dtype]]
+                                 [(keyword (str "up_w_" i)) [:tensor [mlp-dim hidden-dim] weight-dtype]]
+                                 [(keyword (str "down_w_" i)) [:tensor [hidden-dim mlp-dim] weight-dtype]]])
                               (when has-ple?
                                 [[(keyword (str "per_layer_gate_w_" i)) [:tensor [pl-dim hidden-dim] norm-dtype]]
                                  [(keyword (str "per_layer_proj_w_" i)) [:tensor [hidden-dim pl-dim] norm-dtype]]
@@ -399,11 +464,13 @@
 (defn allocate-device-weights
   "Loads individual weight tensors for Gemma 4 into PJRT device buffers matching build-tensor-logic-invars."
   [{:keys [ctx weights-mmap config]}]
-  (let [{:keys [prefix-base vocab-size hidden-dim total-pl-dim pl-dim weight-dtype weight-enum norm-enum layer-configs num-layers]} config
+  (let [{:keys [prefix-base vocab-size hidden-dim total-pl-dim pl-dim weight-dtype weight-enum norm-enum layer-configs num-layers is-int8]} config
         has-ple? (pos? total-pl-dim)
         load-fn (fn
                   ([name shape enum] (load-weight-buffer ctx weights-mmap name shape weight-dtype enum 0.0))
                   ([name shape enum default-val] (load-weight-buffer ctx weights-mmap name shape weight-dtype enum default-val)))
+        load-linear-fn (fn [name shape]
+                         (load-linear-projection-buffers ctx weights-mmap name shape is-int8 norm-enum weight-enum))
         embed-buf (load-fn (str prefix-base "embed_tokens.weight") [vocab-size hidden-dim] norm-enum)
         ple-bufs (when has-ple?
                    [(load-fn (str prefix-base "embed_tokens_per_layer.weight") [vocab-size total-pl-dim] norm-enum)
@@ -418,19 +485,19 @@
                                    mlp-dim (:mlp-dim cfg)]
                                (concat
                                 [(load-fn (:input-ln-w kmap) [hidden-dim] norm-enum 0.0)
-                                 (load-fn (:layer-scalar-w kmap) [1] norm-enum 1.0)
-                                 (load-fn (:q-w kmap) [q-dim hidden-dim] weight-enum 0.0)
-                                 (load-fn (:k-w kmap) [kv-dim hidden-dim] weight-enum 0.0)
-                                 (load-fn (:v-w kmap) [kv-dim hidden-dim] weight-enum 0.0)
-                                 (load-fn (:o-w kmap) [hidden-dim q-dim] weight-enum 0.0)
-                                 (load-fn (:q-norm-w kmap) [head-dim] norm-enum 0.0)
+                                 (load-fn (:layer-scalar-w kmap) [1] norm-enum 1.0)]
+                                (load-linear-fn (:q-w kmap) [q-dim hidden-dim])
+                                (load-linear-fn (:k-w kmap) [kv-dim hidden-dim])
+                                (load-linear-fn (:v-w kmap) [kv-dim hidden-dim])
+                                (load-linear-fn (:o-w kmap) [hidden-dim q-dim])
+                                [(load-fn (:q-norm-w kmap) [head-dim] norm-enum 0.0)
                                  (load-fn (:k-norm-w kmap) [head-dim] norm-enum 0.0)
                                  (load-fn (:post-attn-ln-w kmap) [hidden-dim] norm-enum 0.0)
                                  (load-fn (:pre-mlp-ln-w kmap) [hidden-dim] norm-enum 0.0)
-                                 (load-fn (:post-mlp-ln-w kmap) [hidden-dim] norm-enum 0.0)
-                                 (load-fn (:gate-w kmap) [mlp-dim hidden-dim] weight-enum 0.0)
-                                 (load-fn (:up-w kmap) [mlp-dim hidden-dim] weight-enum 0.0)
-                                 (load-fn (:down-w kmap) [hidden-dim mlp-dim] weight-enum 0.0)]
+                                 (load-fn (:post-mlp-ln-w kmap) [hidden-dim] norm-enum 0.0)]
+                                (load-linear-fn (:gate-w kmap) [mlp-dim hidden-dim])
+                                (load-linear-fn (:up-w kmap) [mlp-dim hidden-dim])
+                                (load-linear-fn (:down-w kmap) [hidden-dim mlp-dim])
                                 (when has-ple?
                                   [(load-fn (:per-layer-gate-w kmap) [pl-dim hidden-dim] norm-enum 0.0)
                                    (load-fn (:per-layer-proj-w kmap) [hidden-dim pl-dim] norm-enum 0.0)
@@ -564,7 +631,7 @@
         num-layers (long (or (:num-layers cfg) 35))
         num-kv-shared (long (or (:num-kv-shared-layers cfg) 0))
         num-unshared (- num-layers num-kv-shared)
-        norm-dtype (get cfg :weight-dtype :bf16)
+        norm-dtype (if (:is-int8 cfg) :bf16 (get cfg :weight-dtype :bf16))
         layer-configs (:layer-configs cfg)
         layer-types (:layer-types cfg)
 
@@ -808,7 +875,7 @@
          seq-len (long (or max-seq-len (:max-seq-len config) 128))
          vocab-size (long (or (:vocab-size config) (:vocab_size config) 262144))
          last-token? (get opts :last-token-only? true)
-         weight-dt (get config :weight-dtype :bf16)
+         weight-dt (if (:is-int8 config) :bf16 (get config :weight-dtype :bf16))
          prompt-count (count prompt-ids)
          in-arr (int-array seq-len)
          pos-arr (when last-token? (int-array 1))
@@ -876,7 +943,7 @@
          is-agent? (= mode :agent)
          seq-len (long (or max-seq-len (:max-seq-len config) 512))
          vocab-size (long (or (:vocab-size config) 262144))
-         weight-dt (get config :weight-dtype :bf16)
+         weight-dt (if (:is-int8 config) :bf16 (get config :weight-dtype :bf16))
          num-layers (long (or (:num-layers config) 35))
          num-kv-shared (long (or (:num-kv-shared-layers config) 0))
          num-unshared (- num-layers num-kv-shared)

@@ -403,3 +403,61 @@
       [:exl3-dequant w-deq-head trellis-term]
       [:= y-mid-head x-rot-head w-deq-head]
       [:hadamard-block-128 out-head y-mid-head svh-term {:inverse? true}]])))
+
+(defn quantize-weights-per-row-int8
+  "Quantizes an array of floats/doubles/BF16-shorts of shape [rows cols] into signed INT8 bytes
+   with per-row symmetric scaling. Runs in parallel across rows.
+   Returns {:data ^bytes :scales ^floats} (or :scales as ^shorts if :as :bf16)."
+  ([w-arr rows cols]
+   (quantize-weights-per-row-int8 w-arr rows cols {}))
+  ([w-arr rows cols opts]
+   (let [total (* rows cols)
+         data-bytes (byte-array total)
+         target-scale-format (get opts :as :f32)
+         scales-floats (when (= target-scale-format :f32) (float-array rows))
+         scales-shorts (when (= target-scale-format :bf16) (short-array rows))
+         is-floats? (instance? (Class/forName "[F") w-arr)
+         is-doubles? (instance? (Class/forName "[D") w-arr)
+         is-shorts? (instance? (Class/forName "[S") w-arr)
+         f-arr (when is-floats? ^floats w-arr)
+         d-arr (when is-doubles? ^doubles w-arr)
+         s-arr (when is-shorts? ^shorts w-arr)]
+     (-> (IntStream/range 0 rows)
+         (.parallel)
+         (.forEach
+          (reify IntConsumer
+            (accept [_ r]
+              (let [r-base (* r cols)
+                    ;; 1. Compute max absolute value for row
+                    max-abs (loop [c 0 m (float 0.0)]
+                              (if (>= c cols)
+                                m
+                                (let [idx (+ r-base c)
+                                      v (cond
+                                          is-floats? (Math/abs (aget f-arr idx))
+                                          is-doubles? (float (Math/abs (aget d-arr idx)))
+                                          is-shorts? (let [s (int (aget s-arr idx))
+                                                           bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))]
+                                                       (Math/abs (Float/intBitsToFloat bits)))
+                                          :else (float (Math/abs (double (nth w-arr idx)))))]
+                                  (recur (inc c) (max m v)))))
+                    scale (if (zero? max-abs) (float 1.0) (float (/ (double max-abs) 127.0)))
+                    inv-scale (float (/ 1.0 scale))]
+                (if (= target-scale-format :bf16)
+                  (aset-short scales-shorts r (float->bf16-short scale))
+                  (aset-float scales-floats r scale))
+                ;; 2. Quantize row elements to signed INT8
+                (dotimes [c cols]
+                  (let [idx (+ r-base c)
+                        v (cond
+                            is-floats? (aget f-arr idx)
+                            is-doubles? (float (aget d-arr idx))
+                            is-shorts? (let [s (int (aget s-arr idx))
+                                             bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))]
+                                         (Float/intBitsToFloat bits))
+                            :else (float (nth w-arr idx)))
+                        q (Math/round (* v inv-scale))
+                        clamped (max -127 (min 127 q))]
+                    (aset-byte data-bytes idx (byte clamped)))))))))
+     {:data data-bytes
+      :scales (if (= target-scale-format :bf16) scales-shorts scales-floats)})))

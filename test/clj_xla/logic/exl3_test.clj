@@ -77,6 +77,25 @@
                   (and (integer? state)
                        (<= 0 state 65535)))))
 
+(defspec prop-per-row-int8-quantization-invariants
+  50
+  (prop/for-all [rows (gen/choose 2 8)
+                 cols (gen/choose 16 32)
+                 scale-factors (gen/vector (gen/double* {:min 0.1 :max 10.0 :NaN? false :infinite? false}) 8)]
+                (let [total (* rows cols)
+                      f-arr (float-array total)
+                      _ (dotimes [r rows]
+                          (let [s (nth scale-factors r)]
+                            (dotimes [c cols]
+                              (aset-float f-arr (+ (* r cols) c) (float (* s (Math/sin (double (+ r c)))))))))
+                      {:keys [data scales]} (exl3/quantize-weights-per-row-int8 f-arr rows cols)
+                      bytes-data ^bytes data
+                      scales-data ^floats scales]
+                  (and (= total (alength bytes-data))
+                       (= rows (alength scales-data))
+                       (every? #(<= -127 % 127) (vec bytes-data))
+                       (every? #(> % 0.0) (vec scales-data))))))
+
 ;; --- Unit Tests for EXL3 Decoding & Mathematical Parity ---
 
 (deftest test-mul1-reference-constants

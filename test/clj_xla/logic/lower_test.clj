@@ -3,7 +3,7 @@
   (:require [clj-xla.core :as xla]
             [clj-xla.logic.lower :as lower]
             [clj-xla.stablehlo :as shlo]
-            [clojure.test :refer [deftest is]]
+            [clojure.test :refer [deftest is testing]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]))
@@ -280,4 +280,23 @@
     (is (= 6.0 (nth res 11)))
     (is (= 0.0 (nth res 12)))
     (xla/destroy-buffer! out-buf)))
+
+(deftest test-binary-contraction-subset-broadcast
+  (testing "Binary contraction automatically broadcasts secondary operand when its indices are a subset of primary operand."
+    (let [ctx (xla/get-context)
+          invars [[:w [:tensor [2 3] :f32]]
+                  [:scale [:tensor [2] :f32]]]
+          ast [:= [:w_scaled :n :k] [:w :n :k] [:scale :n]]
+          graph (lower/ast->graph "broadcast_mul" invars ast #{:w_scaled})
+          _ (is (shlo/validate-graph graph))
+          compiled (xla/compile-graph ctx graph)
+          w-data (float-array [1.0 2.0 3.0
+                               4.0 5.0 6.0])
+          scale-data (float-array [2.0 0.5])
+          out-buf (xla/execute compiled w-data scale-data)
+          res (vec (xla/to-host-slice out-buf 0 6 4))]
+      ;; Row 0 scaled by 2.0: [2.0, 4.0, 6.0]
+      ;; Row 1 scaled by 0.5: [2.0, 2.5, 3.0]
+      (is (= [2.0 4.0 6.0 2.0 2.5 3.0] res))
+      (xla/destroy-buffer! out-buf))))
 
