@@ -63,13 +63,32 @@
    :final-logit-softcap 30.0
    :num-kv-shared-layers 0})
 
+(def DEFAULT_GEMMA4_31B_CONFIG
+  {:hidden-dim 5376
+   :intermediate-dim 21504
+   :pl-dim 0
+   :total-pl-dim 0
+   :num-layers 60
+   :num-heads 32
+   :num-kv-heads 16
+   :num-global-kv-heads 4
+   :head-dim 256
+   :global-head-dim 512
+   :vocab-size 262144
+   :norm-eps 1e-6
+   :final-logit-softcap 30.0
+   :num-kv-shared-layers 0
+   :sliding-window 1024
+   :layer-types (vec (take 60 (cycle ["sliding_attention" "sliding_attention" "sliding_attention"
+                                      "sliding_attention" "sliding_attention" "full_attention"])))})
+
 (defn gemma-config
   "Returns Gemma 1/2 configuration map with optional custom overrides."
   ([] DEFAULT_GEMMA_CONFIG)
   ([overrides] (merge DEFAULT_GEMMA_CONFIG overrides)))
 
 (defn gemma4-config
-  "Returns Gemma 4 configuration map for the specified variant (e.g. :e2b, :e4b, :12b) with optional custom overrides."
+  "Returns Gemma 4 configuration map for the specified variant (e.g. :e2b, :e4b, :12b, :31b) with optional custom overrides."
   ([] (gemma4-config :e2b {}))
   ([variant-or-overrides]
    (if (keyword? variant-or-overrides)
@@ -77,9 +96,10 @@
      (gemma4-config :e2b variant-or-overrides)))
   ([variant overrides]
    (let [base (case variant
-                :12b DEFAULT_GEMMA4_12B_CONFIG
-                :e4b DEFAULT_GEMMA4_E4B_CONFIG
-                :e2b DEFAULT_GEMMA4_E2B_CONFIG
+                (:31b :31B) DEFAULT_GEMMA4_31B_CONFIG
+                (:12b :12B) DEFAULT_GEMMA4_12B_CONFIG
+                (:e4b :e4B) DEFAULT_GEMMA4_E4B_CONFIG
+                (:e2b :e2B) DEFAULT_GEMMA4_E2B_CONFIG
                 DEFAULT_GEMMA4_E2B_CONFIG)]
      (merge base overrides))))
 
@@ -134,11 +154,29 @@
 
 (defn- gemma4-linear-proj
   "Emits a linear projection AST node.
+   When is-int4? is true, emits [:int4-unpack ...] followed by contraction.
    When is-int8? is true, emits convert(w_s8 -> norm-dtype) * scale followed by contraction."
   ([out-term x-term w-term is-int8? scale-var norm-dtype]
-   (gemma4-linear-proj out-term x-term w-term is-int8? scale-var norm-dtype {}))
+   (gemma4-linear-proj out-term x-term w-term is-int8? false scale-var norm-dtype {}))
   ([out-term x-term w-term is-int8? scale-var norm-dtype attrs]
-   (if is-int8?
+   (gemma4-linear-proj out-term x-term w-term is-int8? false scale-var norm-dtype attrs))
+  ([out-term x-term w-term is-int8? is-int4? scale-var norm-dtype attrs]
+   (cond
+     is-int4?
+     (let [head-name (first out-term)
+           w-name (first w-term)
+           w-idxs (vec (rest w-term))
+           w-scaled (keyword (str (name w-name) "_scaled"))
+           scale-dim (first w-idxs)
+           half-in-dim (keyword (str (name (second w-idxs)) "_half"))
+           w-packed-term [w-name scale-dim half-in-dim]]
+       [:block {:name (keyword (str (name head-name) "_int4_proj"))}
+        [:int4-unpack (into [w-scaled] w-idxs) w-packed-term [scale-var scale-dim]]
+        (cond-> [:= out-term]
+          (seq attrs) (conj attrs)
+          :always (conj x-term (into [w-scaled] w-idxs)))])
+
+     is-int8?
      (let [head-name (first out-term)
            w-name (first w-term)
            w-idxs (vec (rest w-term))
@@ -151,6 +189,8 @@
         (cond-> [:= out-term]
           (seq attrs) (conj attrs)
           :always (conj x-term (into [w-scaled] w-idxs)))])
+
+     :else
      (cond-> [:= out-term]
        (seq attrs) (conj attrs)
        :always (conj x-term w-term)))))
@@ -190,7 +230,8 @@
          ring-buffer? (boolean (and window (> max-seq-len window)))
 
          is-int8? (boolean (or (:is-int8 config) (= (:weight-dtype config) :int8)))
-         norm-dtype (get config :norm-dtype (if is-int8? :bf16 (get config :weight-dtype :bf16)))
+         is-int4? (boolean (or (:is-int4 config) (= (:weight-dtype config) :int4)))
+         norm-dtype (get config :norm-dtype (if (or is-int8? is-int4?) :bf16 (get config :weight-dtype :bf16)))
 
          h-in (keyword (str "h" i))
          h-out (keyword (str "h" (inc i)))
@@ -286,7 +327,7 @@
       [:rms-norm [x-norm1 :b :p :d] [h-in :b :p :d] [input-ln-w :d] {:eps 1e-6}]
 
       ;; 2. Q Projection & Reshape
-      (gemma4-linear-proj [q-raw :b :p qd] [x-norm1 :b :p :d] [q-w qd :d] is-int8? q-scale norm-dtype)
+      (gemma4-linear-proj [q-raw :b :p qd] [x-norm1 :b :p :d] [q-w qd :d] is-int8? is-int4? q-scale norm-dtype {})
       [:reshape [q-heads-raw :b :p h dh] [q-raw :b :p qd] {:shape [1 max-seq-len num-heads head-dim]}]
       [:rms-norm [q-normed-4d :b :p h dh] [q-heads-raw :b :p h dh] [q-norm-w dh] {:eps 1e-6}]
       [:reshape [q-normed-3d :b :p qd] [q-normed-4d :b :p h dh] {:shape [1 max-seq-len q-dim]}]
@@ -296,8 +337,8 @@
       ;; 3. K, V Projections (computed only if not shared)
       (when-not is-shared?
         [:block {:name (keyword (str "kv_proj_" i))}
-         (gemma4-linear-proj [k-raw :b :p kvd] [x-norm1 :b :p :d] [k-w kvd :d] is-int8? k-scale norm-dtype)
-         (gemma4-linear-proj [v-raw :b :p kvd] [x-norm1 :b :p :d] [v-w kvd :d] is-int8? v-scale norm-dtype)
+         (gemma4-linear-proj [k-raw :b :p kvd] [x-norm1 :b :p :d] [k-w kvd :d] is-int8? is-int4? k-scale norm-dtype {})
+         (gemma4-linear-proj [v-raw :b :p kvd] [x-norm1 :b :p :d] [v-w kvd :d] is-int8? is-int4? v-scale norm-dtype {})
          [:rms-norm [v-normed :b :p kvd] [v-raw :b :p kvd] {:eps 1e-6}]
          [:reshape [k-heads-raw :b :p kvh dh] [k-raw :b :p kvd] {:shape [1 max-seq-len num-kv-heads head-dim]}]
          [:reshape [v-heads :b :p kvh dh] [v-normed :b :p kvd] {:shape [1 max-seq-len num-kv-heads head-dim]}]
@@ -325,7 +366,7 @@
       [:reshape [ctx-flat :b :p qd] [ctx :b p-q h dh] {:shape [1 max-seq-len q-dim]}]
 
       ;; 6. Output Projection & Post-Attention RMSNorm
-      (gemma4-linear-proj [attn-raw :b :p :d] [ctx-flat :b :p qd] [o-w :d qd] is-int8? o-scale norm-dtype)
+      (gemma4-linear-proj [attn-raw :b :p :d] [ctx-flat :b :p qd] [o-w :d qd] is-int8? is-int4? o-scale norm-dtype {})
       [:rms-norm [attn-normed :b :p :d] [attn-raw :b :p :d] [post-attn-ln-w :d] {:eps 1e-6}]
 
       ;; 7. Residual Connection 1
@@ -336,10 +377,10 @@
       [:rms-norm [x-norm2 :b :p :d] [res1 :b :p :d] [pre-mlp-ln-w :d] {:eps 1e-6}]
 
       ;; 9. GeGLU MLP Block: down_proj(gelu(gate_proj(x)) * up_proj(x))
-      (gemma4-linear-proj [gate :b :p dff] [x-norm2 :b :p :d] [gate-w dff :d] is-int8? gate-scale norm-dtype {:act :gelu})
-      (gemma4-linear-proj [up :b :p dff] [x-norm2 :b :p :d] [up-w dff :d] is-int8? up-scale norm-dtype)
+      (gemma4-linear-proj [gate :b :p dff] [x-norm2 :b :p :d] [gate-w dff :d] is-int8? is-int4? gate-scale norm-dtype {:act :gelu})
+      (gemma4-linear-proj [up :b :p dff] [x-norm2 :b :p :d] [up-w dff :d] is-int8? is-int4? up-scale norm-dtype {})
       [:= [mlp-act :b :p dff] [gate :b :p dff] [up :b :p dff]]
-      (gemma4-linear-proj [mlp-raw :b :p :d] [mlp-act :b :p dff] [down-w :d dff] is-int8? down-scale norm-dtype)
+      (gemma4-linear-proj [mlp-raw :b :p :d] [mlp-act :b :p dff] [down-w :d dff] is-int8? is-int4? down-scale norm-dtype {})
       [:rms-norm [mlp-normed :b :p :d] [mlp-raw :b :p :d] [post-mlp-ln-w :d] {:eps 1e-6}]
 
       ;; 10. Residual Connection 2
@@ -497,7 +538,8 @@
          ring-buffer? (boolean (and window (> max-seq-len window)))
 
          is-int8? (boolean (or (:is-int8 config) (= (:weight-dtype config) :int8)))
-         norm-dtype (get config :norm-dtype (if is-int8? :bf16 (get config :weight-dtype :bf16)))
+         is-int4? (boolean (or (:is-int4 config) (= (:weight-dtype config) :int4)))
+         norm-dtype (get config :norm-dtype (if (or is-int8? is-int4?) :bf16 (get config :weight-dtype :bf16)))
 
          h-in (keyword (str "h" i))
          h-out (keyword (str "h" (inc i)))
@@ -590,7 +632,7 @@
       [:rms-norm [x-norm1 :b p :d] [h-in :b p :d] [input-ln-w :d] {:eps 1e-6}]
 
       ;; 2. Q Projection & Reshape for single token
-      (gemma4-linear-proj [q-raw :b p qd] [x-norm1 :b p :d] [q-w qd :d] is-int8? q-scale norm-dtype)
+      (gemma4-linear-proj [q-raw :b p qd] [x-norm1 :b p :d] [q-w qd :d] is-int8? is-int4? q-scale norm-dtype {})
       [:reshape [q-heads-raw :b p h dh] [q-raw :b p qd] {:shape [1 1 num-heads head-dim]}]
       [:rms-norm [q-normed-4d :b p h dh] [q-heads-raw :b p h dh] [q-norm-w dh] {:eps 1e-6}]
       [:reshape [q-normed-3d :b p qd] [q-normed-4d :b p h dh] {:shape [1 1 q-dim]}]
@@ -600,8 +642,8 @@
       ;; 3. K, V Projections & Dynamic Cache Update (if not shared)
       (when-not is-shared?
         [:block {:name (keyword (str "kv_proj_update_" i))}
-         (gemma4-linear-proj [k-raw :b p kvd] [x-norm1 :b p :d] [k-w kvd :d] is-int8? k-scale norm-dtype)
-         (gemma4-linear-proj [v-raw :b p kvd] [x-norm1 :b p :d] [v-w kvd :d] is-int8? v-scale norm-dtype)
+         (gemma4-linear-proj [k-raw :b p kvd] [x-norm1 :b p :d] [k-w kvd :d] is-int8? is-int4? k-scale norm-dtype {})
+         (gemma4-linear-proj [v-raw :b p kvd] [x-norm1 :b p :d] [v-w kvd :d] is-int8? is-int4? v-scale norm-dtype {})
          [:rms-norm [v-normed :b p kvd] [v-raw :b p kvd] {:eps 1e-6}]
          [:reshape [k-heads-raw :b p kvh dh] [k-raw :b p kvd] {:shape [1 1 num-kv-heads head-dim]}]
          [:reshape [v-heads :b p kvh dh] [v-normed :b p kvd] {:shape [1 1 num-kv-heads head-dim]}]
@@ -634,7 +676,7 @@
       [:reshape [ctx-flat :b p qd] [ctx :b p h dh] {:shape [1 1 q-dim]}]
 
       ;; 6. Output Projection & Post-Attention RMSNorm
-      (gemma4-linear-proj [attn-raw :b p :d] [ctx-flat :b p qd] [o-w :d qd] is-int8? o-scale norm-dtype)
+      (gemma4-linear-proj [attn-raw :b p :d] [ctx-flat :b p qd] [o-w :d qd] is-int8? is-int4? o-scale norm-dtype {})
       [:rms-norm [attn-normed :b p :d] [attn-raw :b p :d] [post-attn-ln-w :d] {:eps 1e-6}]
 
       ;; 7. Residual Connection 1
@@ -645,10 +687,10 @@
       [:rms-norm [x-norm2 :b p :d] [res1 :b p :d] [pre-mlp-ln-w :d] {:eps 1e-6}]
 
       ;; 9. GeGLU MLP Block: down_proj(gelu(gate_proj(x)) * up_proj(x))
-      (gemma4-linear-proj [gate :b p dff] [x-norm2 :b p :d] [gate-w dff :d] is-int8? gate-scale norm-dtype {:act :gelu})
-      (gemma4-linear-proj [up :b p dff] [x-norm2 :b p :d] [up-w dff :d] is-int8? up-scale norm-dtype)
+      (gemma4-linear-proj [gate :b p dff] [x-norm2 :b p :d] [gate-w dff :d] is-int8? is-int4? gate-scale norm-dtype {:act :gelu})
+      (gemma4-linear-proj [up :b p dff] [x-norm2 :b p :d] [up-w dff :d] is-int8? is-int4? up-scale norm-dtype {})
       [:= [mlp-act :b p dff] [gate :b p dff] [up :b p dff]]
-      (gemma4-linear-proj [mlp-raw :b p :d] [mlp-act :b p dff] [down-w :d dff] is-int8? down-scale norm-dtype)
+      (gemma4-linear-proj [mlp-raw :b p :d] [mlp-act :b p dff] [down-w :d dff] is-int8? is-int4? down-scale norm-dtype {})
       [:rms-norm [mlp-normed :b p :d] [mlp-raw :b p :d] [post-mlp-ln-w :d] {:eps 1e-6}]
 
       ;; 10. Residual Connection 2

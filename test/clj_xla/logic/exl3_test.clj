@@ -96,6 +96,31 @@
                        (every? #(<= -127 % 127) (vec bytes-data))
                        (every? #(> % 0.0) (vec scales-data))))))
 
+(defspec prop-per-row-int4-quantization-invariants
+  50
+  (prop/for-all [rows (gen/choose 2 8)
+                 cols (gen/elements [16 32 64])
+                 scale-factors (gen/vector (gen/double* {:min 0.1 :max 10.0 :NaN? false :infinite? false}) 8)]
+                (let [total (* rows cols)
+                      half-total (quot total 2)
+                      f-arr (float-array total)
+                      _ (dotimes [r rows]
+                          (let [s (nth scale-factors r)]
+                            (dotimes [c cols]
+                              (aset-float f-arr (+ (* r cols) c) (float (* s (Math/sin (double (+ r c)))))))))
+                      {:keys [data scales]} (exl3/quantize-weights-per-row-int4 f-arr rows cols)
+                      bytes-data ^bytes data
+                      scales-data (vec scales)]
+                  (and (= half-total (alength bytes-data))
+                       (= rows (count scales-data))
+                       (every? (fn [b]
+                                 (let [b-int (int b)
+                                       lo (bit-and b-int 0x0F)
+                                       hi (bit-and (bit-shift-right b-int 4) 0x0F)]
+                                   (and (<= 1 lo 15)
+                                        (<= 1 hi 15))))
+                               (vec bytes-data))))))
+
 ;; --- Unit Tests for EXL3 Decoding & Mathematical Parity ---
 
 (deftest test-mul1-reference-constants

@@ -1049,6 +1049,67 @@
         reshape-eqn {:op :stablehlo/reshape :invars [trellis-name] :outvars [final-out-var] :attrs {:shape out-shape}}]
     (swap! eqns-atom conj reshape-eqn)))
 
+(defn- lower-int4-unpack! [eqns-atom counter _head packed-term scale-term _attrs final-out-var known-shapes default-dtype]
+  (let [packed-name (first packed-term)
+        scale-name (first scale-term)
+        shape (get known-shapes packed-name)
+        rows (first shape)
+        half-cols (second shape)
+        cols (* (long half-cols) 2)
+        norm-dtype (or default-dtype :bf16)
+
+        c-0f (gen-id "c_int4_0f" counter)
+        c-4  (gen-id "c_int4_4" counter)
+        c-8  (gen-id "c_int4_8" counter)
+
+        c-0f-eqn {:op :stablehlo/constant :value (int 15) :type [:tensor [] :i8] :outvars [c-0f]}
+        c-4-eqn  {:op :stablehlo/constant :value (int 4) :type [:tensor [] :i8] :outvars [c-4]}
+        c-8-eqn  {:op :stablehlo/constant :value (float 8.0) :type [:tensor [] norm-dtype] :outvars [c-8]}
+
+        lo-var (gen-id "t_int4_lo" counter)
+        lo-eqn {:op :stablehlo/and :invars [packed-name c-0f] :outvars [lo-var]}
+
+        hi-var (gen-id "t_int4_hi" counter)
+        hi-eqn {:op :stablehlo/shift_right_logical :invars [packed-name c-4] :outvars [hi-var]}
+
+        lo-bf (gen-id "t_int4_lo_bf" counter)
+        lo-bf-eqn {:op :stablehlo/convert :invars [lo-var] :outvars [lo-bf] :attrs {:target-dtype norm-dtype}}
+
+        hi-bf (gen-id "t_int4_hi_bf" counter)
+        hi-bf-eqn {:op :stablehlo/convert :invars [hi-var] :outvars [hi-bf] :attrs {:target-dtype norm-dtype}}
+
+        lo-c (gen-id "t_int4_lo_c" counter)
+        lo-c-eqn {:op :stablehlo/subtract :invars [lo-bf c-8] :outvars [lo-c]}
+
+        hi-c (gen-id "t_int4_hi_c" counter)
+        hi-c-eqn {:op :stablehlo/subtract :invars [hi-bf c-8] :outvars [hi-c]}
+
+        lo-r (gen-id "t_int4_lo_r" counter)
+        lo-r-eqn {:op :stablehlo/reshape :invars [lo-c] :outvars [lo-r] :attrs {:shape [rows half-cols 1]}}
+
+        hi-r (gen-id "t_int4_hi_r" counter)
+        hi-r-eqn {:op :stablehlo/reshape :invars [hi-c] :outvars [hi-r] :attrs {:shape [rows half-cols 1]}}
+
+        cat-var (gen-id "t_int4_cat" counter)
+        cat-eqn {:op :stablehlo/concatenate :invars [lo-r hi-r] :outvars [cat-var] :attrs {:dimension 2}}
+
+        unscaled-var (gen-id "t_int4_unscaled" counter)
+        unscaled-eqn {:op :stablehlo/reshape :invars [cat-var] :outvars [unscaled-var] :attrs {:shape [rows cols]}}
+
+        scale-bcast (gen-id "t_int4_scale_bcast" counter)
+        scale-bcast-eqn {:op :stablehlo/broadcast_in_dim :invars [scale-name] :outvars [scale-bcast]
+                         :attrs {:broadcast_dimensions [0] :target_shape [rows cols] :shape [rows cols]}}
+
+        mul-eqn {:op :stablehlo/multiply :invars [unscaled-var scale-bcast] :outvars [final-out-var]}]
+    (swap! eqns-atom conj
+           c-0f-eqn c-4-eqn c-8-eqn
+           lo-eqn hi-eqn
+           lo-bf-eqn hi-bf-eqn
+           lo-c-eqn hi-c-eqn
+           lo-r-eqn hi-r-eqn
+           cat-eqn unscaled-eqn
+           scale-bcast-eqn mul-eqn)))
+
 (defn ast->graph
   "Compiles a Tensor Logic Hiccup AST into a validated EDN SSA graph for OpenXLA compilation.
    Pipeline: expand -> prune (DCE) -> unify shapes -> lower to dot_general & StableHLO ops."
@@ -1157,6 +1218,9 @@
 
           (= op :exl3-dequant)
           (lower-exl3-dequant! eqns-atom counter head (first body) (second body) attrs final-var known-shapes)
+
+          (= op :int4-unpack)
+          (lower-int4-unpack! eqns-atom counter head (first body) (second body) attrs final-var known-shapes default-dtype)
 
           (= op :while)
           (let [out-spec (second eqn)

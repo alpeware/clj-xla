@@ -91,6 +91,18 @@
              out-shape (or (:shape attrs) [(* in-tiles 16) (* out-tiles 16)])]
          (assoc known-shapes head-name (vec out-shape)))
 
+       (= (first eqn) :int4-unpack)
+       (let [head (ast/head eqn)
+             head-name (if (vector? head) (first head) head)
+             attrs (ast/attrs eqn)
+             body (ast/body-terms eqn)
+             packed-name (first (first body))
+             packed-shape (get known-shapes packed-name [1 1])
+             rows (first packed-shape)
+             half-cols (second packed-shape)
+             out-shape (or (:shape attrs) [rows (* (long half-cols) 2)])]
+         (assoc known-shapes head-name (vec out-shape)))
+
        (= (first eqn) :argmax)
        (let [head (ast/head eqn)
              head-name (if (vector? head) (first head) head)

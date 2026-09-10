@@ -461,3 +461,76 @@
                     (aset-byte data-bytes idx (byte clamped)))))))))
      {:data data-bytes
       :scales (if (= target-scale-format :bf16) scales-shorts scales-floats)})))
+
+(defn quantize-weights-per-row-int4
+  "Quantizes an array of floats/doubles/BF16-shorts of shape [rows cols] into packed INT4 bytes
+   of shape [rows (/ cols 2)] with per-row symmetric scaling. Runs in parallel across rows.
+   Each byte packs 2 adjacent values: low nibble = col 2k, high nibble = col 2k+1 (offset +8).
+   Returns {:data ^bytes :scales ^floats} (or :scales as ^shorts if :as :bf16)."
+  ([w-arr rows cols]
+   (quantize-weights-per-row-int4 w-arr rows cols {}))
+  ([w-arr rows cols opts]
+   (let [half-cols (quot cols 2)
+         total-packed (* rows half-cols)
+         data-bytes (byte-array total-packed)
+         target-scale-format (get opts :as :f32)
+         scales-floats (when (= target-scale-format :f32) (float-array rows))
+         scales-shorts (when (= target-scale-format :bf16) (short-array rows))
+         is-floats? (instance? (Class/forName "[F") w-arr)
+         is-doubles? (instance? (Class/forName "[D") w-arr)
+         is-shorts? (instance? (Class/forName "[S") w-arr)
+         f-arr (when is-floats? ^floats w-arr)
+         d-arr (when is-doubles? ^doubles w-arr)
+         s-arr (when is-shorts? ^shorts w-arr)]
+     (-> (IntStream/range 0 rows)
+         (.parallel)
+         (.forEach
+          (reify IntConsumer
+            (accept [_ r]
+              (let [r-base (* r cols)
+                    out-base (* r half-cols)
+                    ;; 1. Compute max absolute value for row
+                    max-abs (loop [c 0 m (float 0.0)]
+                              (if (>= c cols)
+                                m
+                                (let [idx (+ r-base c)
+                                      v (cond
+                                          is-floats? (Math/abs (aget f-arr idx))
+                                          is-doubles? (float (Math/abs (aget d-arr idx)))
+                                          is-shorts? (let [s (int (aget s-arr idx))
+                                                           bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))]
+                                                       (Math/abs (Float/intBitsToFloat bits)))
+                                          :else (float (Math/abs (double (nth w-arr idx)))))]
+                                  (recur (inc c) (max m v)))))
+                    scale (if (zero? max-abs) (float 1.0) (float (/ (double max-abs) 7.0)))
+                    inv-scale (float (/ 1.0 scale))]
+                (if (= target-scale-format :bf16)
+                  (aset-short scales-shorts r (float->bf16-short scale))
+                  (aset-float scales-floats r scale))
+                ;; 2. Quantize and pack pairs of row elements into signed nibbles [1..15]
+                (dotimes [hc half-cols]
+                  (let [c0 (* hc 2)
+                        c1 (inc c0)
+                        idx0 (+ r-base c0)
+                        idx1 (+ r-base c1)
+                        v0 (cond
+                             is-floats? (aget f-arr idx0)
+                             is-doubles? (float (aget d-arr idx0))
+                             is-shorts? (let [s (int (aget s-arr idx0))
+                                              bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))]
+                                          (Float/intBitsToFloat bits))
+                             :else (float (nth w-arr idx0)))
+                        v1 (cond
+                             is-floats? (aget f-arr idx1)
+                             is-doubles? (float (aget d-arr idx1))
+                             is-shorts? (let [s (int (aget s-arr idx1))
+                                              bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))]
+                                          (Float/intBitsToFloat bits))
+                             :else (float (nth w-arr idx1)))
+                        q0 (+ (max -7 (min 7 (Math/round (* v0 inv-scale)))) 8)
+                        q1 (+ (max -7 (min 7 (Math/round (* v1 inv-scale)))) 8)
+                        packed (unchecked-byte (bit-or (bit-and (int q0) 0x0F)
+                                                       (bit-shift-left (bit-and (int q1) 0x0F) 4)))]
+                    (aset-byte data-bytes (+ out-base hc) packed))))))))
+     {:data data-bytes
+      :scales (if (= target-scale-format :bf16) scales-shorts scales-floats)})))

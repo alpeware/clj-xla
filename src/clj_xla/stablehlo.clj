@@ -80,7 +80,7 @@
                 (cond
                   (= op :stablehlo/constant)
                   (let [val (:value eqn)
-                        out-t (if-let [t (:type eqn)]
+                        out-t (if-let [t (or (:type eqn) (get-in eqn [:attrs :type]))]
                                 (type->mlir-string t)
                                 (if (vector? val) "tensor<128x128xf32>" "tensor<f32>"))]
                     (assoc acc (first outvars) out-t))
@@ -134,7 +134,7 @@
                     (assoc acc (first outvars) out-t))
 
                   (= op :stablehlo/broadcast_in_dim)
-                  (let [target-shape (get attrs :target_shape [1 3 3 128 64])
+                  (let [target-shape (or (get attrs :target_shape) (get attrs :shape) [1 3 3 128 64])
                         [_in-dims in-dtype] (or (parse-tensor-dims in-type) [[1 3 1 128 64] "f32"])
                         out-t (if (seq target-shape)
                                 (str "tensor<" (str/join "x" target-shape) "x" in-dtype ">")
@@ -244,12 +244,13 @@
                                 "tensor<i1>")]
                     (assoc acc (first outvars) out-t))
 
-                  (or (= op :stablehlo/not) (= op :stablehlo/and) (= op :stablehlo/or))
+                  (or (= op :stablehlo/not) (= op :stablehlo/and) (= op :stablehlo/or) (= op :stablehlo/shift_right_logical))
                   (let [in-t (get acc (first in-vars) "tensor<i1>")
-                        [in-dims _] (parse-tensor-dims in-t)
+                        [in-dims in-dtype] (or (parse-tensor-dims in-t) [[] "i1"])
+                        dtype-str (or in-dtype "i1")
                         out-t (if (seq in-dims)
-                                (str "tensor<" (str/join "x" in-dims) "xi1>")
-                                "tensor<i1>")]
+                                (str "tensor<" (str/join "x" in-dims) "x" dtype-str ">")
+                                (str "tensor<" dtype-str ">"))]
                     (assoc acc (first outvars) out-t))
 
                   (= op :stablehlo/argmax)
@@ -360,14 +361,6 @@
             in-type (get var-types in-var "tensor<i1>")
             out-type (get var-types out-var in-type)]
         (str "    %" (name out-var) " = \"stablehlo.not\"(%" (name in-var) ") : (" in-type ") -> " out-type))
-
-      (or (= op :stablehlo/and) (= op :stablehlo/or))
-      (let [[in0 in1] invars
-            in0-t (get var-types in0 "tensor<i1>")
-            in1-t (get var-types in1 in0-t)
-            out-type (get var-types out-var in0-t)
-            mlir-name (if (= op :stablehlo/and) "stablehlo.and" "stablehlo.or")]
-        (str "    %" (name out-var) " = \"" mlir-name "\"(%" (name in0) ", %" (name in1) ") : (" in0-t ", " in1-t ") -> " out-type))
 
       (= op :stablehlo/gather)
       (let [[operand start-indices] invars

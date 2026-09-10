@@ -799,3 +799,111 @@
                               (let [ctx (xla/init-cpu!)
                                     exec (xla/compile-graph ctx graph)]
                                 (some? exec))))))))
+
+(defspec prop-gemma4-31b-config-invariants 10
+  (prop/for-all [layer-idx (gen/choose 0 59)]
+                (let [cfg (gemma/gemma4-config :31b)]
+                  (and (= (:num-layers cfg) 60)
+                       (= (:hidden-dim cfg) 5376)
+                       (= (:intermediate-dim cfg) 21504)
+                       (= (:num-heads cfg) 32)
+                       (= (:num-kv-heads cfg) 16)
+                       (= (:num-global-kv-heads cfg) 4)
+                       (= (:head-dim cfg) 256)
+                       (= (:global-head-dim cfg) 512)
+                       (= (:sliding-window cfg) 1024)
+                       (= (:pl-dim cfg) 0)
+                       (= (:total-pl-dim cfg) 0)
+                       (= (gemma/layer-is-global? (:layer-types cfg) layer-idx)
+                          (= (mod layer-idx 6) 5))))))
+
+(defspec prop-gemma4-31b-layer-ast-validity 20
+  (prop/for-all [layer-idx (gen/choose 0 59)
+                 seq-len (gen/elements [8 16 32])]
+                (let [config (gemma/gemma4-config :31b)
+                      layer-ast (gemma/gemma4-layer-ast layer-idx seq-len config)
+                      expanded (expand/expand-ast {} layer-ast)]
+                  (and (vector? layer-ast)
+                       (seq expanded)
+                       (every? ast/valid-node? expanded)))))
+
+(defspec prop-gemma4-31b-kv-layer-ast-validity 20
+  (prop/for-all [layer-idx (gen/choose 0 59)
+                 seq-len (gen/elements [1024 2048])]
+                (let [config (gemma/gemma4-config :31b)
+                      layer-ast (gemma/gemma4-kv-layer-ast layer-idx seq-len config)
+                      expanded (expand/expand-ast {} layer-ast)]
+                  (and (vector? layer-ast)
+                       (seq expanded)
+                       (every? ast/valid-node? expanded)))))
+
+(defspec prop-gemma4-31b-int4-layer-ast-validity 20
+  (prop/for-all [layer-idx (gen/choose 0 59)
+                 seq-len (gen/elements [8 16 32])]
+                (let [config (assoc (gemma/gemma4-config :31b) :is-int4 true)
+                      layer-ast (gemma/gemma4-layer-ast layer-idx seq-len config)
+                      expanded (expand/expand-ast {} layer-ast)]
+                  (and (vector? layer-ast)
+                       (seq expanded)
+                       (every? ast/valid-node? expanded)))))
+
+(defspec prop-gemma4-31b-int4-kv-layer-ast-validity 20
+  (prop/for-all [layer-idx (gen/choose 0 59)
+                 seq-len (gen/elements [1024 2048])]
+                (let [config (assoc (gemma/gemma4-config :31b) :is-int4 true)
+                      layer-ast (gemma/gemma4-kv-layer-ast layer-idx seq-len config)
+                      expanded (expand/expand-ast {} layer-ast)]
+                  (and (vector? layer-ast)
+                       (seq expanded)
+                       (every? ast/valid-node? expanded)))))
+
+(deftest test-gemma4-31b-int4-step-lowering-and-compilation
+  (let [num-layers 1
+        max-seq-len 8
+        vocab-size 256
+        hidden-dim 5376
+        intermediate-dim 21504
+        head-dim 256
+        num-heads 32
+        num-kv-heads 16
+        q-dim (* num-heads head-dim)
+        kv-dim (* num-kv-heads head-dim)
+        config (assoc (gemma/gemma4-config :31b)
+                      :num-layers num-layers
+                      :vocab-size vocab-size
+                      :max-seq-len max-seq-len
+                      :is-int4 true)
+        invars [[:x [:tensor [1 1] :i32]]
+                [:pos [:tensor [1] :i32]]
+                [:k_cache_in_0 [:tensor [1 max-seq-len num-kv-heads head-dim] :f32]]
+                [:v_cache_in_0 [:tensor [1 max-seq-len num-kv-heads head-dim] :f32]]
+                [:embed_tokens [:tensor [vocab-size hidden-dim] :f32]]
+                [:final_norm_w [:tensor [hidden-dim] :f32]]
+                [:input_ln_w_0 [:tensor [hidden-dim] :f32]]
+                [:layer_scalar_0 [:tensor [1] :f32]]
+                [:q_w_0 [:tensor [q-dim (quot hidden-dim 2)] :i8]]
+                [:q_scale_0 [:tensor [q-dim] :f32]]
+                [:k_w_0 [:tensor [kv-dim (quot hidden-dim 2)] :i8]]
+                [:k_scale_0 [:tensor [kv-dim] :f32]]
+                [:v_w_0 [:tensor [kv-dim (quot hidden-dim 2)] :i8]]
+                [:v_scale_0 [:tensor [kv-dim] :f32]]
+                [:o_w_0 [:tensor [hidden-dim (quot q-dim 2)] :i8]]
+                [:o_scale_0 [:tensor [hidden-dim] :f32]]
+                [:q_norm_w_0 [:tensor [head-dim] :f32]]
+                [:k_norm_w_0 [:tensor [head-dim] :f32]]
+                [:post_attn_ln_w_0 [:tensor [hidden-dim] :f32]]
+                [:pre_mlp_ln_w_0 [:tensor [hidden-dim] :f32]]
+                [:post_mlp_ln_w_0 [:tensor [hidden-dim] :f32]]
+                [:gate_w_0 [:tensor [intermediate-dim (quot hidden-dim 2)] :i8]]
+                [:gate_scale_0 [:tensor [intermediate-dim] :f32]]
+                [:up_w_0 [:tensor [intermediate-dim (quot hidden-dim 2)] :i8]]
+                [:up_scale_0 [:tensor [intermediate-dim] :f32]]
+                [:down_w_0 [:tensor [hidden-dim (quot intermediate-dim 2)] :i8]]
+                [:down_scale_0 [:tensor [hidden-dim] :f32]]]
+        ast (gemma/gemma4-kv-model-ast config)
+        graph (lower/ast->graph "gemma4_31b_int4_kv_step" invars ast [:logits :k_cache_out_0 :v_cache_out_0])]
+    (is (shlo/validate-graph graph))
+    (is (= [:logits :k_cache_out_0 :v_cache_out_0] (:outvars graph)))
+    (let [ctx (xla/get-context)
+          compiled (xla/compile-graph ctx graph)]
+      (is (some? compiled)))))
