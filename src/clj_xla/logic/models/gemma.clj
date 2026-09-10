@@ -459,6 +459,8 @@
          rope-prop (double (or (:rope-proportion cfg) (if is-global? 0.25 1.0)))
          theta (double (or (:theta-base cfg) (if is-global? 1000000.0 10000.0)))
          window (if is-global? nil (long (or (:sliding-window cfg) (:sliding-window config) (:sliding_window config) 512)))
+         layer-seq-len (if window (min max-seq-len window) max-seq-len)
+         ring-buffer? (boolean (and window (> max-seq-len window)))
 
          is-int8? (boolean (or (:is-int8 config) (= (:weight-dtype config) :int8)))
          norm-dtype (get config :norm-dtype (if is-int8? :bf16 (get config :weight-dtype :bf16)))
@@ -574,9 +576,11 @@
          [:rope [k-rope :b p kvd] [k-normed-3d :b p kvd] {:head-dim head-dim :theta theta :rope-proportion rope-prop :pos :pos :max-seq-len max-seq-len}]
          [:reshape [k-ro :b p kvh dh] [k-rope :b p kvd] {:shape [1 1 num-kv-heads head-dim]}]
          [:dynamic-update-slice [k-cache-out :b kv-s kvh dh] [k-cache-in :b kv-s kvh dh] [k-ro :b p kvh dh]
-          {:start-indices [0 :pos 0 0]}]
+          (merge {:start-indices [0 :pos 0 0]}
+                 (when ring-buffer? {:window window}))]
          [:dynamic-update-slice [v-cache-out :b kv-s kvh dh] [v-cache-in :b kv-s kvh dh] [v-heads :b p kvh dh]
-          {:start-indices [0 :pos 0 0]}]])
+          (merge {:start-indices [0 :pos 0 0]}
+                 (when ring-buffer? {:window window}))]])
 
       ;; 4 & 5. Chunked Scaled Dot-Product Attention (Online Streaming Softmax)
       ;; Tiled across sequence chunks to bound shared memory (LDS) on RDNA3 hardware
@@ -585,13 +589,14 @@
        [actual-k-cache :b kv-s kvh dh]
        [actual-v-cache :b kv-s kvh dh]
        (merge {:pos :pos
-               :chunk-size (min 64 max-seq-len)
+               :chunk-size (min 64 layer-seq-len)
                :head-dim head-dim
                :num-heads num-heads
                :num-kv-heads num-kv-heads
-               :max-seq-len max-seq-len
+               :max-seq-len layer-seq-len
                :shape [1 1 num-heads head-dim]}
-              (when window {:sliding-window window}))]
+              (when ring-buffer? {:ring-buffer true :sliding-window window})
+              (when (and window (not ring-buffer?)) {:sliding-window window}))]
       [:reshape [ctx-flat :b p qd] [ctx :b p h dh] {:shape [1 1 q-dim]}]
 
       ;; 6. Output Projection & Post-Attention RMSNorm

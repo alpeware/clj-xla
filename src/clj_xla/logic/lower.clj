@@ -287,14 +287,31 @@
                            :slice_sizes slice-sizes}}]
     (swap! eqns-atom conj slice-eqn)))
 
-(defn- lower-dynamic-update-slice! [eqns-atom _head op-term up-term attrs final-out-var]
+(defn- lower-dynamic-update-slice! [eqns-atom counter _head op-term up-term attrs final-out-var]
   (let [op-name (first op-term)
         up-name (first up-term)
         starts (or (:start_indices attrs) (:start-indices attrs) [0 0 0 0])
+        window (:window attrs)
+        actual-starts (if (and window (some keyword? starts))
+                        (let [c-win (gen-id "c_win" counter)
+                              c-win-eqn {:op :stablehlo/constant :value (int window) :type [:tensor [] :i32] :outvars [c-win]}
+                              c-win-1d (gen-id "c_win_1d" counter)
+                              c-win-1d-eqn {:op :stablehlo/broadcast_in_dim :invars [c-win] :outvars [c-win-1d]
+                                            :attrs {:broadcast_dimensions [] :target_shape [1]}}
+                              _ (swap! eqns-atom conj c-win-eqn c-win-1d-eqn)]
+                          (mapv (fn [idx]
+                                  (if (keyword? idx)
+                                    (let [mod-var (gen-id "slot_mod" counter)
+                                          mod-eqn {:op :stablehlo/remainder :invars [idx c-win-1d] :outvars [mod-var]}]
+                                      (swap! eqns-atom conj mod-eqn)
+                                      mod-var)
+                                    idx))
+                                starts))
+                        starts)
         update-eqn {:op :stablehlo/dynamic_update_slice
                     :invars [op-name up-name]
                     :outvars [final-out-var]
-                    :attrs {:start_indices starts}}]
+                    :attrs {:start_indices actual-starts}}]
     (swap! eqns-atom conj update-eqn)))
 
 (defn- lower-reshape! [eqns-atom head in-term attrs final-out-var]
@@ -549,7 +566,25 @@
                      :attrs {:comparison_direction "GT"}}
         _ (swap! eqns-atom conj iota-eqn iota-rs-eqn pos-s-eqn pos-5d-eqn cmp-fut-eqn)
 
-        cmp-mask (if window
+        ring-buffer? (:ring-buffer attrs)
+        cmp-mask (cond
+                   ring-buffer?
+                   (let [c-win (gen-id "c_win" counter)
+                         c-win-eqn {:op :stablehlo/constant :value (int window) :type [:tensor [] :i32] :outvars [c-win]}
+                         cmp-full (gen-id "cmp_full" counter)
+                         cmp-full-eqn {:op :stablehlo/compare :invars [pos-scalar c-win] :outvars [cmp-full]
+                                       :attrs {:comparison_direction "GE"}}
+                         cmp-full-5d (gen-id "cmp_full_5d" counter)
+                         cmp-full-5d-eqn {:op :stablehlo/broadcast_in_dim :invars [cmp-full] :outvars [cmp-full-5d]
+                                          :attrs {:broadcast_dimensions [] :target_shape [1 1 num-chunks 1 chunk-size]}}
+                         not-full-5d (gen-id "not_full_5d" counter)
+                         not-full-eqn {:op :stablehlo/not :invars [cmp-full-5d] :outvars [not-full-5d]}
+                         mask-cond (gen-id "mask_cond" counter)
+                         mask-cond-eqn {:op :stablehlo/and :invars [not-full-5d cmp-fut] :outvars [mask-cond]}]
+                     (swap! eqns-atom conj c-win-eqn cmp-full-eqn cmp-full-5d-eqn not-full-eqn mask-cond-eqn)
+                     mask-cond)
+
+                   window
                    (let [c-win (gen-id "c_win" counter)
                          c-win-eqn {:op :stablehlo/constant :value (int window) :type [:tensor [] :i32] :outvars [c-win]}
                          p-sub (gen-id "p_sub_w" counter)
@@ -568,6 +603,8 @@
                          cmp-comb-eqn {:op :stablehlo/or :invars [cmp-fut cmp-old] :outvars [cmp-comb]}]
                      (swap! eqns-atom conj c-win-eqn p-sub-eqn c-one-eqn min-p-eqn min-p-5d-eqn cmp-old-eqn cmp-comb-eqn)
                      cmp-comb)
+
+                   :else
                    cmp-fut)
 
         c-neg (gen-id "c_neg" counter)
@@ -1084,7 +1121,7 @@
           (lower-dynamic-slice! eqns-atom head (first body) (second body) attrs final-var)
 
           (= op :dynamic-update-slice)
-          (lower-dynamic-update-slice! eqns-atom head (first body) (second body) attrs final-var)
+          (lower-dynamic-update-slice! eqns-atom counter head (first body) (second body) attrs final-var)
 
           (= op :reshape)
           (lower-reshape! eqns-atom head (first body) attrs final-var)

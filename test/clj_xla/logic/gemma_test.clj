@@ -301,6 +301,81 @@
       (xla/destroy-buffer! k-out-buf)
       (xla/destroy-buffer! v-out-buf))))
 
+(deftest test-gemma4-kv-cache-step-ring-buffer-lowering
+  (let [num-layers 1
+        max-seq-len 16
+        window 4
+        vocab-size 1000
+        hidden-dim 1536
+        intermediate-dim 6144
+        pl-dim 256
+        total-pl-dim 256
+        config {:vocab-size vocab-size
+                :hidden-dim hidden-dim
+                :intermediate-dim intermediate-dim
+                :pl-dim pl-dim
+                :total-pl-dim total-pl-dim
+                :num-layers num-layers
+                :num-heads 8
+                :num-kv-heads 1
+                :head-dim 256
+                :max-seq-len max-seq-len
+                :sliding-window window}
+        invars [[:x [:tensor [1 1] :i32]]
+                [:pos [:tensor [1] :i32]]]
+        invars (into invars
+                     [[:k_cache_in_0 [:tensor [1 window 1 256] :f32]]
+                      [:v_cache_in_0 [:tensor [1 window 1 256] :f32]]
+                      [:embed_tokens [:tensor [vocab-size hidden-dim] :f32]]
+                      [:embed_tokens_per_layer [:tensor [vocab-size total-pl-dim] :f32]]
+                      [:per_layer_model_projection [:tensor [total-pl-dim hidden-dim] :f32]]
+                      [:per_layer_projection_norm [:tensor [pl-dim] :f32]]
+                      [:final_norm_w [:tensor [hidden-dim] :f32]]
+                      [:input_ln_w_0 [:tensor [hidden-dim] :f32]]
+                      [:layer_scalar_0 [:tensor [1] :f32]]
+                      [:q_w_0 [:tensor [2048 hidden-dim] :f32]]
+                      [:k_w_0 [:tensor [256 hidden-dim] :f32]]
+                      [:v_w_0 [:tensor [256 hidden-dim] :f32]]
+                      [:o_w_0 [:tensor [hidden-dim 2048] :f32]]
+                      [:q_norm_w_0 [:tensor [256] :f32]]
+                      [:k_norm_w_0 [:tensor [256] :f32]]
+                      [:post_attn_ln_w_0 [:tensor [hidden-dim] :f32]]
+                      [:pre_mlp_ln_w_0 [:tensor [hidden-dim] :f32]]
+                      [:post_mlp_ln_w_0 [:tensor [hidden-dim] :f32]]
+                      [:gate_w_0 [:tensor [intermediate-dim hidden-dim] :f32]]
+                      [:up_w_0 [:tensor [intermediate-dim hidden-dim] :f32]]
+                      [:down_w_0 [:tensor [hidden-dim intermediate-dim] :f32]]
+                      [:per_layer_gate_w_0 [:tensor [pl-dim hidden-dim] :f32]]
+                      [:per_layer_proj_w_0 [:tensor [hidden-dim pl-dim] :f32]]
+                      [:post_per_layer_norm_w_0 [:tensor [hidden-dim] :f32]]])
+        ast (gemma/gemma4-kv-model-ast config)
+        graph (lower/ast->graph "gemma4_kv_ring_step" invars ast [:logits :k_cache_out_0 :v_cache_out_0])]
+    (is (shlo/validate-graph graph))
+    (let [ctx (xla/get-context)
+          compiled (xla/compile-graph ctx graph)
+          x-data (int-array [42])
+          pos-data (int-array [6]) ;; 6 mod 4 = 2
+          k-cache (float-array (repeat (* window 256) 0.0))
+          v-cache (float-array (repeat (* window 256) 0.0))
+          weights-data (mapv (fn [[_ [_ shape _]]]
+                               (let [size (reduce * shape)]
+                                 (float-array (repeat size 0.01))))
+                             (subvec invars 4))
+          all-inputs (into [x-data pos-data k-cache v-cache] weights-data)
+          outs (apply xla/execute compiled all-inputs)
+          [logits-buf k-out-buf v-out-buf] (if (vector? outs) outs [outs])
+          logits (xla/to-host-slice logits-buf 0 vocab-size vocab-size)
+          k-out (xla/to-host-slice k-out-buf 0 (* window 256) (* window 256))]
+      (is (= vocab-size (count logits)))
+      ;; Slot 2 (indices 512 to 767) should be populated because 6 mod 4 = 2!
+      (is (some #(not= 0.0 %) (subvec (vec k-out) (* 2 256) (* 3 256))))
+      ;; Slot 0 (indices 0 to 255) and slot 1 (indices 256 to 511) should remain 0.0
+      (is (every? #(= 0.0 %) (subvec (vec k-out) 0 256)))
+      (is (every? #(= 0.0 %) (subvec (vec k-out) 256 512)))
+      (xla/destroy-buffer! logits-buf)
+      (xla/destroy-buffer! k-out-buf)
+      (xla/destroy-buffer! v-out-buf))))
+
 (deftest test-gemma4-kv-cache-step-int8-lowering
   (let [num-layers 1
         max-seq-len 8
@@ -590,5 +665,69 @@
                       arr-std (pjrt/buffer-to-host-buffer ctx res-std n-elem :f32)
                       arr-chunk (pjrt/buffer-to-host-buffer ctx res-chunk n-elem :f32)
                       max-diff (reduce max 0.0 (map #(Math/abs (double (- %1 %2))) arr-std arr-chunk))]
+                  (< max-diff 1e-4))))
+
+(defspec prop-sliding-window-ring-buffer-parity 10
+  (prop/for-all [window (gen/elements [16 32])
+                 mult (gen/elements [2 3])
+                 chunk-size (gen/elements [8 16])
+                 num-heads (gen/elements [4 8])
+                 num-kv-heads (gen/elements [1 2])
+                 head-dim (gen/elements [16 32])
+                 pos-idx (gen/choose 0 95)]
+                (let [max-seq-len (* window mult)
+                      pos (min pos-idx (dec max-seq-len))
+                      group-size (quot num-heads num-kv-heads)
+                      num-heads (* num-kv-heads group-size)
+                      g-std (test-standard-attention-graph max-seq-len num-heads num-kv-heads head-dim window)
+                      invars-ring [[:pos [:tensor [1] :i32]]
+                                   [:q_ro [:tensor [1 1 num-heads head-dim] :f32]]
+                                   [:k_cache [:tensor [1 window num-kv-heads head-dim] :f32]]
+                                   [:v_cache [:tensor [1 window num-kv-heads head-dim] :f32]]]
+                      ast-ring [:block {:name :ring_block}
+                                [:chunked-attention [:ctx :b :p :h :dh]
+                                 [:q_ro :b :p :h :dh]
+                                 [:k_cache :b :kv-s :kvh :dh]
+                                 [:v_cache :b :kv-s :kvh :dh]
+                                 {:pos :pos
+                                  :chunk-size chunk-size
+                                  :head-dim head-dim
+                                  :num-heads num-heads
+                                  :num-kv-heads num-kv-heads
+                                  :max-seq-len window
+                                  :sliding-window window
+                                  :ring-buffer true
+                                  :shape [1 1 num-heads head-dim]}]]
+                      g-ring (lower/ast->graph "test_ring_parity" invars-ring ast-ring [:ctx])
+                      ctx (xla/init-cpu!)
+                      exec-std (xla/compile-graph ctx g-std)
+                      exec-ring (xla/compile-graph ctx g-ring)
+                      pos-buf (xla/buffer-from-host-buffer (int-array [pos]) [1] 4)
+                      q-data (float-array (* 1 1 num-heads head-dim))
+                      _ (dotimes [i (count q-data)] (aset q-data i (float (Math/sin (double (inc i))))))
+                      q-buf (xla/buffer-from-host-buffer q-data [1 1 num-heads head-dim] 11)
+                      k-full (float-array (* 1 max-seq-len num-kv-heads head-dim))
+                      v-full (float-array (* 1 max-seq-len num-kv-heads head-dim))
+                      _ (dotimes [i (count k-full)] (aset k-full i (float (Math/cos (double (inc i))))))
+                      _ (dotimes [i (count v-full)] (aset v-full i (float (Math/sin (* 0.5 (double (inc i)))))))
+                      k-buf-std (xla/buffer-from-host-buffer k-full [1 max-seq-len num-kv-heads head-dim] 11)
+                      v-buf-std (xla/buffer-from-host-buffer v-full [1 max-seq-len num-kv-heads head-dim] 11)
+                      tok-stride (* num-kv-heads head-dim)
+                      k-ring (float-array (* 1 window num-kv-heads head-dim))
+                      v-ring (float-array (* 1 window num-kv-heads head-dim))
+                      _ (dotimes [t (inc pos)]
+                          (let [slot (mod t window)
+                                src-offset (* t tok-stride)
+                                dst-offset (* slot tok-stride)]
+                            (System/arraycopy k-full src-offset k-ring dst-offset tok-stride)
+                            (System/arraycopy v-full src-offset v-ring dst-offset tok-stride)))
+                      k-buf-ring (xla/buffer-from-host-buffer k-ring [1 window num-kv-heads head-dim] 11)
+                      v-buf-ring (xla/buffer-from-host-buffer v-ring [1 window num-kv-heads head-dim] 11)
+                      res-std (xla/execute exec-std [pos-buf q-buf k-buf-std v-buf-std])
+                      res-ring (xla/execute exec-ring [pos-buf q-buf k-buf-ring v-buf-ring])
+                      n-elem (* 1 1 num-heads head-dim)
+                      arr-std (pjrt/buffer-to-host-buffer ctx res-std n-elem :f32)
+                      arr-ring (pjrt/buffer-to-host-buffer ctx res-ring n-elem :f32)
+                      max-diff (reduce max 0.0 (map #(Math/abs (double (- %1 %2))) arr-std arr-ring))]
                   (< max-diff 1e-4))))
 

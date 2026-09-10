@@ -541,10 +541,12 @@
         kv-invars (mapcat (fn [i]
                             (let [cfg (if (seq layer-configs) (nth layer-configs i nil) nil)
                                   is-global? (if cfg (:is-global? cfg) (gemma-logic/layer-is-global? layer-types i))
+                                  win (when-not is-global? (or (:sliding-window cfg) (:sliding-window config) (:sliding_window config) 512))
+                                  seq-l (if win (min max-seq-len win) max-seq-len)
                                   h-dim (or (:head-dim cfg) (if is-global? 512 256))
                                   n-kv (or (:num-kv-heads cfg) 1)]
-                              [[(keyword (str "k_cache_in_" i)) [:tensor [1 max-seq-len n-kv h-dim] norm-dtype]]
-                               [(keyword (str "v_cache_in_" i)) [:tensor [1 max-seq-len n-kv h-dim] norm-dtype]]]))
+                              [[(keyword (str "k_cache_in_" i)) [:tensor [1 seq-l n-kv h-dim] norm-dtype]]
+                               [(keyword (str "v_cache_in_" i)) [:tensor [1 seq-l n-kv h-dim] norm-dtype]]]))
                           (range num-unshared))
         weight-invars (subvec (build-tensor-logic-invars (assoc config :last-token-only? true) max-seq-len) 2)]
     (vec (concat [[:x [:tensor [1 1] :i32]]
@@ -604,11 +606,13 @@
     (vec (mapcat (fn [i]
                    (let [c (if (seq layer-configs) (nth layer-configs i nil) nil)
                          is-global? (if c (:is-global? c) (gemma-logic/layer-is-global? layer-types i))
+                         win (when-not is-global? (or (:sliding-window c) (:sliding-window config) (:sliding_window config) 512))
+                         seq-l (if win (min max-seq-len win) max-seq-len)
                          n-kv (long (or (:num-kv-heads c) 1))
                          h-dim (long (or (:head-dim c) (if is-global? 512 256)))
-                         zeros (float-array (* max-seq-len n-kv h-dim))]
-                     [(pjrt/buffer-from-host-buffer ctx (:client ctx) zeros [1 max-seq-len n-kv h-dim] norm-enum)
-                      (pjrt/buffer-from-host-buffer ctx (:client ctx) zeros [1 max-seq-len n-kv h-dim] norm-enum)]))
+                         zeros (float-array (* seq-l n-kv h-dim))]
+                     [(pjrt/buffer-from-host-buffer ctx (:client ctx) zeros [1 seq-l n-kv h-dim] norm-enum)
+                      (pjrt/buffer-from-host-buffer ctx (:client ctx) zeros [1 seq-l n-kv h-dim] norm-enum)]))
                  (range num-unshared)))))
 
 (defn compile-gemma4-kv-executable
@@ -645,10 +649,12 @@
         kv-invars (mapcat (fn [i]
                             (let [c (if (seq layer-configs) (nth layer-configs i nil) nil)
                                   is-global? (if c (:is-global? c) (gemma-logic/layer-is-global? layer-types i))
+                                  win (when-not is-global? (or (:sliding-window c) (:sliding-window cfg) (:sliding_window cfg) 512))
+                                  seq-l (if win (min max-seq-len win) max-seq-len)
                                   h-dim (or (:head-dim c) (if is-global? 512 256))
                                   n-kv (or (:num-kv-heads c) 1)]
-                              [[(keyword (str "init_k_" i)) [:tensor [1 max-seq-len n-kv h-dim] norm-dtype]]
-                               [(keyword (str "init_v_" i)) [:tensor [1 max-seq-len n-kv h-dim] norm-dtype]]]))
+                              [[(keyword (str "init_k_" i)) [:tensor [1 seq-l n-kv h-dim] norm-dtype]]
+                               [(keyword (str "init_v_" i)) [:tensor [1 seq-l n-kv h-dim] norm-dtype]]]))
                           (range num-unshared))
         weight-invars (subvec (build-tensor-logic-invars cfg max-seq-len) 2)
         kv-init-names (mapcat (fn [i] [(keyword (str "init_k_" i)) (keyword (str "init_v_" i))]) (range num-unshared))
@@ -974,7 +980,7 @@
                       (pos? p-match)
                       (:kv-buffers prior-cache)
 
-                      (some? prefill-exec)
+                      (and (some? prefill-exec) (<= seq-len 2048))
                       nil
 
                       :else
@@ -1193,8 +1199,9 @@
           prefill-exec (binding [profile/*active-trace-spans* trace-spans-atom]
                          (if (:prefill-executable session)
                            (:prefill-executable session)
-                           (when (or (= (or (:method opts) :kv-cache) :kv-cache)
-                                     (:vram-loop? opts) (:vram-loop? session) (= (:method opts) :vram-loop))
+                           (when (and (or (= (or (:method opts) :kv-cache) :kv-cache)
+                                          (:vram-loop? opts) (:vram-loop? session) (= (:method opts) :vram-loop))
+                                      (<= max-seq-len 2048))
                              (profile/with-profile metrics-atom "graph_compilation"
                                (compile-gemma4-prefill-executable session max-seq-len)))))
           active-session (assoc session :prefill-executable prefill-exec)
@@ -1261,7 +1268,8 @@
          exec (if vram-loop?
                 (compile-in-vram-loop-executable session max-seq-len)
                 (compile-gemma4-kv-executable session max-seq-len))
-         prefill-exec (compile-gemma4-prefill-executable session max-seq-len)
+         prefill-exec (when (<= max-seq-len 2048)
+                        (compile-gemma4-prefill-executable session max-seq-len))
          _ (when-not (:quiet opts) (println "Pinning Gemma 4 weights in PJRT VRAM..."))
          device-weights (allocate-device-weights session)]
      (assoc session
