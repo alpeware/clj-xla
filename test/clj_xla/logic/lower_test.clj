@@ -300,3 +300,113 @@
       (is (= [2.0 4.0 6.0 2.0 2.5 3.0] res))
       (xla/destroy-buffer! out-buf))))
 
+(defn- reference-rope
+  [x-vec batch seq-len n-heads head-dim rope-prop theta pos-offset]
+  (let [half-dim (quot head-dim 2)
+        rope-angles (long (* rope-prop half-dim))
+        freqs (mapv (fn [i]
+                      (if (< i rope-angles)
+                        (Math/pow theta (/ (* -2.0 i) (double head-dim)))
+                        0.0))
+                    (range half-dim))]
+    (vec
+     (for [b (range batch)
+           s (range seq-len)
+           h (range n-heads)
+           d (range head-dim)]
+       (let [pos (+ pos-offset s)
+             rot-half (if (< d half-dim) d (- d half-dim))
+             freq (nth freqs rot-half)
+             angle (* (double pos) freq)
+             cos-val (Math/cos angle)
+             sin-val (Math/sin angle)
+             idx (+ (* b seq-len n-heads head-dim)
+                    (* s n-heads head-dim)
+                    (* h head-dim)
+                    d)
+             cur-val (double (nth x-vec idx))]
+         (if (< d half-dim)
+           (let [pair-idx (+ idx half-dim)
+                 pair-val (double (nth x-vec pair-idx))]
+             (- (* cur-val cos-val) (* pair-val sin-val)))
+           (let [pair-idx (- idx half-dim)
+                 pair-val (double (nth x-vec pair-idx))]
+             (+ (* cur-val cos-val) (* pair-val sin-val)))))))))
+
+(defspec prop-lower-rope-produces-valid-graph
+  30
+  (prop/for-all [b (gen/elements [1 2])
+                 seq-len (gen/elements [1 4 8])
+                 head-dim (gen/elements [32 64 128])
+                 n-heads (gen/elements [1 2 4])
+                 rope-prop (gen/elements [1.0 0.5 0.25])]
+                (let [total-dim (* n-heads head-dim)
+                      dynamic? (= seq-len 1)
+                      invars (if dynamic?
+                               [[:x [:tensor [b seq-len total-dim] :f32]]
+                                [:pos [:tensor [1] :i32]]]
+                               [[:x [:tensor [b seq-len total-dim] :f32]]])
+                      attrs (cond-> {:head-dim head-dim
+                                     :theta 10000.0
+                                     :rope-proportion rope-prop}
+                              dynamic? (assoc :pos :pos :max-seq-len 64))
+                      ast [:rope [:y :b :p :d] [:x :b :p :d] attrs]
+                      graph (lower/ast->graph "rope_test_graph" invars ast #{:y})]
+                  (and (shlo/validate-graph graph)
+                       (= [:y] (:outvars graph))
+                       (boolean (some #(= :stablehlo/multiply (:op %)) (:eqns graph)))))))
+
+(deftest test-rope-parity-with-proportional-reference
+  (let [ctx (xla/get-context)
+        batch 1
+        seq-len 4
+        n-heads 2
+        head-dim 8
+        total-dim (* n-heads head-dim)
+        rope-prop 0.5
+        theta 10000.0
+        invars [[:x [:tensor [batch seq-len total-dim] :f32]]]
+        ast [:rope [:y :b :p :d] [:x :b :p :d]
+             {:head-dim head-dim :rope-proportion rope-prop :theta theta}]
+        graph (lower/ast->graph "rope_e2e_static" invars ast #{:y})
+        _ (is (shlo/validate-graph graph))
+        compiled (xla/compile-graph ctx graph)
+        x-raw (vec (map #(float (inc %)) (range (* batch seq-len total-dim))))
+        x-data (float-array x-raw)
+        out-buf (xla/execute compiled x-data)
+        pjrt-res (vec (xla/to-host-slice out-buf 0 (* batch seq-len total-dim) 4))
+        ref-res (reference-rope x-raw batch seq-len n-heads head-dim rope-prop theta 0)]
+    (doseq [i (range (count x-raw))]
+      (is (< (Math/abs (- (double (nth pjrt-res i)) (double (nth ref-res i)))) 1e-4)
+          (str "Mismatch at index " i " pjrt=" (nth pjrt-res i) " ref=" (nth ref-res i))))
+    (xla/destroy-buffer! out-buf))
+
+  (testing "Dynamic KV-Cache step RoPE parity"
+    (let [ctx (xla/get-context)
+          batch 1
+          seq-len 1
+          n-heads 2
+          head-dim 8
+          total-dim (* n-heads head-dim)
+          rope-prop 0.5
+          theta 10000.0
+          pos-val 7
+          invars [[:x [:tensor [batch seq-len total-dim] :f32]]
+                  [:pos [:tensor [1] :i32]]]
+          ast [:rope [:y :b :p :d] [:x :b :p :d]
+               {:head-dim head-dim :rope-proportion rope-prop :theta theta :pos :pos :max-seq-len 16}]
+          graph (lower/ast->graph "rope_e2e_dynamic" invars ast #{:y})
+          _ (is (shlo/validate-graph graph))
+          compiled (xla/compile-graph ctx graph)
+          x-raw (vec (map #(float (inc %)) (range (* batch seq-len total-dim))))
+          x-data (float-array x-raw)
+          pos-data (int-array [pos-val])
+          out-buf (xla/execute compiled x-data pos-data)
+          pjrt-res (vec (xla/to-host-slice out-buf 0 (* batch seq-len total-dim) 4))
+          ref-res (reference-rope x-raw batch seq-len n-heads head-dim rope-prop theta pos-val)]
+      (doseq [i (range (count x-raw))]
+        (is (< (Math/abs (- (double (nth pjrt-res i)) (double (nth ref-res i)))) 1e-4)
+            (str "Dynamic mismatch at index " i " pjrt=" (nth pjrt-res i) " ref=" (nth ref-res i))))
+      (xla/destroy-buffer! out-buf))))
+
+

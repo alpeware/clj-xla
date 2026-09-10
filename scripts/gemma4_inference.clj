@@ -344,6 +344,7 @@
          num-kv-heads (or (:num_key_value_heads text-cfg) (quot (nth k0-shape 0 256) 256))
          head-dim (or (:head_dim text-cfg) 256)
          max-seq-len (long (or (:max-seq-len opts) 16384))
+         model-sliding-window (long (or (:sliding_window text-cfg) (:sliding-window text-cfg) 512))
 
          layer-configs (mapv (fn [i]
                                (let [kmap (gemma-logic/gemma4-weight-key-map i (str prefix-base "layers."))
@@ -366,7 +367,8 @@
                                   :is-global? is-global?
                                   :layer-type (if is-global? :full_attention :sliding_attention)
                                   :rope-proportion rope-prop
-                                  :theta-base theta-base}))
+                                  :theta-base theta-base
+                                  :sliding-window (if is-global? nil model-sliding-window)}))
                              (range num-layers))
 
          weight-dtype (or precision :bf16)
@@ -397,6 +399,7 @@
                :max-seq-len max-seq-len
                :layer-types layer-types-cfg
                :layer-configs layer-configs
+               :sliding-window model-sliding-window
                :num-kv-shared-layers num-kv-shared-layers
                :weight-dtype weight-dtype
                :weight-enum weight-enum

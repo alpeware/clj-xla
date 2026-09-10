@@ -465,18 +465,20 @@
          head-dim (long (or (:head-dim attrs) 64))
          n-heads (quot total-dim head-dim)
          rope-prop (double (or (:rope-proportion attrs) (:partial-rotary-factor attrs) 1.0))
-         rot-dim (long (* head-dim rope-prop))
-         partial? (< rot-dim head-dim)
-         effective-rot-dim (if partial? rot-dim head-dim)
-         half-dim (quot effective-rot-dim 2)
+         half-dim (quot head-dim 2)
+         rope-angles (long (* rope-prop half-dim))
          theta (double (or (:theta attrs) (:theta-base attrs) 10000.0))
 
          dynamic? (and (= seq-len 1) (:pos attrs))
          pos-var (when dynamic? (:pos attrs))
          table-len (if dynamic? (long (or (:max-seq-len attrs) 2048)) seq-len)
 
+         ;; Frequencies are computed with full head-dim as base exponent divisor.
+         ;; Unrotated channels (i >= rope-angles) receive frequency 0.0 (cos=1.0, sin=0.0 -> identity pass).
          freqs (vec (for [i (range half-dim)]
-                      (Math/pow theta (/ (* -2.0 i) (double effective-rot-dim)))))
+                      (if (< i rope-angles)
+                        (Math/pow theta (/ (* -2.0 i) (double head-dim)))
+                        0.0)))
          cos-rows (vec (for [idx (range table-len)]
                          (let [pos idx
                                half (vec (for [i (range half-dim)]
@@ -494,26 +496,9 @@
          trans-var (gen-id "rope_trans" counter)
          trans-eqn {:op :stablehlo/transpose :invars [r4d-var] :outvars [trans-var] :attrs {:permutation [0 2 1 3]}}
 
-         x-rope-var (if partial? (gen-id "rope_x_rot" counter) trans-var)
-         x-pass-var (when partial? (gen-id "rope_x_pass" counter))
-         slice-rot-eqn (when partial?
-                         {:op :stablehlo/slice
-                          :invars [trans-var]
-                          :outvars [x-rope-var]
-                          :attrs {:start_indices [0 0 0 0]
-                                  :limit_indices [batch n-heads seq-len effective-rot-dim]
-                                  :strides [1 1 1 1]}})
-         slice-pass-eqn (when partial?
-                          {:op :stablehlo/slice
-                           :invars [trans-var]
-                           :outvars [x-pass-var]
-                           :attrs {:start_indices [0 0 0 effective-rot-dim]
-                                   :limit_indices [batch n-heads seq-len head-dim]
-                                   :strides [1 1 1 1]}})
-
          x1-var (gen-id "rope_x1" counter)
          x1-eqn {:op :stablehlo/slice
-                 :invars [x-rope-var]
+                 :invars [trans-var]
                  :outvars [x1-var]
                  :attrs {:start_indices [0 0 0 0]
                          :limit_indices [batch n-heads seq-len half-dim]
@@ -521,10 +506,10 @@
 
          x2-var (gen-id "rope_x2" counter)
          x2-eqn {:op :stablehlo/slice
-                 :invars [x-rope-var]
+                 :invars [trans-var]
                  :outvars [x2-var]
                  :attrs {:start_indices [0 0 0 half-dim]
-                         :limit_indices [batch n-heads seq-len effective-rot-dim]
+                         :limit_indices [batch n-heads seq-len head-dim]
                          :strides [1 1 1 1]}}
 
          neg-x2-var (gen-id "rope_neg_x2" counter)
@@ -536,13 +521,13 @@
          c-cos-table (gen-id "rope_cos" counter)
          c-cos-eqn {:op :stablehlo/constant
                     :value [[cos-rows]]
-                    :type [:tensor [1 1 table-len effective-rot-dim] dtype]
+                    :type [:tensor [1 1 table-len head-dim] dtype]
                     :outvars [c-cos-table]}
 
          c-sin-table (gen-id "rope_sin" counter)
          c-sin-eqn {:op :stablehlo/constant
                     :value [[sin-rows]]
-                    :type [:tensor [1 1 table-len effective-rot-dim] dtype]
+                    :type [:tensor [1 1 table-len head-dim] dtype]
                     :outvars [c-sin-table]}
 
          [c-cos-var c-sin-var]
@@ -551,56 +536,57 @@
                  cos-sl-eqn {:op :stablehlo/dynamic_slice
                              :invars [c-cos-table]
                              :outvars [cos-sl]
-                             :attrs {:slice_sizes [1 1 1 effective-rot-dim]
+                             :attrs {:slice_sizes [1 1 1 head-dim]
                                      :start_indices [0 0 pos-var 0]}}
                  sin-sl (gen-id "rope_sin_sl" counter)
                  sin-sl-eqn {:op :stablehlo/dynamic_slice
                              :invars [c-sin-table]
                              :outvars [sin-sl]
-                             :attrs {:slice_sizes [1 1 1 effective-rot-dim]
+                             :attrs {:slice_sizes [1 1 1 head-dim]
                                      :start_indices [0 0 pos-var 0]}}
                  cos-bc (gen-id "rope_cos_bc" counter)
                  cos-bc-eqn {:op :stablehlo/broadcast_in_dim
                              :invars [cos-sl]
                              :outvars [cos-bc]
                              :attrs {:broadcast_dimensions [0 1 2 3]
-                                     :target_shape [batch n-heads 1 effective-rot-dim]}}
+                                     :target_shape [batch n-heads 1 head-dim]}}
                  sin-bc (gen-id "rope_sin_bc" counter)
                  sin-bc-eqn {:op :stablehlo/broadcast_in_dim
                              :invars [sin-sl]
                              :outvars [sin-bc]
                              :attrs {:broadcast_dimensions [0 1 2 3]
-                                     :target_shape [batch n-heads 1 effective-rot-dim]}}]
+                                     :target_shape [batch n-heads 1 head-dim]}}]
              (swap! eqns-atom conj c-cos-eqn c-sin-eqn cos-sl-eqn sin-sl-eqn cos-bc-eqn sin-bc-eqn)
              [cos-bc sin-bc])
-           (do
-             (swap! eqns-atom conj c-cos-eqn c-sin-eqn)
-             [c-cos-table c-sin-table]))
+           (let [cos-bc (gen-id "rope_cos_bc" counter)
+                 cos-bc-eqn {:op :stablehlo/broadcast_in_dim
+                             :invars [c-cos-table]
+                             :outvars [cos-bc]
+                             :attrs {:broadcast_dimensions [0 1 2 3]
+                                     :target_shape [batch n-heads seq-len head-dim]}}
+                 sin-bc (gen-id "rope_sin_bc" counter)
+                 sin-bc-eqn {:op :stablehlo/broadcast_in_dim
+                             :invars [c-sin-table]
+                             :outvars [sin-bc]
+                             :attrs {:broadcast_dimensions [0 1 2 3]
+                                     :target_shape [batch n-heads seq-len head-dim]}}]
+             (swap! eqns-atom conj c-cos-eqn c-sin-eqn cos-bc-eqn sin-bc-eqn)
+             [cos-bc sin-bc]))
 
          x-cos-var (gen-id "rope_x_cos" counter)
-         x-cos-eqn {:op :stablehlo/multiply :invars [x-rope-var c-cos-var] :outvars [x-cos-var]}
+         x-cos-eqn {:op :stablehlo/multiply :invars [trans-var c-cos-var] :outvars [x-cos-var]}
 
          x-sin-var (gen-id "rope_x_sin" counter)
          x-sin-eqn {:op :stablehlo/multiply :invars [rot-var c-sin-var] :outvars [x-sin-var]}
 
-         add-rot-var (if partial? (gen-id "rope_res_rot" counter) (gen-id "rope_res" counter))
-         add-rot-eqn {:op :stablehlo/add :invars [x-cos-var x-sin-var] :outvars [add-rot-var]}
-
-         add-var (if partial? (gen-id "rope_res" counter) add-rot-var)
-         concat-pass-eqn (when partial?
-                           {:op :stablehlo/concatenate :invars [add-rot-var x-pass-var] :outvars [add-var] :attrs {:dimension 3}})
+         add-var (gen-id "rope_res" counter)
+         add-eqn {:op :stablehlo/add :invars [x-cos-var x-sin-var] :outvars [add-var]}
 
          back-trans-var (gen-id "rope_back_trans" counter)
          back-trans-eqn {:op :stablehlo/transpose :invars [add-var] :outvars [back-trans-var] :attrs {:permutation [0 2 1 3]}}
 
          final-eqn {:op :stablehlo/reshape :invars [back-trans-var] :outvars [final-out-var] :attrs {:shape [batch seq-len total-dim]}}]
-     (swap! eqns-atom conj r4d-eqn trans-eqn)
-     (when partial?
-       (swap! eqns-atom conj slice-rot-eqn slice-pass-eqn))
-     (swap! eqns-atom conj x1-eqn x2-eqn neg-x2-eqn rot-eqn x-cos-eqn x-sin-eqn add-rot-eqn)
-     (when partial?
-       (swap! eqns-atom conj concat-pass-eqn))
-     (swap! eqns-atom conj back-trans-eqn final-eqn))))
+     (swap! eqns-atom conj r4d-eqn trans-eqn x1-eqn x2-eqn neg-x2-eqn rot-eqn x-cos-eqn x-sin-eqn add-eqn back-trans-eqn final-eqn))))
 
 (defn- lower-fwht! [eqns-atom counter _head in-term attrs final-out-var known-shapes]
   (let [in-name (first in-term)

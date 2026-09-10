@@ -185,7 +185,7 @@
          group-size (quot num-heads num-kv-heads)
          rope-prop (double (or (:rope-proportion cfg) (if is-global? 0.25 1.0)))
          theta (double (or (:theta-base cfg) (if is-global? 1000000.0 10000.0)))
-         window (if is-global? nil 512)
+         window (if is-global? nil (long (or (:sliding-window cfg) (:sliding-window config) (:sliding_window config) 512)))
 
          is-int8? (boolean (or (:is-int8 config) (= (:weight-dtype config) :int8)))
          norm-dtype (get config :norm-dtype (if is-int8? :bf16 (get config :weight-dtype :bf16)))
@@ -458,7 +458,7 @@
          group-size (quot num-heads num-kv-heads)
          rope-prop (double (or (:rope-proportion cfg) (if is-global? 0.25 1.0)))
          theta (double (or (:theta-base cfg) (if is-global? 1000000.0 10000.0)))
-         window (if is-global? nil 512)
+         window (if is-global? nil (long (or (:sliding-window cfg) (:sliding-window config) (:sliding_window config) 512)))
 
          is-int8? (boolean (or (:is-int8 config) (= (:weight-dtype config) :int8)))
          norm-dtype (get config :norm-dtype (if is-int8? :bf16 (get config :weight-dtype :bf16)))
