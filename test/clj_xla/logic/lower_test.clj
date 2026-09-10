@@ -409,4 +409,38 @@
             (str "Dynamic mismatch at index " i " pjrt=" (nth pjrt-res i) " ref=" (nth ref-res i))))
       (xla/destroy-buffer! out-buf))))
 
+(defspec prop-rope-symbolic-parity 20
+  (prop/for-all [b (gen/elements [1 2])
+                 seq-len (gen/elements [1 4])
+                 head-dim (gen/elements [16 32 64])
+                 n-heads (gen/elements [1 2 4])
+                 rope-prop (gen/elements [1.0 0.5 0.25])
+                 pos-val (gen/choose 0 4095)]
+                (let [total-dim (* n-heads head-dim)
+                      dynamic? (= seq-len 1)
+                      theta 10000.0
+                      invars (if dynamic?
+                               [[:x [:tensor [b seq-len total-dim] :f32]]
+                                [:pos [:tensor [1] :i32]]]
+                               [[:x [:tensor [b seq-len total-dim] :f32]]])
+                      attrs (cond-> {:head-dim head-dim
+                                     :theta theta
+                                     :rope-proportion rope-prop}
+                              dynamic? (assoc :pos :pos :max-seq-len 4096))
+                      ast [:rope [:y :b :p :d] [:x :b :p :d] attrs]
+                      graph (lower/ast->graph "rope_symbolic_test" invars ast #{:y})
+                      ctx (xla/get-context)
+                      compiled (xla/compile-graph ctx graph)
+                      n-elem (* b seq-len total-dim)
+                      x-data (float-array n-elem)
+                      _ (dotimes [i n-elem] (aset x-data i (float (Math/sin (double (inc i))))))
+                      out-buf (if dynamic?
+                                (xla/execute compiled x-data (int-array [pos-val]))
+                                (xla/execute compiled x-data))
+                      pjrt-res (vec (xla/to-host-slice out-buf 0 n-elem 4))
+                      ref-res (reference-rope (vec x-data) b seq-len n-heads head-dim rope-prop theta (if dynamic? pos-val 0))
+                      max-diff (reduce max 0.0 (map #(Math/abs (double (- %1 %2))) pjrt-res ref-res))]
+                  (xla/destroy-buffer! out-buf)
+                  (< max-diff 5e-4))))
+
 

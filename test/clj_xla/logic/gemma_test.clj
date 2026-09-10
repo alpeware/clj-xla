@@ -463,58 +463,85 @@
                              :max-seq-len max-seq-len}]]
                   (ast/valid-node? node))))
 
-(defn- test-standard-attention-graph [max-seq-len num-heads num-kv-heads head-dim]
-  (let [group-size (quot num-heads num-kv-heads)
-        invars [[:pos [:tensor [1] :i32]]
-                [:q_ro [:tensor [1 1 num-heads head-dim] :f32]]
-                [:k_cache [:tensor [1 max-seq-len num-kv-heads head-dim] :f32]]
-                [:v_cache [:tensor [1 max-seq-len num-kv-heads head-dim] :f32]]]
-        outvars [:ctx]
-        eqs [{:op :stablehlo/broadcast_in_dim :invars [:k_cache] :outvars [:k_rep]
-              :attrs {:broadcast_dimensions [0 1 2 4] :target_shape [1 max-seq-len num-kv-heads group-size head-dim]}}
-             {:op :stablehlo/reshape :invars [:k_rep] :outvars [:k_heads]
-              :attrs {:shape [1 max-seq-len num-heads head-dim]}}
-             {:op :stablehlo/broadcast_in_dim :invars [:v_cache] :outvars [:v_rep]
-              :attrs {:broadcast_dimensions [0 1 2 4] :target_shape [1 max-seq-len num-kv-heads group-size head-dim]}}
-             {:op :stablehlo/reshape :invars [:v_rep] :outvars [:v_heads]
-              :attrs {:shape [1 max-seq-len num-heads head-dim]}}
+(defn- test-standard-attention-graph
+  ([max-seq-len num-heads num-kv-heads head-dim]
+   (test-standard-attention-graph max-seq-len num-heads num-kv-heads head-dim nil))
+  ([max-seq-len num-heads num-kv-heads head-dim window]
+   (let [group-size (quot num-heads num-kv-heads)
+         invars [[:pos [:tensor [1] :i32]]
+                 [:q_ro [:tensor [1 1 num-heads head-dim] :f32]]
+                 [:k_cache [:tensor [1 max-seq-len num-kv-heads head-dim] :f32]]
+                 [:v_cache [:tensor [1 max-seq-len num-kv-heads head-dim] :f32]]]
+         outvars [:ctx]
+         mask-eqns (if window
+                     [{:op :stablehlo/iota :outvars [:iota_1d] :attrs {:len max-seq-len :dtype :i32 :iota_dimension 0}}
+                      {:op :stablehlo/broadcast_in_dim :invars [:iota_1d] :outvars [:iota_4d]
+                       :attrs {:broadcast_dimensions [3] :target_shape [1 1 1 max-seq-len]}}
+                      {:op :stablehlo/reshape :invars [:pos] :outvars [:pos_s] :attrs {:shape []}}
+                      {:op :stablehlo/broadcast_in_dim :invars [:pos_s] :outvars [:pos_4d]
+                       :attrs {:broadcast_dimensions [] :target_shape [1 1 1 max-seq-len]}}
+                      {:op :stablehlo/compare :invars [:iota_4d :pos_4d] :outvars [:cmp_fut] :attrs {:comparison_direction "GT"}}
+                      {:op :stablehlo/constant :value (int window) :type [:tensor [] :i32] :outvars [:c_win]}
+                      {:op :stablehlo/subtract :invars [:pos_s :c_win] :outvars [:p_sub]}
+                      {:op :stablehlo/constant :value 1 :type [:tensor [] :i32] :outvars [:c_one]}
+                      {:op :stablehlo/add :invars [:p_sub :c_one] :outvars [:min_p]}
+                      {:op :stablehlo/broadcast_in_dim :invars [:min_p] :outvars [:min_p_4d]
+                       :attrs {:broadcast_dimensions [] :target_shape [1 1 1 max-seq-len]}}
+                      {:op :stablehlo/compare :invars [:iota_4d :min_p_4d] :outvars [:cmp_old] :attrs {:comparison_direction "LT"}}
+                      {:op :stablehlo/or :invars [:cmp_fut :cmp_old] :outvars [:cmp_mask]}
+                      {:op :stablehlo/constant :value -10000.0 :type [:tensor [] :f32] :outvars [:c_neg]}
+                      {:op :stablehlo/broadcast_in_dim :invars [:c_neg] :outvars [:c_neg_4d]
+                       :attrs {:broadcast_dimensions [] :target_shape [1 1 1 max-seq-len]}}
+                      {:op :stablehlo/constant :value 0.0 :type [:tensor [] :f32] :outvars [:c_zero]}
+                      {:op :stablehlo/broadcast_in_dim :invars [:c_zero] :outvars [:c_zero_4d]
+                       :attrs {:broadcast_dimensions [] :target_shape [1 1 1 max-seq-len]}}
+                      {:op :stablehlo/select :invars [:cmp_mask :c_neg_4d :c_zero_4d] :outvars [:mask_4d]}
+                      {:op :stablehlo/broadcast_in_dim :invars [:mask_4d] :outvars [:mask_bcast]
+                       :attrs {:broadcast_dimensions [0 1 2 3] :target_shape [1 num-heads 1 max-seq-len]}}]
+                     [{:op :stablehlo/iota :outvars [:iota_1d] :attrs {:len max-seq-len :dtype :i32 :iota_dimension 0}}
+                      {:op :stablehlo/broadcast_in_dim :invars [:iota_1d] :outvars [:iota_4d]
+                       :attrs {:broadcast_dimensions [3] :target_shape [1 1 1 max-seq-len]}}
+                      {:op :stablehlo/reshape :invars [:pos] :outvars [:pos_s] :attrs {:shape []}}
+                      {:op :stablehlo/broadcast_in_dim :invars [:pos_s] :outvars [:pos_4d]
+                       :attrs {:broadcast_dimensions [] :target_shape [1 1 1 max-seq-len]}}
+                      {:op :stablehlo/compare :invars [:iota_4d :pos_4d] :outvars [:cmp_fut] :attrs {:comparison_direction "GT"}}
+                      {:op :stablehlo/constant :value -10000.0 :type [:tensor [] :f32] :outvars [:c_neg]}
+                      {:op :stablehlo/broadcast_in_dim :invars [:c_neg] :outvars [:c_neg_4d]
+                       :attrs {:broadcast_dimensions [] :target_shape [1 1 1 max-seq-len]}}
+                      {:op :stablehlo/constant :value 0.0 :type [:tensor [] :f32] :outvars [:c_zero]}
+                      {:op :stablehlo/broadcast_in_dim :invars [:c_zero] :outvars [:c_zero_4d]
+                       :attrs {:broadcast_dimensions [] :target_shape [1 1 1 max-seq-len]}}
+                      {:op :stablehlo/select :invars [:cmp_fut :c_neg_4d :c_zero_4d] :outvars [:mask_4d]}
+                      {:op :stablehlo/broadcast_in_dim :invars [:mask_4d] :outvars [:mask_bcast]
+                       :attrs {:broadcast_dimensions [0 1 2 3] :target_shape [1 num-heads 1 max-seq-len]}}])
+         eqs (vec (concat [{:op :stablehlo/broadcast_in_dim :invars [:k_cache] :outvars [:k_rep]
+                            :attrs {:broadcast_dimensions [0 1 2 4] :target_shape [1 max-seq-len num-kv-heads group-size head-dim]}}
+                           {:op :stablehlo/reshape :invars [:k_rep] :outvars [:k_heads]
+                            :attrs {:shape [1 max-seq-len num-heads head-dim]}}
+                           {:op :stablehlo/broadcast_in_dim :invars [:v_cache] :outvars [:v_rep]
+                            :attrs {:broadcast_dimensions [0 1 2 4] :target_shape [1 max-seq-len num-kv-heads group-size head-dim]}}
+                           {:op :stablehlo/reshape :invars [:v_rep] :outvars [:v_heads]
+                            :attrs {:shape [1 max-seq-len num-heads head-dim]}}
 
-             {:op :stablehlo/dot_general :invars [:q_ro :k_heads] :outvars [:scores_4d]
-              :attrs {:batch_dims {:lhs [0 2] :rhs [0 2]} :contracting_dims {:lhs [3] :rhs [3]}}}
-             {:op :stablehlo/reshape :invars [:scores_4d] :outvars [:scores]
-              :attrs {:shape [1 num-heads 1 max-seq-len]}}
+                           {:op :stablehlo/dot_general :invars [:q_ro :k_heads] :outvars [:scores_4d]
+                            :attrs {:batch_dims {:lhs [0 2] :rhs [0 2]} :contracting_dims {:lhs [3] :rhs [3]}}}
+                           {:op :stablehlo/reshape :invars [:scores_4d] :outvars [:scores]
+                            :attrs {:shape [1 num-heads 1 max-seq-len]}}]
+                          mask-eqns
+                          [{:op :stablehlo/add :invars [:scores :mask_bcast] :outvars [:masked_scores]}
+                           {:op :stablehlo/reduce_max :invars [:masked_scores] :outvars [:max_val]
+                            :attrs {:axes [-1] :keep_dims true}}
+                           {:op :stablehlo/subtract :invars [:masked_scores :max_val] :outvars [:s_diff]}
+                           {:op :stablehlo/exp :invars [:s_diff] :outvars [:s_exp]}
+                           {:op :stablehlo/reduce_sum :invars [:s_exp] :outvars [:s_sum]
+                            :attrs {:axes [-1] :keep_dims true}}
+                           {:op :stablehlo/divide :invars [:s_exp :s_sum] :outvars [:probs]}
 
-             {:op :stablehlo/iota :outvars [:iota_1d] :attrs {:len max-seq-len :dtype :i32 :iota_dimension 0}}
-             {:op :stablehlo/broadcast_in_dim :invars [:iota_1d] :outvars [:iota_4d]
-              :attrs {:broadcast_dimensions [3] :target_shape [1 1 1 max-seq-len]}}
-             {:op :stablehlo/reshape :invars [:pos] :outvars [:pos_s] :attrs {:shape []}}
-             {:op :stablehlo/broadcast_in_dim :invars [:pos_s] :outvars [:pos_4d]
-              :attrs {:broadcast_dimensions [] :target_shape [1 1 1 max-seq-len]}}
-             {:op :stablehlo/compare :invars [:iota_4d :pos_4d] :outvars [:cmp_fut] :attrs {:comparison_direction "GT"}}
-             {:op :stablehlo/constant :value -10000.0 :type [:tensor [] :f32] :outvars [:c_neg]}
-             {:op :stablehlo/broadcast_in_dim :invars [:c_neg] :outvars [:c_neg_4d]
-              :attrs {:broadcast_dimensions [] :target_shape [1 1 1 max-seq-len]}}
-             {:op :stablehlo/constant :value 0.0 :type [:tensor [] :f32] :outvars [:c_zero]}
-             {:op :stablehlo/broadcast_in_dim :invars [:c_zero] :outvars [:c_zero_4d]
-              :attrs {:broadcast_dimensions [] :target_shape [1 1 1 max-seq-len]}}
-             {:op :stablehlo/select :invars [:cmp_fut :c_neg_4d :c_zero_4d] :outvars [:mask_4d]}
-             {:op :stablehlo/broadcast_in_dim :invars [:mask_4d] :outvars [:mask_bcast]
-              :attrs {:broadcast_dimensions [0 1 2 3] :target_shape [1 num-heads 1 max-seq-len]}}
-             {:op :stablehlo/add :invars [:scores :mask_bcast] :outvars [:masked_scores]}
-
-             {:op :stablehlo/reduce_max :invars [:masked_scores] :outvars [:max_val]
-              :attrs {:axes [-1] :keep_dims true}}
-             {:op :stablehlo/subtract :invars [:masked_scores :max_val] :outvars [:s_diff]}
-             {:op :stablehlo/exp :invars [:s_diff] :outvars [:s_exp]}
-             {:op :stablehlo/reduce_sum :invars [:s_exp] :outvars [:s_sum]
-              :attrs {:axes [-1] :keep_dims true}}
-             {:op :stablehlo/divide :invars [:s_exp :s_sum] :outvars [:probs]}
-
-             {:op :stablehlo/dot_general :invars [:probs :v_heads] :outvars [:ctx_raw]
-              :attrs {:batch_dims {:lhs [0 1] :rhs [0 2]} :contracting_dims {:lhs [3] :rhs [1]}}}
-             {:op :stablehlo/reshape :invars [:ctx_raw] :outvars [:ctx]
-              :attrs {:shape [1 1 num-heads head-dim]}}]]
-    (shlo/validate-graph {:name "test_standard_attn" :invars invars :outvars outvars :eqns eqs})))
+                           {:op :stablehlo/dot_general :invars [:probs :v_heads] :outvars [:ctx_raw]
+                            :attrs {:batch_dims {:lhs [0 1] :rhs [0 2]} :contracting_dims {:lhs [3] :rhs [1]}}}
+                           {:op :stablehlo/reshape :invars [:ctx_raw] :outvars [:ctx]
+                            :attrs {:shape [1 1 num-heads head-dim]}}]))]
+     (shlo/validate-graph {:name "test_standard_attn" :invars invars :outvars outvars :eqns eqs}))))
 
 (defspec prop-chunked-attention-parity 10
   (prop/for-all [max-seq-len (gen/elements [64 128])

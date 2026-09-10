@@ -704,31 +704,17 @@
 
          dynamic? (and (= seq-len 1) (:pos attrs))
          pos-var (when dynamic? (:pos attrs))
-         table-len (if dynamic? (long (or (:max-seq-len attrs) 2048)) seq-len)
 
-         ;; Frequencies are computed with full head-dim as base exponent divisor.
+         ;; Frequencies: full head-dim as base exponent divisor.
          ;; Unrotated channels (i >= rope-angles) receive frequency 0.0 (cos=1.0, sin=0.0 -> identity pass).
          freqs (vec (for [i (range half-dim)]
                       (if (< i rope-angles)
                         (Math/pow theta (/ (* -2.0 i) (double head-dim)))
                         0.0)))
-         cos-rows (vec (for [idx (range table-len)]
-                         (let [pos idx
-                               half (vec (for [i (range half-dim)]
-                                           (Math/cos (* (double pos) (nth freqs i)))))]
-                           (vec (concat half half)))))
-         sin-rows (vec (for [idx (range table-len)]
-                         (let [pos idx
-                               half (vec (for [i (range half-dim)]
-                                           (Math/sin (* (double pos) (nth freqs i)))))]
-                           (vec (concat half half)))))
-
          r4d-var (gen-id "rope_r4d" counter)
          r4d-eqn {:op :stablehlo/reshape :invars [in-name] :outvars [r4d-var] :attrs {:shape [batch seq-len n-heads head-dim]}}
-
          trans-var (gen-id "rope_trans" counter)
          trans-eqn {:op :stablehlo/transpose :invars [r4d-var] :outvars [trans-var] :attrs {:permutation [0 2 1 3]}}
-
          x1-var (gen-id "rope_x1" counter)
          x1-eqn {:op :stablehlo/slice
                  :invars [trans-var]
@@ -736,7 +722,6 @@
                  :attrs {:start_indices [0 0 0 0]
                          :limit_indices [batch n-heads seq-len half-dim]
                          :strides [1 1 1 1]}}
-
          x2-var (gen-id "rope_x2" counter)
          x2-eqn {:op :stablehlo/slice
                  :invars [trans-var]
@@ -744,67 +729,69 @@
                  :attrs {:start_indices [0 0 0 half-dim]
                          :limit_indices [batch n-heads seq-len head-dim]
                          :strides [1 1 1 1]}}
-
          neg-x2-var (gen-id "rope_neg_x2" counter)
          neg-x2-eqn {:op :stablehlo/negate :invars [x2-var] :outvars [neg-x2-var]}
-
          rot-var (gen-id "rope_rot" counter)
          rot-eqn {:op :stablehlo/concatenate :invars [neg-x2-var x1-var] :outvars [rot-var] :attrs {:dimension 3}}
+         _ (swap! eqns-atom conj r4d-eqn trans-eqn x1-eqn x2-eqn neg-x2-eqn rot-eqn)
 
-         c-cos-table (gen-id "rope_cos" counter)
-         c-cos-eqn {:op :stablehlo/constant
-                    :value [[cos-rows]]
-                    :type [:tensor [1 1 table-len head-dim] dtype]
-                    :outvars [c-cos-table]}
+         c-freqs (gen-id "rope_freqs" counter)
+         c-freqs-eqn {:op :stablehlo/constant :value freqs :type [:tensor [half-dim] :f32] :outvars [c-freqs]}
+         freqs-4d (gen-id "rope_freqs_4d" counter)
+         freqs-4d-eqn {:op :stablehlo/broadcast_in_dim :invars [c-freqs] :outvars [freqs-4d]
+                       :attrs {:broadcast_dimensions [3] :target_shape [1 1 seq-len half-dim]}}
+         _ (swap! eqns-atom conj c-freqs-eqn freqs-4d-eqn)
 
-         c-sin-table (gen-id "rope_sin" counter)
-         c-sin-eqn {:op :stablehlo/constant
-                    :value [[sin-rows]]
-                    :type [:tensor [1 1 table-len head-dim] dtype]
-                    :outvars [c-sin-table]}
+         pos-4d (if dynamic?
+                  (let [pos-s (gen-id "rope_pos_s" counter)
+                        pos-s-eqn {:op :stablehlo/reshape :invars [pos-var] :outvars [pos-s] :attrs {:shape []}}
+                        pos-f32 (gen-id "rope_pos_f32" counter)
+                        pos-f32-eqn {:op :stablehlo/convert :invars [pos-s] :outvars [pos-f32] :attrs {:target_dtype :f32}}
+                        p4d (gen-id "rope_pos_4d" counter)
+                        p4d-eqn {:op :stablehlo/broadcast_in_dim :invars [pos-f32] :outvars [p4d]
+                                 :attrs {:broadcast_dimensions [] :target_shape [1 1 1 half-dim]}}]
+                    (swap! eqns-atom conj pos-s-eqn pos-f32-eqn p4d-eqn)
+                    p4d)
+                  (let [iota-1d (gen-id "rope_iota" counter)
+                        iota-eqn {:op :stablehlo/iota :outvars [iota-1d] :attrs {:len seq-len :dtype :i32 :iota_dimension 0}}
+                        iota-f32 (gen-id "rope_iota_f32" counter)
+                        iota-f32-eqn {:op :stablehlo/convert :invars [iota-1d] :outvars [iota-f32] :attrs {:target_dtype :f32}}
+                        p4d (gen-id "rope_pos_4d" counter)
+                        p4d-eqn {:op :stablehlo/broadcast_in_dim :invars [iota-f32] :outvars [p4d]
+                                 :attrs {:broadcast_dimensions [2] :target_shape [1 1 seq-len half-dim]}}]
+                    (swap! eqns-atom conj iota-eqn iota-f32-eqn p4d-eqn)
+                    p4d))
 
-         [c-cos-var c-sin-var]
-         (if dynamic?
-           (let [cos-sl (gen-id "rope_cos_sl" counter)
-                 cos-sl-eqn {:op :stablehlo/dynamic_slice
-                             :invars [c-cos-table]
-                             :outvars [cos-sl]
-                             :attrs {:slice_sizes [1 1 1 head-dim]
-                                     :start_indices [0 0 pos-var 0]}}
-                 sin-sl (gen-id "rope_sin_sl" counter)
-                 sin-sl-eqn {:op :stablehlo/dynamic_slice
-                             :invars [c-sin-table]
-                             :outvars [sin-sl]
-                             :attrs {:slice_sizes [1 1 1 head-dim]
-                                     :start_indices [0 0 pos-var 0]}}
-                 cos-bc (gen-id "rope_cos_bc" counter)
-                 cos-bc-eqn {:op :stablehlo/broadcast_in_dim
-                             :invars [cos-sl]
-                             :outvars [cos-bc]
-                             :attrs {:broadcast_dimensions [0 1 2 3]
-                                     :target_shape [batch n-heads 1 head-dim]}}
-                 sin-bc (gen-id "rope_sin_bc" counter)
-                 sin-bc-eqn {:op :stablehlo/broadcast_in_dim
-                             :invars [sin-sl]
-                             :outvars [sin-bc]
-                             :attrs {:broadcast_dimensions [0 1 2 3]
-                                     :target_shape [batch n-heads 1 head-dim]}}]
-             (swap! eqns-atom conj c-cos-eqn c-sin-eqn cos-sl-eqn sin-sl-eqn cos-bc-eqn sin-bc-eqn)
-             [cos-bc sin-bc])
-           (let [cos-bc (gen-id "rope_cos_bc" counter)
-                 cos-bc-eqn {:op :stablehlo/broadcast_in_dim
-                             :invars [c-cos-table]
-                             :outvars [cos-bc]
-                             :attrs {:broadcast_dimensions [0 1 2 3]
-                                     :target_shape [batch n-heads seq-len head-dim]}}
-                 sin-bc (gen-id "rope_sin_bc" counter)
-                 sin-bc-eqn {:op :stablehlo/broadcast_in_dim
-                             :invars [c-sin-table]
-                             :outvars [sin-bc]
-                             :attrs {:broadcast_dimensions [0 1 2 3]
-                                     :target_shape [batch n-heads seq-len head-dim]}}]
-             (swap! eqns-atom conj c-cos-eqn c-sin-eqn cos-bc-eqn sin-bc-eqn)
-             [cos-bc sin-bc]))
+         ang-half (gen-id "rope_ang_half" counter)
+         ang-half-eqn {:op :stablehlo/multiply :invars [pos-4d freqs-4d] :outvars [ang-half]}
+         ang-full (gen-id "rope_ang_full" counter)
+         ang-full-eqn {:op :stablehlo/concatenate :invars [ang-half ang-half] :outvars [ang-full] :attrs {:dimension 3}}
+         cos-raw (gen-id "rope_cos_raw" counter)
+         cos-raw-eqn {:op :stablehlo/cosine :invars [ang-full] :outvars [cos-raw]}
+         sin-raw (gen-id "rope_sin_raw" counter)
+         sin-raw-eqn {:op :stablehlo/sine :invars [ang-full] :outvars [sin-raw]}
+         _ (swap! eqns-atom conj ang-half-eqn ang-full-eqn cos-raw-eqn sin-raw-eqn)
+
+         cos-dt (if (= dtype :f32)
+                  cos-raw
+                  (let [c-dt (gen-id "rope_cos_dt" counter)
+                        c-eqn {:op :stablehlo/convert :invars [cos-raw] :outvars [c-dt] :attrs {:target_dtype dtype}}]
+                    (swap! eqns-atom conj c-eqn)
+                    c-dt))
+         sin-dt (if (= dtype :f32)
+                  sin-raw
+                  (let [s-dt (gen-id "rope_sin_dt" counter)
+                        s-eqn {:op :stablehlo/convert :invars [sin-raw] :outvars [s-dt] :attrs {:target_dtype dtype}}]
+                    (swap! eqns-atom conj s-eqn)
+                    s-dt))
+
+         c-cos-var (gen-id "rope_cos_bc" counter)
+         c-cos-eqn {:op :stablehlo/broadcast_in_dim :invars [cos-dt] :outvars [c-cos-var]
+                    :attrs {:broadcast_dimensions [0 1 2 3] :target_shape [batch n-heads seq-len head-dim]}}
+         c-sin-var (gen-id "rope_sin_bc" counter)
+         c-sin-eqn {:op :stablehlo/broadcast_in_dim :invars [sin-dt] :outvars [c-sin-var]
+                    :attrs {:broadcast_dimensions [0 1 2 3] :target_shape [batch n-heads seq-len head-dim]}}
+         _ (swap! eqns-atom conj c-cos-eqn c-sin-eqn)
 
          x-cos-var (gen-id "rope_x_cos" counter)
          x-cos-eqn {:op :stablehlo/multiply :invars [trans-var c-cos-var] :outvars [x-cos-var]}
@@ -819,7 +806,7 @@
          back-trans-eqn {:op :stablehlo/transpose :invars [add-var] :outvars [back-trans-var] :attrs {:permutation [0 2 1 3]}}
 
          final-eqn {:op :stablehlo/reshape :invars [back-trans-var] :outvars [final-out-var] :attrs {:shape [batch seq-len total-dim]}}]
-     (swap! eqns-atom conj r4d-eqn trans-eqn x1-eqn x2-eqn neg-x2-eqn rot-eqn x-cos-eqn x-sin-eqn add-eqn back-trans-eqn final-eqn))))
+     (swap! eqns-atom conj x-cos-eqn x-sin-eqn add-eqn back-trans-eqn final-eqn))))
 
 (defn- lower-fwht! [eqns-atom counter _head in-term attrs final-out-var known-shapes]
   (let [in-name (first in-term)
