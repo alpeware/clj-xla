@@ -606,6 +606,19 @@
   [config]
   (gemma-logic/gemma4-prefill-outvars config (:max-seq-len config)))
 
+(defn max-safe-prefill-seq-len
+  "Returns the maximum sequence length for 1-shot parallel prefill that safely fits in VRAM
+   without exceeding device workspace headroom."
+  [config]
+  (cond
+    (or (:is-int4 config)
+        (re-find #"31[bB]" (or (:model-dir config) ""))
+        (>= (long (or (:num-layers config) 0)) 60))
+    2048
+
+    :else
+    8192))
+
 (defn compile-gemma4-prefill-executable
   "Compiles Gemma 4 model AST into a native StableHLO MLIR prefill executable that produces
    the next-token logits and initial populated KV cache tensors in a single parallel step."
@@ -752,7 +765,7 @@
     (xla/compile-graph ctx loop-graph)))
 
 (defn run-vram-loop-generation
-  "Executes autoregressive token generation entirely within device VRAM using 1-shot prefill and an OpenXLA while-loop carrying KV-Cache."
+  "Executes autoregressive token generation entirely within device VRAM using 1-shot prefill (or sequential prefill for large contexts) and an OpenXLA while-loop carrying KV-Cache."
   [session exec device-weights prompt-ids max-seq-len]
   (let [{:keys [ctx opts config kv-state prefill-executable]} session
         {:keys [max-new-tokens quiet]} opts
@@ -771,29 +784,65 @@
             num-layers (long (or (:num-layers config) 35))
             num-kv-shared (long (or (:num-kv-shared-layers config) 0))
             num-unshared (- num-layers num-kv-shared)
-            num-prefill-outs (inc (* 2 num-unshared))
+            safe-prefill-len (max-safe-prefill-seq-len config)
             prefill-exec (or prefill-executable
                              (:prefill-executable session)
-                             (compile-gemma4-prefill-executable session seq-len))
-
-            ;; 1. Run 1-shot parallel prefill to populate KV cache for prompt tokens
+                             (when (<= seq-len safe-prefill-len)
+                               (compile-gemma4-prefill-executable session seq-len)))
             in-arr (int-array seq-len)
             _ (dotimes [i p-count] (aset in-arr i (int (nth clamped-prompt-ids i))))
-            pos-p (int-array [(dec p-count)])
-            in-b (xla/buffer-from-host-buffer ctx (:client ctx) in-arr [1 seq-len] 4)
-            pos-b (xla/buffer-from-host-buffer ctx (:client ctx) pos-p [1] 4)
-            prefill-inputs (into [in-b pos-b] device-weights)
 
+            ;; 1. Populate KV cache for prompt tokens (Parallel or Sequential)
             t-prefill-0 (System/nanoTime)
-            prefill-outs (pjrt/execute-executable ctx (or (:handle prefill-exec) prefill-exec) prefill-inputs num-prefill-outs)
+            prefill-kv (if (some? prefill-exec)
+                         ;; Path A: 1-shot parallel prefill
+                         (let [pos-p (int-array [(dec p-count)])
+                               in-b (xla/buffer-from-host-buffer ctx (:client ctx) in-arr [1 seq-len] 4)
+                               pos-b (xla/buffer-from-host-buffer ctx (:client ctx) pos-p [1] 4)
+                               prefill-inputs (into [in-b pos-b] device-weights)
+                               num-prefill-outs (inc (* 2 num-unshared))
+                               prefill-outs (pjrt/execute-executable ctx (or (:handle prefill-exec) prefill-exec) prefill-inputs num-prefill-outs)
+                               _ (xla/destroy-buffer! ctx in-b)
+                               _ (xla/destroy-buffer! ctx pos-b)
+                               prefill-outs-vec (if (vector? prefill-outs) prefill-outs [prefill-outs])
+                               prefill-logits (first prefill-outs-vec)
+                               kv-outs (vec (subvec prefill-outs-vec 1))]
+                           (xla/destroy-buffer! ctx prefill-logits)
+                           kv-outs)
+                         ;; Path B: Sequential prefill for sequence lengths exceeding VRAM parallel workspace headroom
+                         (let [step-exec (or (:step-executable session)
+                                             (compile-gemma4-kv-executable session seq-len))
+                               initial-kv (allocate-kv-cache-buffers session seq-len)
+                               num-step-outs (inc (* 2 num-unshared))
+                               x-arr (int-array 1)
+                               pos-arr (int-array 1)
+                               prefill-limit (max 0 (dec p-count))]
+                           (when-not quiet
+                             (println (format "Prefilling %d prompt tokens into KV-Cache (exceeds parallel prefill limit %d)..."
+                                              prefill-limit safe-prefill-len)))
+                           (loop [p 0
+                                  cur-kv initial-kv
+                                  cur-log nil]
+                             (if (< p prefill-limit)
+                               (let [tok (int (nth clamped-prompt-ids p))
+                                     _ (aset x-arr 0 tok)
+                                     _ (aset pos-arr 0 p)
+                                     x-b (xla/buffer-from-host-buffer ctx (:client ctx) x-arr [1 1] 4)
+                                     pos-b (xla/buffer-from-host-buffer ctx (:client ctx) pos-arr [1] 4)
+                                     step-inputs (into [x-b pos-b] (concat cur-kv device-weights))
+                                     outs (pjrt/execute-executable ctx (or (:handle step-exec) step-exec) step-inputs num-step-outs)
+                                     _ (xla/destroy-buffer! ctx x-b)
+                                     _ (xla/destroy-buffer! ctx pos-b)
+                                     outs-vec (if (vector? outs) outs [outs])
+                                     new-log (first outs-vec)
+                                     new-kv (vec (subvec outs-vec 1))]
+                                 (when cur-log (xla/destroy-buffer! ctx cur-log))
+                                 (doseq [b cur-kv] (xla/destroy-buffer! ctx b))
+                                 (recur (inc p) new-kv new-log))
+                               (do
+                                 (when cur-log (xla/destroy-buffer! ctx cur-log))
+                                 cur-kv)))))
             t-prefill-1 (System/nanoTime)
-            _ (xla/destroy-buffer! ctx in-b)
-            _ (xla/destroy-buffer! ctx pos-b)
-
-            prefill-outs-vec (if (vector? prefill-outs) prefill-outs [prefill-outs])
-            prefill-logits (first prefill-outs-vec)
-            prefill-kv (vec (subvec prefill-outs-vec 1))
-            _ (xla/destroy-buffer! ctx prefill-logits)
             prefill-ms (/ (- t-prefill-1 t-prefill-0) 1e6)
 
             ;; 2. Run In-VRAM While Loop carrying the KV cache
@@ -1008,7 +1057,7 @@
                       (pos? p-match)
                       (:kv-buffers prior-cache)
 
-                      (and (some? prefill-exec) (<= seq-len 8192))
+                      (and (some? prefill-exec) (<= seq-len (max-safe-prefill-seq-len config)))
                       nil
 
                       :else
@@ -1224,15 +1273,23 @@
 
                        :else
                        (compile-gemma4-kv-executable session max-seq-len)))))
+          safe-prefill-len (max-safe-prefill-seq-len (:config session))
           prefill-exec (binding [profile/*active-trace-spans* trace-spans-atom]
                          (if (:prefill-executable session)
                            (:prefill-executable session)
                            (when (and (or (= (or (:method opts) :kv-cache) :kv-cache)
                                           (:vram-loop? opts) (:vram-loop? session) (= (:method opts) :vram-loop))
-                                      (or (<= max-seq-len 8192) (:vram-loop? opts) (:vram-loop? session) (= (:method opts) :vram-loop)))
+                                      (<= max-seq-len safe-prefill-len))
                              (profile/with-profile metrics-atom "graph_compilation"
                                (compile-gemma4-prefill-executable session max-seq-len)))))
-          active-session (assoc session :prefill-executable prefill-exec)
+          step-exec (binding [profile/*active-trace-spans* trace-spans-atom]
+                      (when (and (or (:vram-loop? opts) (:vram-loop? session) (= (:method opts) :vram-loop))
+                                 (> max-seq-len safe-prefill-len))
+                        (profile/with-profile metrics-atom "graph_compilation"
+                          (compile-gemma4-kv-executable session max-seq-len))))
+          active-session (assoc session
+                                :prefill-executable prefill-exec
+                                :step-executable step-exec)
           device-weights (binding [profile/*active-trace-spans* trace-spans-atom]
                            (if reuse-weights?
                              (:device-weights session)
@@ -1296,14 +1353,18 @@
          exec (if vram-loop?
                 (compile-in-vram-loop-executable session max-seq-len)
                 (compile-gemma4-kv-executable session max-seq-len))
-         prefill-exec (when (or (<= max-seq-len 8192) vram-loop?)
+         safe-prefill-len (max-safe-prefill-seq-len (:config session))
+         prefill-exec (when (<= max-seq-len safe-prefill-len)
                         (compile-gemma4-prefill-executable session max-seq-len))
+         step-exec (when (and vram-loop? (> max-seq-len safe-prefill-len))
+                     (compile-gemma4-kv-executable session max-seq-len))
          _ (when-not (:quiet opts) (println "Pinning Gemma 4 weights in PJRT VRAM..."))
          device-weights (allocate-device-weights session)]
      (assoc session
             :device-weights device-weights
             :executable exec
             :prefill-executable prefill-exec
+            :step-executable step-exec
             :kv-state (atom nil)
             :max-seq-len max-seq-len
             :vram-session? true
