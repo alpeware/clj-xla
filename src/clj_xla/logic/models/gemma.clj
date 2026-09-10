@@ -455,7 +455,7 @@
                                 1))
          q-dim (long (or (:q-dim cfg) (* num-heads head-dim)))
          kv-dim (long (or (:kv-dim cfg) (* num-kv-heads head-dim)))
-         group-size (quot num-heads num-kv-heads)
+         _group-size (quot num-heads num-kv-heads)
          rope-prop (double (or (:rope-proportion cfg) (if is-global? 0.25 1.0)))
          theta (double (or (:theta-base cfg) (if is-global? 1000000.0 10000.0)))
          window (if is-global? nil (long (or (:sliding-window cfg) (:sliding-window config) (:sliding_window config) 512)))
@@ -518,12 +518,6 @@
          actual-k-cache (if is-shared? shared-k k-cache-out)
          actual-v-cache (if is-shared? shared-v v-cache-out)
 
-         k-rep (keyword (str "k_rep_" i))
-         k-heads (keyword (str "k_heads_" i))
-         v-rep (keyword (str "v_rep_" i))
-         v-rep-heads (keyword (str "v_rep_heads_" i))
-         scores (keyword (str "scores_" i))
-         probs (keyword (str "probs_" i))
          ctx (keyword (str "ctx_" i))
          ctx-flat (keyword (str "ctx_flat_" i))
          attn-raw (keyword (str "attn_raw_" i))
@@ -548,7 +542,7 @@
          qd (keyword (str "qd_" i))
          kvd (keyword (str "kvd_" i))
          kvh (keyword (str "kvh_" i))
-         g (keyword (str "g_" i))
+         _g (keyword (str "g_" i))
          h (keyword (str "h_" i))
          dff (keyword (str "dff_" i))
          pld (keyword (str "pld_" i))
@@ -584,16 +578,20 @@
          [:dynamic-update-slice [v-cache-out :b kv-s kvh dh] [v-cache-in :b kv-s kvh dh] [v-heads :b p kvh dh]
           {:start-indices [0 :pos 0 0]}]])
 
-      ;; 4. Broadcast KV Heads
-      [:= [k-rep :b kv-s kvh g dh] [actual-k-cache :b kv-s kvh dh] {:shape [1 max-seq-len num-kv-heads group-size head-dim]}]
-      [:reshape [k-heads :b kv-s h dh] [k-rep :b kv-s kvh g dh] {:shape [1 max-seq-len num-heads head-dim]}]
-      [:= [v-rep :b kv-s kvh g dh] [actual-v-cache :b kv-s kvh dh] {:shape [1 max-seq-len num-kv-heads group-size head-dim]}]
-      [:reshape [v-rep-heads :b kv-s h dh] [v-rep :b kv-s kvh g dh] {:shape [1 max-seq-len num-heads head-dim]}]
-
-      ;; 5. Scaled Dot-Product Attention: Q(1) @ K(max-seq-len)^T -> Dynamic Causal Softmax -> probs @ V
-      [:= [scores :b h p kv-s] {:scale 1.0} [q-ro :b p h dh] [k-heads :b kv-s h dh]]
-      [:causal-softmax [probs :b h p kv-s] [scores :b h p kv-s] (merge {:pos :pos} (if window {:sliding-window window} {}))]
-      [:= [ctx :b p h dh] [probs :b h p kv-s] [v-rep-heads :b kv-s h dh]]
+      ;; 4 & 5. Chunked Scaled Dot-Product Attention (Online Streaming Softmax)
+      ;; Tiled across sequence chunks to bound shared memory (LDS) on RDNA3 hardware
+      [:chunked-attention [ctx :b p h dh]
+       [q-ro :b p h dh]
+       [actual-k-cache :b kv-s kvh dh]
+       [actual-v-cache :b kv-s kvh dh]
+       (merge {:pos :pos
+               :chunk-size (min 64 max-seq-len)
+               :head-dim head-dim
+               :num-heads num-heads
+               :num-kv-heads num-kv-heads
+               :max-seq-len max-seq-len
+               :shape [1 1 num-heads head-dim]}
+              (when window {:sliding-window window}))]
       [:reshape [ctx-flat :b p qd] [ctx :b p h dh] {:shape [1 1 q-dim]}]
 
       ;; 6. Output Projection & Post-Attention RMSNorm

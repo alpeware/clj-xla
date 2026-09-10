@@ -1,6 +1,7 @@
 (ns clj-xla.logic.gemma-test
   "Unit and generative tests for declarative Tensor Logic Gemma 4 model architecture."
   (:require [clj-xla.core :as xla]
+            [clj-xla.pjrt :as pjrt]
             [clj-xla.logic.ast :as ast]
             [clj-xla.logic.expand :as expand]
             [clj-xla.logic.lower :as lower]
@@ -441,4 +442,126 @@
     (let [ctx (xla/get-context)
           compiled (xla/compile-graph ctx graph)]
       (is (some? compiled)))))
+
+(defspec prop-chunked-attention-ast-validity 20
+  (prop/for-all [max-seq-len (gen/elements [64 128 256])
+                 chunk-size (gen/elements [32 64])
+                 num-heads (gen/elements [4 8 16])
+                 num-kv-heads (gen/elements [1 2 4])
+                 head-dim (gen/elements [64 128 256])]
+                (let [group-size (quot num-heads num-kv-heads)
+                      num-heads (* num-kv-heads group-size)
+                      node [:chunked-attention [:ctx :b :p :h :dh]
+                            [:q_ro :b :p :h :dh]
+                            [:k_cache :b :kv-s :kvh :dh]
+                            [:v_cache :b :kv-s :kvh :dh]
+                            {:pos :pos
+                             :chunk-size chunk-size
+                             :head-dim head-dim
+                             :num-heads num-heads
+                             :num-kv-heads num-kv-heads
+                             :max-seq-len max-seq-len}]]
+                  (ast/valid-node? node))))
+
+(defn- test-standard-attention-graph [max-seq-len num-heads num-kv-heads head-dim]
+  (let [group-size (quot num-heads num-kv-heads)
+        invars [[:pos [:tensor [1] :i32]]
+                [:q_ro [:tensor [1 1 num-heads head-dim] :f32]]
+                [:k_cache [:tensor [1 max-seq-len num-kv-heads head-dim] :f32]]
+                [:v_cache [:tensor [1 max-seq-len num-kv-heads head-dim] :f32]]]
+        outvars [:ctx]
+        eqs [{:op :stablehlo/broadcast_in_dim :invars [:k_cache] :outvars [:k_rep]
+              :attrs {:broadcast_dimensions [0 1 2 4] :target_shape [1 max-seq-len num-kv-heads group-size head-dim]}}
+             {:op :stablehlo/reshape :invars [:k_rep] :outvars [:k_heads]
+              :attrs {:shape [1 max-seq-len num-heads head-dim]}}
+             {:op :stablehlo/broadcast_in_dim :invars [:v_cache] :outvars [:v_rep]
+              :attrs {:broadcast_dimensions [0 1 2 4] :target_shape [1 max-seq-len num-kv-heads group-size head-dim]}}
+             {:op :stablehlo/reshape :invars [:v_rep] :outvars [:v_heads]
+              :attrs {:shape [1 max-seq-len num-heads head-dim]}}
+
+             {:op :stablehlo/dot_general :invars [:q_ro :k_heads] :outvars [:scores_4d]
+              :attrs {:batch_dims {:lhs [0 2] :rhs [0 2]} :contracting_dims {:lhs [3] :rhs [3]}}}
+             {:op :stablehlo/reshape :invars [:scores_4d] :outvars [:scores]
+              :attrs {:shape [1 num-heads 1 max-seq-len]}}
+
+             {:op :stablehlo/iota :outvars [:iota_1d] :attrs {:len max-seq-len :dtype :i32 :iota_dimension 0}}
+             {:op :stablehlo/broadcast_in_dim :invars [:iota_1d] :outvars [:iota_4d]
+              :attrs {:broadcast_dimensions [3] :target_shape [1 1 1 max-seq-len]}}
+             {:op :stablehlo/reshape :invars [:pos] :outvars [:pos_s] :attrs {:shape []}}
+             {:op :stablehlo/broadcast_in_dim :invars [:pos_s] :outvars [:pos_4d]
+              :attrs {:broadcast_dimensions [] :target_shape [1 1 1 max-seq-len]}}
+             {:op :stablehlo/compare :invars [:iota_4d :pos_4d] :outvars [:cmp_fut] :attrs {:comparison_direction "GT"}}
+             {:op :stablehlo/constant :value -10000.0 :type [:tensor [] :f32] :outvars [:c_neg]}
+             {:op :stablehlo/broadcast_in_dim :invars [:c_neg] :outvars [:c_neg_4d]
+              :attrs {:broadcast_dimensions [] :target_shape [1 1 1 max-seq-len]}}
+             {:op :stablehlo/constant :value 0.0 :type [:tensor [] :f32] :outvars [:c_zero]}
+             {:op :stablehlo/broadcast_in_dim :invars [:c_zero] :outvars [:c_zero_4d]
+              :attrs {:broadcast_dimensions [] :target_shape [1 1 1 max-seq-len]}}
+             {:op :stablehlo/select :invars [:cmp_fut :c_neg_4d :c_zero_4d] :outvars [:mask_4d]}
+             {:op :stablehlo/broadcast_in_dim :invars [:mask_4d] :outvars [:mask_bcast]
+              :attrs {:broadcast_dimensions [0 1 2 3] :target_shape [1 num-heads 1 max-seq-len]}}
+             {:op :stablehlo/add :invars [:scores :mask_bcast] :outvars [:masked_scores]}
+
+             {:op :stablehlo/reduce_max :invars [:masked_scores] :outvars [:max_val]
+              :attrs {:axes [-1] :keep_dims true}}
+             {:op :stablehlo/subtract :invars [:masked_scores :max_val] :outvars [:s_diff]}
+             {:op :stablehlo/exp :invars [:s_diff] :outvars [:s_exp]}
+             {:op :stablehlo/reduce_sum :invars [:s_exp] :outvars [:s_sum]
+              :attrs {:axes [-1] :keep_dims true}}
+             {:op :stablehlo/divide :invars [:s_exp :s_sum] :outvars [:probs]}
+
+             {:op :stablehlo/dot_general :invars [:probs :v_heads] :outvars [:ctx_raw]
+              :attrs {:batch_dims {:lhs [0 1] :rhs [0 2]} :contracting_dims {:lhs [3] :rhs [1]}}}
+             {:op :stablehlo/reshape :invars [:ctx_raw] :outvars [:ctx]
+              :attrs {:shape [1 1 num-heads head-dim]}}]]
+    (shlo/validate-graph {:name "test_standard_attn" :invars invars :outvars outvars :eqns eqs})))
+
+(defspec prop-chunked-attention-parity 10
+  (prop/for-all [max-seq-len (gen/elements [64 128])
+                 chunk-size (gen/elements [32 64])
+                 num-heads (gen/elements [4 8])
+                 num-kv-heads (gen/elements [1 2])
+                 head-dim (gen/elements [32 64])
+                 pos-idx (gen/choose 0 63)]
+                (let [pos (min pos-idx (dec max-seq-len))
+                      group-size (quot num-heads num-kv-heads)
+                      num-heads (* num-kv-heads group-size)
+                      invars [[:pos [:tensor [1] :i32]]
+                              [:q_ro [:tensor [1 1 num-heads head-dim] :f32]]
+                              [:k_cache [:tensor [1 max-seq-len num-kv-heads head-dim] :f32]]
+                              [:v_cache [:tensor [1 max-seq-len num-kv-heads head-dim] :f32]]]
+                      ast [:block {:name :chunked_block}
+                           [:chunked-attention [:ctx :b :p :h :dh]
+                            [:q_ro :b :p :h :dh]
+                            [:k_cache :b :kv-s :kvh :dh]
+                            [:v_cache :b :kv-s :kvh :dh]
+                            {:pos :pos
+                             :chunk-size chunk-size
+                             :head-dim head-dim
+                             :num-heads num-heads
+                             :num-kv-heads num-kv-heads
+                             :max-seq-len max-seq-len
+                             :shape [1 1 num-heads head-dim]}]]
+                      g-chunk (lower/ast->graph "test_chunk_parity" invars ast [:ctx])
+                      g-std (test-standard-attention-graph max-seq-len num-heads num-kv-heads head-dim)
+                      ctx (xla/init-cpu!)
+                      exec-std (xla/compile-graph ctx g-std)
+                      exec-chunk (xla/compile-graph ctx g-chunk)
+                      pos-buf (xla/buffer-from-host-buffer (int-array [pos]) [1] 4)
+                      q-data (float-array (* 1 1 num-heads head-dim))
+                      _ (dotimes [i (count q-data)] (aset q-data i (float (Math/sin (double (inc i))))))
+                      q-buf (xla/buffer-from-host-buffer q-data [1 1 num-heads head-dim] 11)
+                      k-data (float-array (* 1 max-seq-len num-kv-heads head-dim))
+                      _ (dotimes [i (count k-data)] (aset k-data i (float (Math/cos (double (inc i))))))
+                      k-buf (xla/buffer-from-host-buffer k-data [1 max-seq-len num-kv-heads head-dim] 11)
+                      v-data (float-array (* 1 max-seq-len num-kv-heads head-dim))
+                      _ (dotimes [i (count v-data)] (aset v-data i (float (Math/sin (* 0.5 (double (inc i)))))))
+                      v-buf (xla/buffer-from-host-buffer v-data [1 max-seq-len num-kv-heads head-dim] 11)
+                      res-std (xla/execute exec-std [pos-buf q-buf k-buf v-buf])
+                      res-chunk (xla/execute exec-chunk [pos-buf q-buf k-buf v-buf])
+                      n-elem (* 1 1 num-heads head-dim)
+                      arr-std (pjrt/buffer-to-host-buffer ctx res-std n-elem :f32)
+                      arr-chunk (pjrt/buffer-to-host-buffer ctx res-chunk n-elem :f32)
+                      max-diff (reduce max 0.0 (map #(Math/abs (double (- %1 %2))) arr-std arr-chunk))]
+                  (< max-diff 1e-4))))
 
