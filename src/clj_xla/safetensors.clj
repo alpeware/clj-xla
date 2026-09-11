@@ -1,9 +1,11 @@
 (ns clj-xla.safetensors
   "Panama FFM zero-copy off-heap .safetensors weight loader."
   (:require [clojure.data.json :as json]
-            [clojure.java.io :as io])
+            [clojure.java.io :as io]
+            [clojure.string :as str])
   (:import [java.io RandomAccessFile]
            [java.lang.foreign Arena MemorySegment ValueLayout]
+           [java.nio ByteBuffer]
            [java.nio.channels FileChannel FileChannel$MapMode]
            [java.nio.file Path StandardOpenOption]))
 
@@ -158,3 +160,129 @@
                     s (short (bit-shift-right bits 16))]
                 (aset arr i s)))
             arr))))))
+
+(defn- tensor-byte-len
+  "Computes payload byte length for given data array, segment, or shape/dtype."
+  [data shape dtype]
+  (cond
+    (instance? (Class/forName "[B") data) (long (alength ^bytes data))
+    (instance? (Class/forName "[S") data) (* 2 (long (alength ^shorts data)))
+    (instance? (Class/forName "[I") data) (* 4 (long (alength ^ints data)))
+    (instance? (Class/forName "[F") data) (* 4 (long (alength ^floats data)))
+    (instance? (Class/forName "[D") data) (* 8 (long (alength ^doubles data)))
+    (instance? (Class/forName "[J") data) (* 8 (long (alength ^longs data)))
+    (instance? MemorySegment data) (.byteSize ^MemorySegment data)
+    (and shape dtype)
+    (let [n (long (reduce * 1 shape))]
+      (case (str/upper-case (name dtype))
+        ("BOOL" "U8" "I8") n
+        ("F16" "BF16" "BFLOAT16" "I16" "U16") (* n 2)
+        ("F32" "I32" "U32") (* n 4)
+        ("F64" "I64" "U64") (* n 8)
+        n))
+    :else 0))
+
+(defn build-header-map
+  "Pure function: calculates safetensors JSON header metadata and continuous data offsets
+   for a sequence of tensor specifications: `[{:name string :dtype string :shape [...] :data array :byte-len num}]`.
+   Returns `{:header-map ... :total-payload-bytes ...}`."
+  [tensors metadata]
+  (let [entries (loop [tensors tensors
+                       curr-offset 0
+                       res []]
+                  (if (empty? tensors)
+                    {:res res :total curr-offset}
+                    (let [t (first tensors)
+                          t-name (:name t)
+                          dtype (str/upper-case (name (:dtype t)))
+                          shape (vec (:shape t))
+                          len (or (:byte-len t)
+                                  (tensor-byte-len (:data t) shape dtype))
+                          next-offset (+ curr-offset len)]
+                      (recur (rest tensors)
+                             next-offset
+                             (conj res [t-name {"dtype" dtype
+                                                "shape" shape
+                                                "data_offsets" [curr-offset next-offset]}])))))
+        header-map (into (cond-> {} (seq metadata) (assoc "__metadata__" metadata))
+                         (:res entries))]
+    {:header-map header-map
+     :total-payload-bytes (:total entries)}))
+
+(defn write-segment-to-channel!
+  "Writes MemorySegment `seg` to `fc` in chunks of up to 1 GB to avoid Java ByteBuffer 2 GB limit."
+  [^FileChannel fc ^MemorySegment seg]
+  (let [total-size (.byteSize seg)
+        chunk-size (* 1024 1024 1024)]
+    (loop [offset (long 0)]
+      (when (< offset total-size)
+        (let [curr-len (min (long chunk-size) (- total-size offset))
+              slice (.asSlice seg offset curr-len)]
+          (.write fc (.asByteBuffer slice))
+          (recur (+ offset curr-len)))))))
+
+(defn write-safetensors
+  "Writes a safetensors binary file to `file-path` with zero-copy/streaming tensor payloads.
+   `tensors` is a sequence of maps: `{:name string :dtype string :shape [dims] :data array-or-segment}`.
+   `opts` may contain `:metadata` (a map of key-value metadata strings)."
+  ([file-path tensors]
+   (write-safetensors file-path tensors {}))
+  ([file-path tensors opts]
+   (let [{:keys [header-map]} (build-header-map tensors (:metadata opts))
+         json-str (json/write-str header-map :escape-slash false)
+         header-bytes (.getBytes json-str "UTF-8")
+         header-size (count header-bytes)
+         path (Path/of file-path (into-array String []))
+         _ (when-let [p (.getParentFile (io/file file-path))] (.mkdirs p))]
+     (with-open [fc (FileChannel/open path (into-array [StandardOpenOption/CREATE
+                                                        StandardOpenOption/WRITE
+                                                        StandardOpenOption/TRUNCATE_EXISTING]))]
+       ;; 1. Write 8-byte LE header size
+       (let [header-size-le (Long/reverseBytes (long header-size))
+             size-buf (ByteBuffer/allocate 8)]
+         (.putLong size-buf header-size-le)
+         (.flip size-buf)
+         (.write fc size-buf))
+       ;; 2. Write UTF-8 JSON header metadata
+       (.write fc (ByteBuffer/wrap header-bytes))
+       ;; 3. Write tensor payloads
+       (with-open [arena (Arena/ofConfined)]
+         (doseq [{:keys [data]} tensors]
+           (cond
+             (instance? MemorySegment data)
+             (write-segment-to-channel! fc ^MemorySegment data)
+
+             (instance? (Class/forName "[B") data)
+             (.write fc (ByteBuffer/wrap ^bytes data))
+
+             (instance? (Class/forName "[S") data)
+             (let [^shorts sa data
+                   n (alength sa)
+                   seg (.allocate arena (* (long n) 2) (long 1))]
+               (MemorySegment/copy sa 0 seg ValueLayout/JAVA_SHORT (long 0) n)
+               (.write fc (.asByteBuffer seg)))
+
+             (instance? (Class/forName "[F") data)
+             (let [^floats fa data
+                   n (alength fa)
+                   seg (.allocate arena (* (long n) 4) (long 1))]
+               (MemorySegment/copy fa 0 seg ValueLayout/JAVA_FLOAT (long 0) n)
+               (.write fc (.asByteBuffer seg)))
+
+             (instance? (Class/forName "[I") data)
+             (let [^ints ia data
+                   n (alength ia)
+                   seg (.allocate arena (* (long n) 4) (long 1))]
+               (MemorySegment/copy ia 0 seg ValueLayout/JAVA_INT (long 0) n)
+               (.write fc (.asByteBuffer seg)))
+
+             (instance? (Class/forName "[D") data)
+             (let [^doubles da data
+                   n (alength da)
+                   seg (.allocate arena (* (long n) 8) (long 1))]
+               (MemorySegment/copy da 0 seg ValueLayout/JAVA_DOUBLE (long 0) n)
+               (.write fc (.asByteBuffer seg)))
+
+             :else
+             (throw (ex-info "Unsupported tensor data type for safetensors serialization"
+                             {:data-type (type data)})))))))))

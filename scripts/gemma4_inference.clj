@@ -33,7 +33,9 @@
    :chrome-trace-out "scratch/gemma4_chrome_trace.json"})
 
 (def DEFAULT_MODEL_DIRS
-  [".models/gemma-4-31B-it-exl3"
+  [".models/gemma-4-31b-it-int4"
+   ".models/gemma-4-31B-it-int4"
+   ".models/gemma-4-31B-it-exl3"
    ".models/gemma-4-31b-it-exl3"
    ".models/gemma-4-12B-it-exl3"
    ".models/gemma-4-E2B-it"
@@ -246,52 +248,62 @@
    (if-not (or is-int8 is-int4)
      [(load-weight-buffer ctx weights-mmap tensor-name shape (if (= weight-enum 11) :f32 :bf16) weight-enum 0.0)]
      (let [header (or (:header weights-mmap) {})
-           trellis-name (when (str/ends-with? tensor-name ".weight")
-                          (str/replace tensor-name #"\.weight$" ".trellis"))
-           actual-trellis-name (when trellis-name
-                                 (if (contains? header trellis-name)
-                                   trellis-name
-                                   (let [k-trellis (str/replace trellis-name #"\.v_proj\." ".k_proj.")]
-                                     (if (contains? header k-trellis) k-trellis trellis-name))))
            actual-tensor-name (if (or (contains? header tensor-name) (contains? (:tensors weights-mmap) tensor-name))
                                 tensor-name
                                 (let [k-name (str/replace tensor-name #"\.v_proj\." ".k_proj.")]
                                   (if (or (contains? header k-name) (contains? (:tensors weights-mmap) k-name))
                                     k-name
                                     tensor-name)))
-           scale-format (if (= norm-enum 11) :f32 :bf16)
-           raw-arr (cond
-                     (and actual-trellis-name (contains? header actual-trellis-name))
-                     (let [base-name (str/replace actual-trellis-name #"\.trellis$" "")
-                           suh-name (str base-name ".suh")
-                           svh-name (str base-name ".svh")
-                           trellis-slice (st/get-tensor-slice weights-mmap actual-trellis-name)
-                           suh-slice (st/get-tensor-slice weights-mmap suh-name)
-                           svh-slice (st/get-tensor-slice weights-mmap svh-name)
-                           in-features (first (get-in header [suh-name "shape"]))
-                           out-features (first (get-in header [svh-name "shape"]))
-                           trellis-shape (get-in header [actual-trellis-name "shape"])
-                           words-per-tile (last trellis-shape)
-                           bits (quot words-per-tile 16)]
-                       (exl3/dequant-exl3-matrix trellis-slice in-features out-features bits suh-slice svh-slice
-                                                 {:as :bf16 :transpose? true}))
-
-                     (or (zero? (reduce * 1 shape))
-                         (not (or (contains? header actual-tensor-name)
-                                  (contains? (:tensors weights-mmap) actual-tensor-name))))
-                     (short-array (* rows cols))
-
-                     :else
-                     (st/get-tensor-floats weights-mmap actual-tensor-name))]
-       (if is-int4
-         (let [{:keys [data scales]} (exl3/quantize-weights-per-row-int4 raw-arr rows cols {:as scale-format})
-               w-buf (xla/buffer-from-host-buffer ctx (:client ctx) data [rows (quot cols 2)] 2)
-               scale-buf (xla/buffer-from-host-buffer ctx (:client ctx) scales [rows] norm-enum)]
+           scale-name (str actual-tensor-name ".scales")
+           prequantized? (and (or (contains? header scale-name) (contains? (:tensors weights-mmap) scale-name))
+                              (or (contains? header actual-tensor-name) (contains? (:tensors weights-mmap) actual-tensor-name)))]
+       (if prequantized?
+         (let [w-shape (if is-int4 [rows (quot cols 2)] [rows cols])
+               w-slice (st/get-tensor-slice weights-mmap actual-tensor-name)
+               scale-slice (st/get-tensor-slice weights-mmap scale-name)
+               w-buf (xla/buffer-from-host-buffer ctx (:client ctx) w-slice w-shape 2)
+               scale-buf (xla/buffer-from-host-buffer ctx (:client ctx) scale-slice [rows] norm-enum)]
            [w-buf scale-buf])
-         (let [{:keys [data scales]} (exl3/quantize-weights-per-row-int8 raw-arr rows cols {:as scale-format})
-               w-buf (xla/buffer-from-host-buffer ctx (:client ctx) data shape 2)
-               scale-buf (xla/buffer-from-host-buffer ctx (:client ctx) scales [rows] norm-enum)]
-           [w-buf scale-buf]))))))
+         (let [trellis-name (when (str/ends-with? tensor-name ".weight")
+                              (str/replace tensor-name #"\.weight$" ".trellis"))
+               actual-trellis-name (when trellis-name
+                                     (if (contains? header trellis-name)
+                                       trellis-name
+                                       (let [k-trellis (str/replace trellis-name #"\.v_proj\." ".k_proj.")]
+                                         (if (contains? header k-trellis) k-trellis trellis-name))))
+               scale-format (if (= norm-enum 11) :f32 :bf16)
+               raw-arr (cond
+                         (and actual-trellis-name (contains? header actual-trellis-name))
+                         (let [base-name (str/replace actual-trellis-name #"\.trellis$" "")
+                               suh-name (str base-name ".suh")
+                               svh-name (str base-name ".svh")
+                               trellis-slice (st/get-tensor-slice weights-mmap actual-trellis-name)
+                               suh-slice (st/get-tensor-slice weights-mmap suh-name)
+                               svh-slice (st/get-tensor-slice weights-mmap svh-name)
+                               in-features (first (get-in header [suh-name "shape"]))
+                               out-features (first (get-in header [svh-name "shape"]))
+                               trellis-shape (get-in header [actual-trellis-name "shape"])
+                               words-per-tile (last trellis-shape)
+                               bits (quot words-per-tile 16)]
+                           (exl3/dequant-exl3-matrix trellis-slice in-features out-features bits suh-slice svh-slice
+                                                     {:as :bf16 :transpose? true}))
+
+                         (or (zero? (reduce * 1 shape))
+                             (not (or (contains? header actual-tensor-name)
+                                      (contains? (:tensors weights-mmap) actual-tensor-name))))
+                         (short-array (* rows cols))
+
+                         :else
+                         (st/get-tensor-floats weights-mmap actual-tensor-name))]
+           (if is-int4
+             (let [{:keys [data scales]} (exl3/quantize-weights-per-row-int4 raw-arr rows cols {:as scale-format})
+                   w-buf (xla/buffer-from-host-buffer ctx (:client ctx) data [rows (quot cols 2)] 2)
+                   scale-buf (xla/buffer-from-host-buffer ctx (:client ctx) scales [rows] norm-enum)]
+               [w-buf scale-buf])
+             (let [{:keys [data scales]} (exl3/quantize-weights-per-row-int8 raw-arr rows cols {:as scale-format})
+                   w-buf (xla/buffer-from-host-buffer ctx (:client ctx) data shape 2)
+                   scale-buf (xla/buffer-from-host-buffer ctx (:client ctx) scales [rows] norm-enum)]
+               [w-buf scale-buf]))))))))
 
 (defn quantize-bf16-to-int8
   "Quantizes a BF16 short-array to INT8 byte-array with per-tensor symmetric quantization.
@@ -385,13 +397,17 @@
                                   :sliding-window (if is-global? nil model-sliding-window)}))
                              (range num-layers))
 
+         quant-metadata (get-in weights-mmap [:header "__metadata__" "quantization"])
          is-int4 (boolean (or (= precision :int4)
-                              (and (nil? precision)
+                              (= quant-metadata "int4")
+                              (and (or (nil? precision) (= precision :auto))
                                    (or (re-find #"31[bB]" (or resolved-model-dir ""))
                                        (re-find #"31[bB]" (or model-dir ""))))))
-         weight-dtype (or precision (if is-int4 :int4 :bf16))
-         is-int8 (= weight-dtype :int8)
-         ;; For int8/int4: matmul weights use S8 (enum 2), norms/embeddings stay BF16 (enum 13)
+         is-int8 (boolean (or (= precision :int8)
+                              (= quant-metadata "int8")))
+         weight-dtype (or (when (and precision (not= precision :auto)) precision)
+                          (when quant-metadata (keyword quant-metadata))
+                          (if is-int4 :int4 (if is-int8 :int8 :bf16)))
          weight-enum (cond (or is-int8 is-int4) 2 (= weight-dtype :f32) 11 :else 13)
          norm-enum (if (= weight-dtype :f32) 11 13)]
 

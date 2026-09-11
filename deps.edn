@@ -36,6 +36,9 @@
   :fetch-pjrt
   {:main-opts ["-m" "scripts.fetch-pjrt-binaries"]
    :jvm-opts ["--enable-native-access=ALL-UNNAMED" "-Xmx4g"]}
+  :quantize
+  {:main-opts ["-m" "scripts.quantize"]
+   :jvm-opts ["--enable-native-access=ALL-UNNAMED" "-Xmx12g"]}
   :repl
   {:jvm-opts ["-Dclojure.server.repl={:port 5555 :accept clojure.core.server/repl}"
               "--enable-native-access=ALL-UNNAMED" "-Xmx4g"]}

@@ -10,6 +10,7 @@
             [clj-xla.download-hf-test]
             [clj-xla.fetch-pjrt-binaries-test]
             [clj-xla.generation-test]
+            [clj-xla.hardware-test]
             [clj-xla.integration.rocm-e2e-test]
             [clj-xla.integration.sycl-e2e-test]
             [clj-xla.logic.ast-test]
@@ -31,6 +32,7 @@
             [clj-xla.pjrt-test]
             [clj-xla.pjrt.version-test]
             [clj-xla.profile-test]
+            [clj-xla.quantize-test]
             [clj-xla.safetensors-test]
             [clj-xla.sampling-test]
             [clj-xla.stablehlo-test]
@@ -58,6 +60,8 @@
                            'clj-xla.benchmark.runner-test
                            'clj-xla.compile-test
                            'clj-xla.autodiff-test
+                           'clj-xla.hardware-test
+                           'clj-xla.quantize-test
                            'clj-xla.opt-test
                            'clj-xla.safetensors-test
                            'clj-xla.sampling-test
