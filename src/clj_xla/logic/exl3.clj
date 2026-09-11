@@ -474,63 +474,113 @@
          total-packed (* rows half-cols)
          data-bytes (byte-array total-packed)
          target-scale-format (get opts :as :f32)
-         scales-floats (when (= target-scale-format :f32) (float-array rows))
-         scales-shorts (when (= target-scale-format :bf16) (short-array rows))
+         raw-group-size (get opts :group-size)
+         group-size (when (and raw-group-size (pos? (long raw-group-size)) (zero? (mod cols (long raw-group-size))))
+                      (long raw-group-size))
+         num-groups (if group-size (quot cols group-size) 1)
+         total-scales (* rows num-groups)
+         scales-floats (when (= target-scale-format :f32) (float-array total-scales))
+         scales-shorts (when (= target-scale-format :bf16) (short-array total-scales))
          is-floats? (instance? (Class/forName "[F") w-arr)
          is-doubles? (instance? (Class/forName "[D") w-arr)
          is-shorts? (instance? (Class/forName "[S") w-arr)
          f-arr (when is-floats? ^floats w-arr)
          d-arr (when is-doubles? ^doubles w-arr)
-         s-arr (when is-shorts? ^shorts w-arr)]
-     (-> (IntStream/range 0 rows)
-         (.parallel)
-         (.forEach
-          (reify IntConsumer
-            (accept [_ r]
-              (let [r-base (* r cols)
-                    out-base (* r half-cols)
-                    ;; 1. Compute max absolute value for row
-                    max-abs (loop [c 0 m (float 0.0)]
-                              (if (>= c cols)
-                                m
-                                (let [idx (+ r-base c)
-                                      v (cond
-                                          is-floats? (Math/abs (aget f-arr idx))
-                                          is-doubles? (float (Math/abs (aget d-arr idx)))
-                                          is-shorts? (let [s (int (aget s-arr idx))
-                                                           bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))]
-                                                       (Math/abs (Float/intBitsToFloat bits)))
-                                          :else (float (Math/abs (double (nth w-arr idx)))))]
-                                  (recur (inc c) (max m v)))))
-                    scale (if (zero? max-abs) (float 1.0) (float (/ (double max-abs) 7.0)))
-                    inv-scale (float (/ 1.0 scale))]
-                (if (= target-scale-format :bf16)
-                  (aset-short scales-shorts r (float->bf16-short scale))
-                  (aset-float scales-floats r scale))
-                ;; 2. Quantize and pack pairs of row elements into signed nibbles [1..15]
-                (dotimes [hc half-cols]
-                  (let [c0 (* hc 2)
-                        c1 (inc c0)
-                        idx0 (+ r-base c0)
-                        idx1 (+ r-base c1)
-                        v0 (cond
-                             is-floats? (aget f-arr idx0)
-                             is-doubles? (float (aget d-arr idx0))
-                             is-shorts? (let [s (int (aget s-arr idx0))
-                                              bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))]
-                                          (Float/intBitsToFloat bits))
-                             :else (float (nth w-arr idx0)))
-                        v1 (cond
-                             is-floats? (aget f-arr idx1)
-                             is-doubles? (float (aget d-arr idx1))
-                             is-shorts? (let [s (int (aget s-arr idx1))
-                                              bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))]
-                                          (Float/intBitsToFloat bits))
-                             :else (float (nth w-arr idx1)))
-                        q0 (+ (max -7 (min 7 (Math/round (* v0 inv-scale)))) 8)
-                        q1 (+ (max -7 (min 7 (Math/round (* v1 inv-scale)))) 8)
-                        packed (unchecked-byte (bit-or (bit-and (int q0) 0x0F)
-                                                       (bit-shift-left (bit-and (int q1) 0x0F) 4)))]
-                    (aset-byte data-bytes (+ out-base hc) packed))))))))
+         s-arr (when is-shorts? ^shorts w-arr)
+         get-val (fn ^double [^long idx]
+                   (cond
+                     is-floats? (double (aget f-arr idx))
+                     is-doubles? (aget d-arr idx)
+                     is-shorts? (let [s (int (aget s-arr idx))
+                                      bits (unchecked-int (bit-shift-left (long (bit-and s 0xffff)) 16))]
+                                  (double (Float/intBitsToFloat bits)))
+                     :else (double (nth w-arr idx))))]
+     (if group-size
+       ;; Block-wise INT4 quantization with per-block optimal MSE scale search
+       (let [half-g (quot group-size 2)]
+         (-> (IntStream/range 0 rows)
+             (.parallel)
+             (.forEach
+              (reify IntConsumer
+                (accept [_ r]
+                  (let [r-base (* r cols)
+                        out-base (* r half-cols)
+                        s-base (* r num-groups)]
+                    (dotimes [g num-groups]
+                      (let [g-base (+ r-base (* g group-size))
+                            g-out-base (+ out-base (* g half-g))
+                            ;; 1. Max absolute value in block
+                            max-abs (loop [i 0 m 0.0]
+                                      (if (>= i group-size)
+                                        m
+                                        (let [v (Math/abs (get-val (+ g-base i)))]
+                                          (recur (inc i) (max m v)))))
+                            base-scale (/ max-abs 7.0)
+                            ;; 2. 10-step optimal scale search (minimizing MSE against outliers)
+                            opt-mult (if (zero? max-abs)
+                                       1.0
+                                       (loop [step 0 best-m 1.0 best-err Double/MAX_VALUE]
+                                         (if (>= step 10)
+                                           best-m
+                                           (let [m (+ 0.65 (* step 0.035))
+                                                 cand-s (* base-scale m)
+                                                 inv-s (/ 1.0 cand-s)
+                                                 err (loop [i 0 acc 0.0]
+                                                       (if (>= i group-size)
+                                                         acc
+                                                         (let [v (get-val (+ g-base i))
+                                                               q (+ (max -7 (min 7 (Math/round (* v inv-s)))) 8)
+                                                               rec (* (double (- q 8)) cand-s)
+                                                               diff (- v rec)]
+                                                           (recur (inc i) (+ acc (* diff diff))))))]
+                                             (if (< err best-err)
+                                               (recur (inc step) m err)
+                                               (recur (inc step) best-m best-err))))))
+                            scale (if (zero? max-abs) (float 1.0) (float (* base-scale opt-mult)))
+                            inv-scale (/ 1.0 (double scale))]
+                        (if (= target-scale-format :bf16)
+                          (aset-short scales-shorts (+ s-base g) (float->bf16-short scale))
+                          (aset-float scales-floats (+ s-base g) scale))
+                        ;; 3. Pack 4-bit pairs
+                        (dotimes [hc half-g]
+                          (let [idx0 (+ g-base (* hc 2))
+                                idx1 (inc idx0)
+                                v0 (get-val idx0)
+                                v1 (get-val idx1)
+                                q0 (+ (max -7 (min 7 (Math/round (* v0 inv-scale)))) 8)
+                                q1 (+ (max -7 (min 7 (Math/round (* v1 inv-scale)))) 8)
+                                packed (unchecked-byte (bit-or (bit-and (int q0) 0x0F)
+                                                               (bit-shift-left (bit-and (int q1) 0x0F) 4)))]
+                            (aset-byte data-bytes (+ g-out-base hc) packed)))))))))))
+       ;; Legacy per-row INT4 quantization
+       (-> (IntStream/range 0 rows)
+           (.parallel)
+           (.forEach
+            (reify IntConsumer
+              (accept [_ r]
+                (let [r-base (* r cols)
+                      out-base (* r half-cols)
+                      max-abs (loop [c 0 m 0.0]
+                                (if (>= c cols)
+                                  m
+                                  (let [v (Math/abs (get-val (+ r-base c)))]
+                                    (recur (inc c) (max m v)))))
+                      scale (if (zero? max-abs) (float 1.0) (float (/ max-abs 7.0)))
+                      inv-scale (/ 1.0 (double scale))]
+                  (if (= target-scale-format :bf16)
+                    (aset-short scales-shorts r (float->bf16-short scale))
+                    (aset-float scales-floats r scale))
+                  (dotimes [hc half-cols]
+                    (let [idx0 (+ r-base (* hc 2))
+                          idx1 (inc idx0)
+                          v0 (get-val idx0)
+                          v1 (get-val idx1)
+                          q0 (+ (max -7 (min 7 (Math/round (* v0 inv-scale)))) 8)
+                          q1 (+ (max -7 (min 7 (Math/round (* v1 inv-scale)))) 8)
+                          packed (unchecked-byte (bit-or (bit-and (int q0) 0x0F)
+                                                         (bit-shift-left (bit-and (int q1) 0x0F) 4)))]
+                      (aset-byte data-bytes (+ out-base hc) packed)))))))))
      {:data data-bytes
-      :scales (if (= target-scale-format :bf16) scales-shorts scales-floats)})))
+      :scales (if (= target-scale-format :bf16) scales-shorts scales-floats)
+      :shape [rows half-cols]
+      :scale-shape (if group-size [rows num-groups] [rows])})))

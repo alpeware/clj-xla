@@ -1057,6 +1057,10 @@
         half-cols (second shape)
         cols (* (long half-cols) 2)
         norm-dtype (or default-dtype :bf16)
+        scale-shape (get known-shapes scale-name)
+        block-wise? (and scale-shape (= (count scale-shape) 2) (> (second scale-shape) 1))
+        num-groups (if block-wise? (second scale-shape) 1)
+        group-size (if block-wise? (quot cols num-groups) cols)
 
         c-0f (gen-id "c_int4_0f" counter)
         c-4  (gen-id "c_int4_4" counter)
@@ -1091,24 +1095,46 @@
         hi-r-eqn {:op :stablehlo/reshape :invars [hi-c] :outvars [hi-r] :attrs {:shape [rows half-cols 1]}}
 
         cat-var (gen-id "t_int4_cat" counter)
-        cat-eqn {:op :stablehlo/concatenate :invars [lo-r hi-r] :outvars [cat-var] :attrs {:dimension 2}}
+        cat-eqn {:op :stablehlo/concatenate :invars [lo-r hi-r] :outvars [cat-var] :attrs {:dimension 2}}]
 
-        unscaled-var (gen-id "t_int4_unscaled" counter)
-        unscaled-eqn {:op :stablehlo/reshape :invars [cat-var] :outvars [unscaled-var] :attrs {:shape [rows cols]}}
+    (if block-wise?
+      (let [w-3d [rows num-groups group-size]
+            unscaled-var (gen-id "t_int4_unscaled" counter)
+            unscaled-eqn {:op :stablehlo/reshape :invars [cat-var] :outvars [unscaled-var] :attrs {:shape w-3d}}
 
-        scale-bcast (gen-id "t_int4_scale_bcast" counter)
-        scale-bcast-eqn {:op :stablehlo/broadcast_in_dim :invars [scale-name] :outvars [scale-bcast]
-                         :attrs {:broadcast_dimensions [0] :target_shape [rows cols] :shape [rows cols]}}
+            scale-bcast (gen-id "t_int4_scale_bcast" counter)
+            scale-bcast-eqn {:op :stablehlo/broadcast_in_dim :invars [scale-name] :outvars [scale-bcast]
+                             :attrs {:broadcast_dimensions [0 1] :target_shape w-3d :shape w-3d}}
 
-        mul-eqn {:op :stablehlo/multiply :invars [unscaled-var scale-bcast] :outvars [final-out-var]}]
-    (swap! eqns-atom conj
-           c-0f-eqn c-4-eqn c-8-eqn
-           lo-eqn hi-eqn
-           lo-bf-eqn hi-bf-eqn
-           lo-c-eqn hi-c-eqn
-           lo-r-eqn hi-r-eqn
-           cat-eqn unscaled-eqn
-           scale-bcast-eqn mul-eqn)))
+            scaled-3d-var (gen-id "t_int4_scaled_3d" counter)
+            mul-eqn {:op :stablehlo/multiply :invars [unscaled-var scale-bcast] :outvars [scaled-3d-var]}
+
+            final-reshape-eqn {:op :stablehlo/reshape :invars [scaled-3d-var] :outvars [final-out-var] :attrs {:shape [rows cols]}}]
+        (swap! eqns-atom conj
+               c-0f-eqn c-4-eqn c-8-eqn
+               lo-eqn hi-eqn
+               lo-bf-eqn hi-bf-eqn
+               lo-c-eqn hi-c-eqn
+               lo-r-eqn hi-r-eqn
+               cat-eqn unscaled-eqn
+               scale-bcast-eqn mul-eqn final-reshape-eqn))
+
+      (let [unscaled-var (gen-id "t_int4_unscaled" counter)
+            unscaled-eqn {:op :stablehlo/reshape :invars [cat-var] :outvars [unscaled-var] :attrs {:shape [rows cols]}}
+
+            scale-bcast (gen-id "t_int4_scale_bcast" counter)
+            scale-bcast-eqn {:op :stablehlo/broadcast_in_dim :invars [scale-name] :outvars [scale-bcast]
+                             :attrs {:broadcast_dimensions [0] :target_shape [rows cols] :shape [rows cols]}}
+
+            mul-eqn {:op :stablehlo/multiply :invars [unscaled-var scale-bcast] :outvars [final-out-var]}]
+        (swap! eqns-atom conj
+               c-0f-eqn c-4-eqn c-8-eqn
+               lo-eqn hi-eqn
+               lo-bf-eqn hi-bf-eqn
+               lo-c-eqn hi-c-eqn
+               lo-r-eqn hi-r-eqn
+               cat-eqn unscaled-eqn
+               scale-bcast-eqn mul-eqn)))))
 
 (defn ast->graph
   "Compiles a Tensor Logic Hiccup AST into a validated EDN SSA graph for OpenXLA compilation.

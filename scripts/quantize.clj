@@ -35,28 +35,32 @@
 
 (defn quantize-projection-weight
   "Pure function: quantizes 2D projection weight array `w-arr` of shape `[rows cols]` to `precision` (:int4 or :int8).
-   Returns `{:data byte-array :scales short-array :shape [...] :dtype ...}`."
-  [w-arr rows cols precision]
-  (case precision
-    :int4
-    (let [{:keys [data scales]} (exl3/quantize-weights-per-row-int4 w-arr rows cols {:as :bf16})]
-      {:data data
-       :scales scales
-       :shape [rows (quot cols 2)]
-       :dtype "I8"
-       :scale-shape [rows]
-       :scale-dtype "BF16"})
+   Opts may contain `:group-size` (default 128 for :int4).
+   Returns `{:data byte-array :scales short-array :shape [...] :scale-shape [...] :dtype ...}`."
+  ([w-arr rows cols precision]
+   (quantize-projection-weight w-arr rows cols precision {}))
+  ([w-arr rows cols precision opts]
+   (case precision
+     :int4
+     (let [group-size (get opts :group-size 128)
+           {:keys [data scales scale-shape]} (exl3/quantize-weights-per-row-int4 w-arr rows cols {:as :bf16 :group-size group-size})]
+       {:data data
+        :scales scales
+        :shape [rows (quot cols 2)]
+        :dtype "I8"
+        :scale-shape scale-shape
+        :scale-dtype "BF16"})
 
-    :int8
-    (let [{:keys [data scales]} (exl3/quantize-weights-per-row-int8 w-arr rows cols {:as :bf16})]
-      {:data data
-       :scales scales
-       :shape [rows cols]
-       :dtype "I8"
-       :scale-shape [rows]
-       :scale-dtype "BF16"})
+     :int8
+     (let [{:keys [data scales]} (exl3/quantize-weights-per-row-int8 w-arr rows cols {:as :bf16})]
+       {:data data
+        :scales scales
+        :shape [rows cols]
+        :dtype "I8"
+        :scale-shape [rows]
+        :scale-dtype "BF16"})
 
-    (throw (ex-info "Unsupported quantization precision" {:precision precision}))))
+     (throw (ex-info "Unsupported quantization precision" {:precision precision})))))
 
 (defn parse-model-param-count
   "Extracts or estimates total parameter count from model `config.json` map."
@@ -89,7 +93,7 @@
 (defn quantize-model!
   "Quantizes unquantized safetensors checkpoint at `model-path` into native pre-quantized format at `output-path`.
    Automatically detects hardware capabilities if `precision` is `:auto` (or not provided)."
-  [{:keys [model-path output-path precision quiet]}]
+  [{:keys [model-path output-path precision quiet group-size]}]
   (let [model-dir (io/file model-path)
         _ (when-not (.exists model-dir)
             (throw (ex-info "Model directory does not exist" {:model-path model-path})))
@@ -98,33 +102,30 @@
         hw-profile (hw/detect-hardware)
         primary-dev (:primary-device hw-profile)
         config-file (io/file model-dir "config.json")
-        config-json (when (.exists config-file)
-                      (json/read-str (slurp config-file)))
-        param-count (if config-json (parse-model-param-count config-json) 31000000000)
+        model-cfg (when (.exists config-file)
+                    (json/read-str (slurp config-file)))
+        param-count (when model-cfg (parse-model-param-count model-cfg))
         selected-precision (if (and precision (not= precision :auto))
                              precision
-                             (hw/select-quant-strategy primary-dev {:param-count param-count}))
-
-        resolved-out-dir (io/file (or output-path
-                                      (str model-path "-" (name selected-precision))))
+                             (hw/select-quant-strategy hw-profile param-count))
+        group-size (long (or group-size 128))
+        resolved-out-dir (or (when output-path (io/file output-path))
+                             (io/file (.getParentFile model-dir) (str (.getName model-dir) "-" (name selected-precision))))
         _ (.mkdirs resolved-out-dir)]
 
     (when-not quiet
-      (println "==================================================================")
-      (println "  clj-xla Hardware-Aware Offline Model Quantization")
-      (println "==================================================================")
-      (println (format "Target Hardware: %s (%s, %.1f GB VRAM)"
-                       (:name primary-dev)
-                       (name (get primary-dev :arch :unknown))
-                       (/ (double (:vram-bytes primary-dev)) 1024.0 1024.0 1024.0)))
-      (println (format "Model:           %s (~%.1fB parameters)"
-                       (.getName model-dir)
-                       (/ (double param-count) 1e9)))
-      (println (format "Quantization:    %s (Selected optimal for %s)"
+      (println "=== clj-xla Hardware-Aware Offline Model Quantizer ===")
+      (println (format "Detected Primary Device : %s (%s, %d MB VRAM)"
+                       (or (:name primary-dev) "Unknown")
+                       (name (or (:arch primary-dev) :generic))
+                       (or (:vram-total-mb primary-dev) 0)))
+      (println (format "Target Model Directory  : %s (estimated %s params)"
+                       (.getAbsolutePath model-dir)
+                       (if param-count (format "%.1fB" (/ (double param-count) 1e9)) "unknown")))
+      (println (format "Selected Strategy       : %s (group-size: %s) -> %s"
                        (str/upper-case (name selected-precision))
-                       (:name primary-dev)))
-      (println (format "Output Dir:      %s" (.getAbsolutePath resolved-out-dir)))
-      (println "------------------------------------------------------------------"))
+                       (if (= selected-precision :int4) (str group-size) "per-row")
+                       (.getAbsolutePath resolved-out-dir))))
 
     (with-open [arena (Arena/ofConfined)]
       ;; 2. Memory-map source weights
@@ -158,7 +159,12 @@
                                                  (* rows cols))
                                          w-offset-end (+ curr-offset w-len)
                                          scale-name (str t-name ".scales")
-                                         scale-len (* rows 2) ;; BF16 = 2 bytes per row
+                                         num-groups (if (and (= selected-precision :int4) group-size (zero? (mod cols group-size)))
+                                                      (quot cols group-size)
+                                                      1)
+                                         scale-shape (if (> num-groups 1) [rows num-groups] [rows])
+                                         num-scales (if (> num-groups 1) (* rows num-groups) rows)
+                                         scale-len (* (long num-scales) 2) ;; BF16 = 2 bytes per scale
                                          scale-offset-end (+ w-offset-end scale-len)
                                          w-spec {:name t-name
                                                  :source-name t-name
@@ -166,7 +172,7 @@
                                                  :shape (if (= selected-precision :int4) [rows half-cols] [rows cols])
                                                  :dtype "I8"
                                                  :scale-name scale-name
-                                                 :scale-shape [rows]
+                                                 :scale-shape scale-shape
                                                  :scale-dtype "BF16"
                                                  :data-offsets [curr-offset w-offset-end]
                                                  :scale-offsets [w-offset-end scale-offset-end]}]
@@ -200,10 +206,11 @@
                                                                "shape" (:shape spec)
                                                                "data_offsets" (:data-offsets spec)}]]))
                                            specs))
-              metadata {"quantization" (name selected-precision)
-                        "format" "clj-xla"
-                        "producer" "clj-xla.hardware"
-                        "target_arch" (name (get primary-dev :arch :generic))}
+              metadata (cond-> {"quantization" (name selected-precision)
+                                "format" "clj-xla"
+                                "producer" "clj-xla.hardware"
+                                "target_arch" (name (get primary-dev :arch :generic))}
+                         (= selected-precision :int4) (assoc "group_size" (str group-size)))
               full-header-map (assoc header-tensors "__metadata__" metadata)
               json-str (json/write-str full-header-map :escape-slash false)
               header-bytes (.getBytes json-str "UTF-8")
@@ -238,14 +245,15 @@
                   (let [src-name (:source-name spec)
                         [rows cols] (get-in raw-header [src-name "shape"])
                         raw-shorts (st/get-tensor-bf16-shorts mapped-weights src-name)
-                        {:keys [data scales]} (quantize-projection-weight raw-shorts rows cols selected-precision)
+                        {:keys [data scales]} (quantize-projection-weight raw-shorts rows cols selected-precision {:group-size group-size})
                         ^bytes data-bytes data
-                        ^shorts scale-shorts scales]
+                        ^shorts scale-shorts scales
+                        num-scales (alength scale-shorts)]
                     ;; Write INT4/INT8 packed bytes
                     (.write fc (ByteBuffer/wrap data-bytes))
                     ;; Write BF16 scales
-                    (let [scale-seg (.allocate arena (* (long rows) 2) (long 1))]
-                      (MemorySegment/copy scale-shorts 0 scale-seg ValueLayout/JAVA_SHORT (long 0) rows)
+                    (let [scale-seg (.allocate arena (* (long num-scales) 2) (long 1))]
+                      (MemorySegment/copy scale-shorts 0 scale-seg ValueLayout/JAVA_SHORT (long 0) num-scales)
                       (.write fc (.asByteBuffer scale-seg))))
                   ;; Non-quantizable tensor: zero-copy stream direct from mapped source
                   (let [slice (st/get-tensor-slice mapped-weights (:source-name spec))]
@@ -267,6 +275,7 @@
           ;; 6. Write quant_config.edn
           (spit (io/file resolved-out-dir "quant_config.edn")
                 (pr-str {:quantization selected-precision
+                         :group-size (when (= selected-precision :int4) group-size)
                          :source-model (.getAbsolutePath model-dir)
                          :hardware-profile hw-profile
                          :timestamp (str (java.time.Instant/now))
@@ -300,6 +309,9 @@
 
           (or (= arg "--precision") (= arg "-p"))
           (recur (drop 2 remaining) (assoc opts :precision (keyword (second remaining))))
+
+          (or (= arg "--group-size") (= arg "-g"))
+          (recur (drop 2 remaining) (assoc opts :group-size (parse-long (second remaining))))
 
           (or (= arg "--quiet") (= arg "-q"))
           (recur (rest remaining) (assoc opts :quiet true))

@@ -127,6 +127,9 @@
           (and (= flag "--compare") val)
           (recur (subvec remaining 2) (assoc opts :compare (Boolean/parseBoolean val)))
 
+          (and (or (= flag "--group-size") (= flag "-g")) val)
+          (recur (subvec remaining 2) (assoc opts :group-size (Long/parseLong val)))
+
           (= flag "--verbose")
           (recur (subvec remaining 1) (assoc opts :verbose true))
 
@@ -243,8 +246,10 @@
   "Loads a linear projection matrix as either a single unquantized PJRT buffer,
    or if is-int8/is-int4 is true, a pair [w-buf scale-buf] with in-graph symmetric per-row quantization."
   ([ctx weights-mmap tensor-name shape is-int8 norm-enum weight-enum]
-   (load-linear-projection-buffers ctx weights-mmap tensor-name shape is-int8 false norm-enum weight-enum))
-  ([ctx weights-mmap tensor-name [rows cols :as shape] is-int8 is-int4 norm-enum weight-enum]
+   (load-linear-projection-buffers ctx weights-mmap tensor-name shape is-int8 false norm-enum weight-enum 128))
+  ([ctx weights-mmap tensor-name shape is-int8 is-int4 norm-enum weight-enum]
+   (load-linear-projection-buffers ctx weights-mmap tensor-name shape is-int8 is-int4 norm-enum weight-enum 128))
+  ([ctx weights-mmap tensor-name [rows cols :as shape] is-int8 is-int4 norm-enum weight-enum group-size]
    (if-not (or is-int8 is-int4)
      [(load-weight-buffer ctx weights-mmap tensor-name shape (if (= weight-enum 11) :f32 :bf16) weight-enum 0.0)]
      (let [header (or (:header weights-mmap) {})
@@ -261,8 +266,13 @@
          (let [w-shape (if is-int4 [rows (quot cols 2)] [rows cols])
                w-slice (st/get-tensor-slice weights-mmap actual-tensor-name)
                scale-slice (st/get-tensor-slice weights-mmap scale-name)
+               scale-shape (or (get-in header [scale-name "shape"])
+                               (get-in (:tensors weights-mmap) [scale-name :info "shape"])
+                               (if (and is-int4 group-size (zero? (mod cols group-size)))
+                                 [rows (quot cols group-size)]
+                                 [rows]))
                w-buf (xla/buffer-from-host-buffer ctx (:client ctx) w-slice w-shape 2)
-               scale-buf (xla/buffer-from-host-buffer ctx (:client ctx) scale-slice [rows] norm-enum)]
+               scale-buf (xla/buffer-from-host-buffer ctx (:client ctx) scale-slice scale-shape norm-enum)]
            [w-buf scale-buf])
          (let [trellis-name (when (str/ends-with? tensor-name ".weight")
                               (str/replace tensor-name #"\.weight$" ".trellis"))
@@ -296,9 +306,11 @@
                          :else
                          (st/get-tensor-floats weights-mmap actual-tensor-name))]
            (if is-int4
-             (let [{:keys [data scales]} (exl3/quantize-weights-per-row-int4 raw-arr rows cols {:as scale-format})
+             (let [{:keys [data scales scale-shape]} (exl3/quantize-weights-per-row-int4 raw-arr rows cols
+                                                                                         {:as scale-format
+                                                                                          :group-size group-size})
                    w-buf (xla/buffer-from-host-buffer ctx (:client ctx) data [rows (quot cols 2)] 2)
-                   scale-buf (xla/buffer-from-host-buffer ctx (:client ctx) scales [rows] norm-enum)]
+                   scale-buf (xla/buffer-from-host-buffer ctx (:client ctx) scales (or scale-shape [rows]) norm-enum)]
                [w-buf scale-buf])
              (let [{:keys [data scales]} (exl3/quantize-weights-per-row-int8 raw-arr rows cols {:as scale-format})
                    w-buf (xla/buffer-from-host-buffer ctx (:client ctx) data shape 2)
@@ -405,6 +417,20 @@
                                        (re-find #"31[bB]" (or model-dir ""))))))
          is-int8 (boolean (or (= precision :int8)
                               (= quant-metadata "int8")))
+         group-size (or (:group-size opts)
+                        (when-let [gs (or (get-in weights-mmap [:header "__metadata__" "group_size"])
+                                          (get-in weights-mmap [:header "__metadata__" "group-size"]))]
+                          (let [parsed (if (string? gs) (Long/parseLong gs) (long gs))]
+                            (when (pos? parsed) parsed)))
+                        (when-let [scale-sh (some (fn [[k v]]
+                                                    (when (str/ends-with? k ".scales")
+                                                      (get v "shape")))
+                                                  header)]
+                          (if (= 1 (count scale-sh))
+                            nil
+                            (when (= 2 (count scale-sh))
+                              128)))
+                        (when is-int4 128))
          weight-dtype (or (when (and precision (not= precision :auto)) precision)
                           (when quant-metadata (keyword quant-metadata))
                           (if is-int4 :int4 (if is-int8 :int8 :bf16)))
@@ -439,14 +465,19 @@
                :weight-enum weight-enum
                :is-int8 is-int8
                :is-int4 is-int4
+               :group-size group-size
                :norm-enum norm-enum}})))
 
 (defn build-tensor-logic-invars
   "Constructs EDN SSA signature invars for full Gemma 4 model forward pass."
   [config max-seq-len]
-  (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim num-layers weight-dtype is-int8 is-int4 layer-configs last-token-only?]} config
+  (let [{:keys [vocab-size hidden-dim total-pl-dim pl-dim num-layers weight-dtype is-int8 is-int4 layer-configs last-token-only? group-size]} config
         norm-dtype (if (or is-int8 is-int4) :bf16 weight-dtype)
-        has-ple? (pos? total-pl-dim)]
+        has-ple? (pos? total-pl-dim)
+        scale-shape-fn (fn [rows cols]
+                         (if (and is-int4 group-size (zero? (mod cols group-size)))
+                           [rows (quot cols group-size)]
+                           [rows]))]
     (vec (concat [[:x [:tensor [1 max-seq-len] :i32]]]
                  (when last-token-only?
                    [[:pos [:tensor [1] :i32]]])
@@ -467,13 +498,13 @@
                               (cond
                                 is-int4
                                 [[(keyword (str "q_w_" i)) [:tensor [q-dim (quot hidden-dim 2)] :i8]]
-                                 [(keyword (str "q_scale_" i)) [:tensor [q-dim] norm-dtype]]
+                                 [(keyword (str "q_scale_" i)) [:tensor (scale-shape-fn q-dim hidden-dim) norm-dtype]]
                                  [(keyword (str "k_w_" i)) [:tensor [kv-dim (quot hidden-dim 2)] :i8]]
-                                 [(keyword (str "k_scale_" i)) [:tensor [kv-dim] norm-dtype]]
+                                 [(keyword (str "k_scale_" i)) [:tensor (scale-shape-fn kv-dim hidden-dim) norm-dtype]]
                                  [(keyword (str "v_w_" i)) [:tensor [kv-dim (quot hidden-dim 2)] :i8]]
-                                 [(keyword (str "v_scale_" i)) [:tensor [kv-dim] norm-dtype]]
+                                 [(keyword (str "v_scale_" i)) [:tensor (scale-shape-fn kv-dim hidden-dim) norm-dtype]]
                                  [(keyword (str "o_w_" i)) [:tensor [hidden-dim (quot q-dim 2)] :i8]]
-                                 [(keyword (str "o_scale_" i)) [:tensor [hidden-dim] norm-dtype]]]
+                                 [(keyword (str "o_scale_" i)) [:tensor (scale-shape-fn hidden-dim q-dim) norm-dtype]]]
                                 is-int8
                                 [[(keyword (str "q_w_" i)) [:tensor [q-dim hidden-dim] :i8]]
                                  [(keyword (str "q_scale_" i)) [:tensor [q-dim] norm-dtype]]
@@ -496,11 +527,11 @@
                               (cond
                                 is-int4
                                 [[(keyword (str "gate_w_" i)) [:tensor [mlp-dim (quot hidden-dim 2)] :i8]]
-                                 [(keyword (str "gate_scale_" i)) [:tensor [mlp-dim] norm-dtype]]
+                                 [(keyword (str "gate_scale_" i)) [:tensor (scale-shape-fn mlp-dim hidden-dim) norm-dtype]]
                                  [(keyword (str "up_w_" i)) [:tensor [mlp-dim (quot hidden-dim 2)] :i8]]
-                                 [(keyword (str "up_scale_" i)) [:tensor [mlp-dim] norm-dtype]]
+                                 [(keyword (str "up_scale_" i)) [:tensor (scale-shape-fn mlp-dim hidden-dim) norm-dtype]]
                                  [(keyword (str "down_w_" i)) [:tensor [hidden-dim (quot mlp-dim 2)] :i8]]
-                                 [(keyword (str "down_scale_" i)) [:tensor [hidden-dim] norm-dtype]]]
+                                 [(keyword (str "down_scale_" i)) [:tensor (scale-shape-fn hidden-dim mlp-dim) norm-dtype]]]
                                 is-int8
                                 [[(keyword (str "gate_w_" i)) [:tensor [mlp-dim hidden-dim] :i8]]
                                  [(keyword (str "gate_scale_" i)) [:tensor [mlp-dim] norm-dtype]]
@@ -522,13 +553,13 @@
 (defn allocate-device-weights
   "Loads individual weight tensors for Gemma 4 into PJRT device buffers matching build-tensor-logic-invars."
   [{:keys [ctx weights-mmap config]}]
-  (let [{:keys [prefix-base vocab-size hidden-dim total-pl-dim pl-dim weight-dtype weight-enum norm-enum layer-configs num-layers is-int8 is-int4]} config
+  (let [{:keys [prefix-base vocab-size hidden-dim total-pl-dim pl-dim weight-dtype weight-enum norm-enum layer-configs num-layers is-int8 is-int4 group-size]} config
         has-ple? (pos? total-pl-dim)
         load-fn (fn
                   ([name shape enum] (load-weight-buffer ctx weights-mmap name shape weight-dtype enum 0.0))
                   ([name shape enum default-val] (load-weight-buffer ctx weights-mmap name shape weight-dtype enum default-val)))
         load-linear-fn (fn [name shape]
-                         (load-linear-projection-buffers ctx weights-mmap name shape is-int8 is-int4 norm-enum weight-enum))
+                         (load-linear-projection-buffers ctx weights-mmap name shape is-int8 is-int4 norm-enum weight-enum group-size))
         embed-buf (load-fn (str prefix-base "embed_tokens.weight") [vocab-size hidden-dim] norm-enum)
         ple-bufs (when has-ple?
                    [(load-fn (str prefix-base "embed_tokens_per_layer.weight") [vocab-size total-pl-dim] norm-enum)

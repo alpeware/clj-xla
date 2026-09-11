@@ -28,6 +28,19 @@
                   (and (= packed-len (alength ^bytes data))
                        (= rows (alength ^shorts scales))))))
 
+(defspec prop-quantize-weight-block-int4-invariants 50
+  (prop/for-all [rows (gen/choose 2 16)
+                 group-size (gen/elements [16 32])
+                 num-groups (gen/choose 1 4)]
+                (let [cols (* group-size num-groups)
+                      w-arr (sample-float-matrix rows cols 2.0)
+                      {:keys [data scales shape scale-shape]} (quant/quantize-projection-weight w-arr rows cols :int4 {:group-size group-size})
+                      packed-len (* rows (quot cols 2))]
+                  (and (= packed-len (alength ^bytes data))
+                       (= (* rows num-groups) (alength ^shorts scales))
+                       (= [rows (quot cols 2)] shape)
+                       (= [rows num-groups] scale-shape)))))
+
 (defspec prop-quantize-weight-int8-invariants 50
   (prop/for-all [rows (gen/choose 2 32)
                  cols (gen/choose 2 32)]
@@ -93,5 +106,36 @@
               (is (= [128] (get-in header ["model.layers.0.mlp.gate_proj.weight.scales" "shape"]))))))
         (finally
           ;; Clean up temp dir
+          (doseq [f (reverse (file-seq tmp-dir))]
+            (.delete f))))))
+
+  (testing "Quantizes a synthetic model into block-wise INT4 safetensors with 2D scales"
+    (let [tmp-dir (io/file (System/getProperty "java.io.tmpdir") (str "clj_xla_quant_block_test_" (System/currentTimeMillis)))
+          out-dir (io/file tmp-dir "quantized")
+          _ (.mkdirs tmp-dir)
+          source-file (io/file tmp-dir "model.safetensors")
+          config-file (io/file tmp-dir "config.json")]
+      (try
+        (spit config-file (json/write-str {"model_type" "gemma4", "hidden_size" 256, "num_hidden_layers" 1}))
+        (let [gate-shorts (short-array (* 64 256))
+              tensors [{:name "model.layers.0.mlp.gate_proj.weight" :dtype "BF16" :shape [64 256] :data gate-shorts}]]
+          (st/write-safetensors (.getAbsolutePath source-file) tensors))
+
+        (let [res (quant/quantize-model! {:model-path (.getAbsolutePath tmp-dir)
+                                          :output-path (.getAbsolutePath out-dir)
+                                          :precision :int4
+                                          :group-size 128
+                                          :quiet true})]
+          (is (= :int4 (:precision res)))
+          (with-open [arena (Arena/ofConfined)]
+            (let [mapped (st/map-safetensors-weights (.getAbsolutePath out-dir) arena)
+                  header (:header mapped)]
+              (is (= "128" (get-in header ["__metadata__" "group_size"])))
+              (is (= "I8" (get-in header ["model.layers.0.mlp.gate_proj.weight" "dtype"])))
+              (is (= [64 128] (get-in header ["model.layers.0.mlp.gate_proj.weight" "shape"])))
+              ;; cols=256, group-size=128 => num-groups=2 => scale shape [64 2]
+              (is (= "BF16" (get-in header ["model.layers.0.mlp.gate_proj.weight.scales" "dtype"])))
+              (is (= [64 2] (get-in header ["model.layers.0.mlp.gate_proj.weight.scales" "shape"]))))))
+        (finally
           (doseq [f (reverse (file-seq tmp-dir))]
             (.delete f)))))))
